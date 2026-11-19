@@ -122,7 +122,7 @@ try {
     Write-Host "`nnetwork"
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0); $listener.Start(); $port = $listener.LocalEndpoint.Port
     $r = AP -t local net --port $port
-    Check 'net shows our listening port with our pid' ($r.Out -match "(?m)^\s*$port\s+127\.0\.0\.1\s+powershell\.exe\($PID\)") $r.Out
+    Check 'net shows our listening port with our pid' ($r.Out -match "(?m)^\s*$port\s+127\.0\.0\.1\s+$([regex]::Escape((Get-Process -Id $PID).ProcessName))\.exe\($PID\)") $r.Out
     $r = AP -t local net check "127.0.0.1:$port" 'name.invalid:80'
     Check 'net check: open port is OK' ($r.Out -match "127\.0\.0\.1:$port`: OK") $r.Out
     Check 'net check: bad name is a DNS failure, exit 1' ($r.Out -match 'name\.invalid:80: DNS FAILED' -and $r.Code -eq 1) $r.Out
@@ -141,9 +141,18 @@ try {
     Check 'read --grep returns exactly the match' ($g -eq '5: line 5 value=35') $g
     Check '-t local refuses commands that need a session' ((AP -t local read $file --new).Code -eq 2 -and (AP -t local watch start explorer).Code -eq 2) ''
 
-    $korean = Join-Path $work 'cp949.txt'
-    [IO.File]::WriteAllBytes($korean, [Text.Encoding]::GetEncoding(949).GetBytes("한글 줄`r`nsecond"))
-    Check 'read decodes an ANSI (cp949) file' ((AP -t local read $korean).Out -match '한글 줄') ''
+    # A file in this PC's own ANSI code page: 949 on Korean Windows, 1252 on Western European ones, and so on.
+    $acp = [int](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage').ACP
+    if ($acp -eq 65001) {
+        Write-Host '  skipped: the ANSI code page of this PC is UTF-8, so there is no separate ANSI decoding to check.' -ForegroundColor Yellow
+    } else {
+        $ansi = [Text.Encoding]::GetEncoding($acp)
+        $sample = switch ($acp) { 949 { '한글 줄' } 932 { '日本語の行' } 936 { '中文行' } 950 { '中文行' } default { 'line ' + $ansi.GetString([byte[]](0xE0..0xE5)) } }
+        $ansiFile = Join-Path $work 'ansi.txt'
+        [IO.File]::WriteAllBytes($ansiFile, $ansi.GetBytes("$sample`r`nsecond"))
+        $shown = (AP -t local read $ansiFile).Out
+        Check "read decodes a file in the system ANSI code page (cp$acp)" ($shown.Contains($sample)) "expected '$sample', got: $shown"
+    }
     $utf16 = Join-Path $work 'utf16.txt'; [IO.File]::WriteAllText($utf16, "유니코드 줄`r`nx", [Text.Encoding]::Unicode)
     Check 'read decodes UTF-16' ((AP -t local read $utf16).Out -match '유니코드 줄') ''
 
