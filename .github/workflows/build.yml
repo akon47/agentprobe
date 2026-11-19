@@ -1,0 +1,95 @@
+name: build
+
+# Every push and pull request: build the native exe and test it.
+# A release is made in one of two ways, and both give the exe the version of the tag:
+#   - push a tag:            git tag v0.2.0; git push origin v0.2.0
+#   - Actions > build > Run workflow, with a version: creates the tag and the release for you.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, for example 0.2.0 (the tag v0.2.0 and a release are created)'
+        required: true
+        type: string
+      draft:
+        description: 'Create the release as a draft: nothing is public and no tag exists until you publish it'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Version
+        id: version
+        shell: pwsh
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          $version = ''
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') { $version = "$env:REQUESTED".Trim().TrimStart('v') }
+          elseif ($env:GITHUB_REF -like 'refs/tags/v*') { $version = $env:GITHUB_REF_NAME.Substring(1) }
+          if ($version) {
+            if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw "'$version' is not a version like 1.2.3 or 1.2.3-beta.1" }
+            if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and (git ls-remote --tags origin "refs/tags/v$version")) { throw "The tag v$version already exists." }
+            "release=true" >> $env:GITHUB_OUTPUT
+          } else {
+            # not a release: the version in the project file
+            $version = ([xml](Get-Content src/AgentProbe/AgentProbe.csproj)).Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
+            "release=false" >> $env:GITHUB_OUTPUT
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "Building version $version"
+
+      - name: Publish native exe
+        run: dotnet publish src/AgentProbe -c Release -o publish -p:Version=${{ steps.version.outputs.version }}
+
+      - name: The exe reports that version
+        shell: pwsh
+        run: |
+          $reported = (./publish/agentprobe.exe version | Out-String).Trim()
+          $reported
+          if ($reported -notmatch [regex]::Escape('${{ steps.version.outputs.version }}')) { throw "The exe does not report version ${{ steps.version.outputs.version }}." }
+
+      - name: Test suite
+        shell: pwsh
+        run: ./tests/verify.ps1 -Exe publish/agentprobe.exe -Session
+
+      - name: Checksum
+        shell: pwsh
+        run: (Get-FileHash publish/agentprobe.exe -Algorithm SHA256).Hash.ToLower() + "  agentprobe.exe" | Out-File publish/agentprobe.exe.sha256 -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentprobe-win-x64
+          path: |
+            publish/agentprobe.exe
+            publish/agentprobe.exe.sha256
+
+      - name: Release
+        if: steps.version.outputs.release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ inputs.draft == true }}
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            publish/agentprobe.exe
+            publish/agentprobe.exe.sha256

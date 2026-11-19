@@ -1,0 +1,11 @@
+bin/
+obj/
+publish/
+.vs/
+*.user
+*.suo
+# never commit captures or logs from real machines
+*.dmp
+*.etl
+*.log
+screenshot-*.png
