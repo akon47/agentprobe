@@ -45,6 +45,7 @@ internal static class ToolRegistry
         .. DebugOutputTools.Tools,
         .. DepsTool.Tools,
         .. DumpTool.Tools,
+        .. HeapTools.Tools,
         .. InspectTools.Tools,
         .. AccessTraceTools.Tools,
         .. TraceTools.Tools,

@@ -33,6 +33,7 @@ If `agentprobe` is not found, it is not on PATH yet: call the exe by its full pa
 | What is using the CPU? Which thread? | `top`, `threads <pid>` |
 | Is it frozen? Where is it stuck? | `windows` (NOT RESPONDING), `threads <pid>`, `stacks <pid>`, then `dump <pid>` |
 | Is it leaking memory / handles / GDI objects? | `watch start <name>` ... run scenario for 2+ minutes ... `watch`; `handles <pid> --interval 30s`; `vmmap <pid> --interval 30s` (which kind of memory) |
+| .NET app: how many objects of a type are alive, and what holds them? | `heap <name> --live --type <Type>` (count before and after a fix), `heap <name> --why <Type>` (the chain of references from its root). Read on the target from a snapshot: no dump to carry |
 | Which file or registry access fails? (missing config, DLL, key; access denied) | `trace start <name>` ... reproduce ... `trace` (needs an elevated target) |
 | Did it crash? Why? | `crashes`, `events --level error`, `watch` (exit codes), `crashdumps on` before reproducing |
 | What does the app log? | `read <file> --new` / `--grep`, `dbg` (OutputDebugString), `logs <job>` |
@@ -40,8 +41,8 @@ If `agentprobe` is not found, it is not on PATH yet: call the exe by its full pa
 | Who holds this file open? | `locks <file>` |
 | Can it reach the server? Who listens on the port? | `net check host:port`, `net --listen`, `net --name <app>` |
 | What did the installer / update change? | `envsnap --save before` ... `envsnap --diff before` (`--dir`, `--reg`) |
-| What is in this window? Press a button, fill a field | `ui <window>` (controls as text), `ui click <name>`, `ui set <name> <text>`, `ui get <name>` |
-| What does the screen show? | `windows` first (cheap), `ui` for the controls; `screenshot --window <title> --scale 0.5` when you need pixels |
+| What is in this window? Press a button, fill a field | `ui <window>` (controls as text), `ui click <name>`, `ui rclick <name>` (context menu), `ui dblclick <name>`, `ui set <name> <text>`, `ui get <name>` |
+| What does the screen show? Is a menu open? | `windows` first (cheap; an open menu or drop-down is a `popup` line), `ui` for the controls; `screenshot --window <title> --scale 0.5` when you need pixels |
 | Where is the time going (deep)? | `wpr start cpu file` ... `wpr stop` (needs an elevated target) |
 
 ## Running things
@@ -61,6 +62,8 @@ agentprobe kill app
 ```
 
 - Quote the command with single quotes so your local shell leaves `$` and `|` alone.
+- Save a script you send with `-f` as UTF-8. On the target it is stored with a byte-order mark, so Windows PowerShell
+  reads Korean or other non-ASCII text in it correctly (run directly from a BOM-less file it would not).
 - Start a GUI app with `start --exe`, not as a command: a shell does not wait for a windowed program, so that job
   would end at once while the app runs on untracked. With `--exe` the job has the app's pid and its exit code
   (crash codes are named), and `kill <job>` / `wait --job <job>` act on the app.
@@ -87,7 +90,10 @@ agentprobe watch start MyApp --interval 2s
 agentprobe exec -f .\run-scenario.ps1
 agentprobe watch                 # private bytes / handles / GDI / USER with growth per minute and a leak verdict
 agentprobe handles MyApp --interval 30s    # which handle type grows
-agentprobe dump MyApp --full -o .\dumps\   # for heap analysis on this PC
+agentprobe heap MyApp --live --type EditorWindow   # .NET: how many are still referenced (closed 20, expect 0)
+agentprobe heap MyApp --why EditorWindow           # .NET: what keeps one alive, root first
+agentprobe dump MyApp --full --keep-remote # native heap, or a 32-bit .NET app: the dump stays on the target
+                                           # (it is often gigabytes); without --keep-remote it comes to this PC
 ```
 
 Crash on start:
@@ -108,7 +114,8 @@ Unattended targets need Windows auto-logon; background jobs do not survive a reb
 Driving the UI: prefer names over pixels. `ui "<window title>"` lists the controls; `ui click "Save"`,
 `ui set "#fileName" "report.txt"` and `ui get "#status"` act on them, and keep working when the layout or DPI changes.
 Fall back to `screenshot` → `click <x> <y>` (coordinates of that image; `--hover` only moves the pointer, for
-tooltips and hover states), `type <text>` (typed literally; use
+tooltips and hover states). The `@x,y` that `ui` prints are SCREEN coordinates, not screenshot pixels: pass them as
+`click @x,y`, never as two plain numbers after a scaled screenshot (a point outside the desktop is refused), `type <text>` (typed literally; use
 `key enter` / `key tab` for those keys), `key ctrl+s`, `focus <title>` when a control has no name. Prefer `windows`
 and `wait --window` over screenshots when you only need to know that something appeared.
 

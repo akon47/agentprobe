@@ -305,6 +305,7 @@ internal static class Cli
 
             Console.WriteLine(L($"downloading agentprobe {latest.Version}...", $"agentprobe {latest.Version} 내려받는 중..."));
             await Updater.InstallAsync(latest, AppInfo.ExePath, CancellationToken.None);
+            Updater.CleanupOldAfterExit(); // this process still runs from the file that was moved aside
             Console.WriteLine(L(
                 $"updated {AppInfo.ExePath} from {AppInfo.Version} to {latest.Version}. The next start uses it.",
                 $"{AppInfo.ExePath}을(를) {AppInfo.Version}에서 {latest.Version}(으)로 업데이트했습니다. 다음 실행부터 새 버전입니다."));

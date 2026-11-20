@@ -6,7 +6,7 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <AssemblyName>agentprobe</AssemblyName>
     <RootNamespace>AgentProbe</RootNamespace>
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -28,6 +28,12 @@
     <EmbeddedResource Include="Controller\dashboard.html" LogicalName="dashboard.html" />
     <!-- Pretendard, SIL Open Font License 1.1 (see Controller\fonts\OFL.txt) -->
     <EmbeddedResource Include="Controller\fonts\*.woff2" LogicalName="font/%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Reads the .NET heap of another process for the `heap` tool (MIT licence). It is compiled into the exe; the
+         runtime's own debugging library (the DAC) is loaded from the tested PC's .NET installation, nothing is downloaded. -->
+    <PackageReference Include="Microsoft.Diagnostics.Runtime" Version="4.2.751201" />
   </ItemGroup>
 
 </Project>

@@ -25,6 +25,8 @@ internal static unsafe partial class UiaTools
                  One line per control: type, "name", #automation-id, =value, state, and its center point on screen.
                  Unnamed layout containers are folded away. --all also lists off-screen controls.
             ui click <name|#id> [--window W]     press a button / select an item (falls back to a mouse click on it)
+            ui rclick <name|#id> [--window W]    right-click it (opens its context menu; `windows` then shows a popup)
+            ui dblclick <name|#id> [--window W]  double-click it
             ui set <name|#id> <text> [--window W]  put text into an edit field
             ui get <name|#id> [--window W]       one control's value and state
               Works with WPF, WinForms, Win32, UWP/WinUI and most browsers/Electron apps. Read the tree once, then act
@@ -259,7 +261,7 @@ internal static unsafe partial class UiaTools
     {
         var a = ArgParser.Parse(args, "all");
         var verb = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "";
-        var isAction = verb is "click" or "set" or "get";
+        var isAction = verb is "click" or "rclick" or "dblclick" or "set" or "get";
         var window = isAction ? a.Get("window") : (a.Positionals.Count > 0 ? string.Join(' ', a.Positionals) : null);
         if (isAction && a.Positionals.Count < 2) return Task.FromResult(ctx.Fail($"ui {verb}: which control? Give its name or #id (see `ui`)."));
         if (verb == "set" && a.Positionals.Count < 3) return Task.FromResult(ctx.Fail("ui set: usage: ui set <name|#id> <text>"));
@@ -350,6 +352,26 @@ internal static unsafe partial class UiaTools
                 if (hr < 0) return (1, $"ui set: {label} refused the text (0x{hr:X8}; read-only?).");
                 ctx.Runtime.Audit.Write($"ui set {label} ({text.Length} characters)");
                 return (0, $"set {label} to \"{Format.Clip(text, 60)}\"");
+            }
+
+            case "rclick" or "dblclick":
+            {
+                // These have no action of their own in UI Automation: the mouse does them, at the control's centre.
+                if (node.Offscreen || node.Rect.Width <= 0) return (1, $"ui {verb}: {label} is not visible on screen.");
+                var x = (node.Rect.Left + node.Rect.Right) / 2;
+                var y = (node.Rect.Top + node.Rect.Bottom) / 2;
+                ctx.Runtime.Audit.Write($"ui {verb} {label} at {x},{y}");
+                UiTools.Mouse(x, y, 0x0001);
+                Thread.Sleep(40);
+                var (down, up, times) = verb == "rclick" ? (0x0008u, 0x0010u, 1) : (0x0002u, 0x0004u, 2);
+                for (var i = 0; i < times; i++)
+                {
+                    UiTools.Mouse(x, y, down);
+                    UiTools.Mouse(x, y, up);
+                    Thread.Sleep(60);
+                }
+
+                return (0, $"{(verb == "rclick" ? "right-clicked" : "double-clicked")} {label} at {x},{y}");
             }
 
             default:

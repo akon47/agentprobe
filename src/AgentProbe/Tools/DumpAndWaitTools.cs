@@ -12,16 +12,19 @@ internal static class DumpTool
     [
         new("dump", "Processes", "Write a memory dump of a process and bring it to the developer PC",
             """
-            dump <pid|name> [--full] [-o folder-or-file]
+            dump <pid|name> [--full] [-o folder-or-file] [--keep-remote]
               Default is a small dump (stacks, modules, handles, data segments): enough for "where is it stuck".
               --full includes all memory (heap contents, needed for leak analysis and .NET objects); it can be large.
               Open it with WinDbg / Visual Studio / dotnet-dump on the developer PC. The process keeps running.
+              --keep-remote leaves the dump in the session workspace on the target and prints its path instead of
+              sending it (a full dump is often gigabytes: analyse it there, or `pull` it later). It goes with the
+              workspace at `end`.
             """, DumpAsync),
     ];
 
     private static async Task<int> DumpAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "full");
+        var a = ArgParser.Parse(args, "full", "keep-remote");
         if (a.Positionals.Count == 0) return ctx.Fail("dump: which process? pid or name.");
         var matches = ProcessTools.Find(ProcessSnapshot.Take(), a.Positionals[0]);
         if (matches.Count == 0) return ctx.Fail($"dump: no process matches '{a.Positionals[0]}'.");
@@ -31,7 +34,10 @@ internal static class DumpTool
         var h = Win32.OpenProcess(Win32.PROCESS_QUERY_INFORMATION | Win32.PROCESS_VM_READ | Win32.PROCESS_DUP_HANDLE, false, p.Pid);
         if (h == 0) return ctx.Fail(ProcessTools.WhyNotOpen("dump", p.Name, p.Pid));
         var full = a.Flag("full");
-        var file = Path.Combine(Path.GetTempPath(), $"{AppInfo.Name}-{Guid.NewGuid():N}.dmp");
+        var keep = a.Flag("keep-remote");
+        var file = keep
+            ? Path.Combine(ctx.Runtime.WorkDir, $"{Path.GetFileNameWithoutExtension(p.Name)}-{p.Pid}-{DateTime.Now:HHmmss}.dmp")
+            : Path.Combine(Path.GetTempPath(), $"{AppInfo.Name}-{Guid.NewGuid():N}.dmp");
         try
         {
             // small: DataSegs | HandleData | UnloadedModules | ProcessThreadData | ThreadInfo
@@ -59,7 +65,8 @@ internal static class DumpTool
             ctx.Runtime.Audit.Write($"dump of {p.Name} ({p.Pid}), {Format.Bytes(size)}");
             ctx.Out.WriteLine($"{(full ? "full" : "small")} dump of {p.Name} (pid {p.Pid}, {arch}), {Format.Bytes(size)}" +
                               (arch == "x86" ? "; 32-bit process dumped by a 64-bit tool: in WinDbg use `.load wow64exts` + `!sw`" : ""));
-            await ctx.SendFile($"{Path.GetFileNameWithoutExtension(p.Name)}-{p.Pid}-{DateTime.Now:HHmmss}.dmp", file, false, true);
+            if (keep) ctx.Out.WriteLine($"kept on the target: {file}");
+            else await ctx.SendFile($"{Path.GetFileNameWithoutExtension(p.Name)}-{p.Pid}-{DateTime.Now:HHmmss}.dmp", file, false, true);
             return 0;
         }
         finally

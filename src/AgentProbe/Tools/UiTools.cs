@@ -22,8 +22,11 @@ internal static partial class UiTools
     [
         new("windows", "Desktop", "Top-level windows: title, process, position, and whether they are hung",
             """
-            windows [filter] [--all]
+            windows [filter] [--all] [--class]
               Visible titled windows by default (--all includes hidden/untitled). "NOT RESPONDING" marks a hung UI thread.
+              "popup" marks an open menu or drop-down (untitled, shown as [its class]): the cheap way to ask "is the
+              menu up?". "console" marks a console window, whose title is often an exe path that matches the app's
+              name. --class adds each window's class.
               "SYSTEM PROMPT" marks a dialog of Windows itself (firewall, UAC, credentials, SmartScreen, a packaged
               app's file picker) that the person at the PC has to answer; those are listed whatever the filter.
               Much cheaper than a screenshot for "did the dialog appear?" / "is the app frozen?".
@@ -37,7 +40,9 @@ internal static partial class UiTools
         new("click", "Desktop", "Click at a position of the latest screenshot",
             """
             click <x> <y> [--button left|right|middle] [--double] [--hover] [--screen]
-              x,y are pixels in your most recent screenshot (crop and scale are undone for you).
+            click @<x>,<y> ...               screen coordinates, exactly as `ui` prints them
+              x,y are pixels in your most recent screenshot (crop and scale are undone for you). A point that
+              falls outside the desktop is refused, not clicked. By name instead: ui click / ui rclick / ui dblclick.
               --hover only moves the pointer there (tooltips, hover states, menus that open on hover).
               --screen means raw desktop coordinates instead. Windows of elevated apps ignore input unless
               agentprobe itself runs elevated on the target.
@@ -92,10 +97,17 @@ internal static partial class UiTools
 
     private static Task<int> WindowsAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "all");
+        var a = ArgParser.Parse(args, "all", "class");
         var names = ProcessSnapshot.Take().ToDictionary(p => p.Pid, p => p.Name);
         var foreground = Win32.GetForegroundWindow();
-        var t = new Table("HWND", ">PID", "PROCESS", "POSITION", "STATE", "TITLE");
+        var withClass = a.Flag("class");
+        var t = withClass ? new Table("HWND", ">PID", "PROCESS", "POSITION", "STATE", "CLASS", "TITLE") : new Table("HWND", ">PID", "PROCESS", "POSITION", "STATE", "TITLE");
+        void Row(string hwnd, int pid, string process, string position, string state, string cls, string title)
+        {
+            if (withClass) t.Add(hwnd, pid, process, position, state, Format.Clip(cls, 40), title);
+            else t.Add(hwnd, pid, process, position, state, title);
+        }
+
         var windows = EnumerateWindows();
 
         // Prompts Windows shows in windows of its own (firewall, UAC, credentials) are listed whatever the filter:
@@ -105,19 +117,21 @@ internal static partial class UiTools
         foreach (var p in prompts)
         {
             var where = p.Rect.Width > 1 ? $"{p.Rect.Left},{p.Rect.Top} {p.Rect.Width}x{p.Rect.Height}" : "";
-            t.Add(p.Hwnd != 0 ? "0x" + ((long)p.Hwnd).ToString("X") : "-", p.Pid, p.Process, where, "SYSTEM PROMPT", Format.Clip(p.Title, 90));
+            Row(p.Hwnd != 0 ? "0x" + ((long)p.Hwnd).ToString("X") : "-", p.Pid, p.Process, where, "SYSTEM PROMPT", "", Format.Clip(p.Title, 90));
         }
 
         foreach (var w in windows)
         {
             if (w.Pid == Environment.ProcessId) continue; // our own "remote control active" banner
             if (promptPids.Contains(w.Pid) && !a.Flag("all")) continue; // shown above as one line
-            if (!a.Flag("all") && (!w.Visible || w.Title.Length == 0 || (w.Rect.Width <= 1 && !w.Minimized))) continue;
+            var popup = IsPopup(w);
+            if (!a.Flag("all") && !popup && (!w.Visible || w.Title.Length == 0 || (w.Rect.Width <= 1 && !w.Minimized))) continue;
             var process = names.GetValueOrDefault(w.Pid, "?");
             if (a.Positionals.Count > 0 && !w.Title.Contains(a.Positionals[0], StringComparison.OrdinalIgnoreCase) && !process.Contains(a.Positionals[0], StringComparison.OrdinalIgnoreCase)) continue;
-            var state = w.Hung ? "NOT RESPONDING" : !w.Visible ? "hidden" : w.Minimized ? "minimized" : w.Hwnd == foreground ? "foreground" : "";
+            var state = w.Hung ? "NOT RESPONDING" : !w.Visible ? "hidden" : w.Minimized ? "minimized" : popup ? "popup" : w.Hwnd == foreground ? "foreground" : "";
+            if (w.Class is "ConsoleWindowClass" or "CASCADIA_HOSTING_WINDOW_CLASS" or "PseudoConsoleWindow") state = (state + " console").TrimStart();
             var pos = w.Minimized ? "" : $"{w.Rect.Left},{w.Rect.Top} {w.Rect.Width}x{w.Rect.Height}";
-            t.Add("0x" + ((long)w.Hwnd).ToString("X"), w.Pid, process, pos, state, Format.Clip(w.Title.Length > 0 ? w.Title : $"[{w.Class}]", 90));
+            Row("0x" + ((long)w.Hwnd).ToString("X"), w.Pid, process, pos, state, w.Class, Format.Clip(w.Title.Length > 0 ? w.Title : $"[{w.Class}]", 90));
         }
 
         ctx.Out.Write(t.Count > 0 ? t.ToString() : "no matching windows\n");
@@ -125,6 +139,51 @@ internal static partial class UiTools
         if (SystemPrompts.SecureDesktopShowing())
             ctx.Out.WriteLine("The secure desktop is showing (a UAC prompt, the lock screen or Ctrl+Alt+Del): the windows above cannot be seen or clicked until the person there answers.");
         return Task.FromResult(0);
+    }
+
+    /// <summary>
+    /// An open menu, context menu or drop-down: a visible untitled window that belongs to another window (or is a
+    /// Win32 menu). Shadows, tooltips and input-method helpers are owned and untitled too, and are left out.
+    /// </summary>
+    private static bool IsPopup(WindowInfo w)
+    {
+        if (!w.Visible || w.Minimized || w.Title.Length > 0 || w.Rect.Width < 16 || w.Rect.Height < 8) return false;
+        if (w.Class == "#32768") return true; // a Win32 menu
+        if (w.Class is "SysShadow" or "tooltips_class32" or "IME" or "MSCTFIME UI" or "Default IME" or "WorkerW" || w.Class.Contains("Shadow", StringComparison.OrdinalIgnoreCase)) return false;
+        return Win32.GetWindow(w.Hwnd, 4) != 0; // GW_OWNER
+    }
+
+    /// <summary>
+    /// A click is refused when it would land outside the desktop: that happens when screen coordinates (what `ui`
+    /// prints as @x,y) are given as if they were pixels of a scaled or cropped screenshot, and it would press
+    /// whatever sits at the edge of the screen instead.
+    /// </summary>
+    private static string? OutsideDesktop(int x, int y, bool raw)
+    {
+        var (vx, vy, vw, vh) = (Win32.GetSystemMetrics(76), Win32.GetSystemMetrics(77), Win32.GetSystemMetrics(78), Win32.GetSystemMetrics(79));
+        if (x >= vx && y >= vy && x < vx + vw && y < vy + vh) return null;
+        return $"{x},{y} is outside the desktop ({vx},{vy} {vw}x{vh}); nothing was done. " + (raw
+            ? "Screen coordinates were given: check them against `windows` or `ui`."
+            : $"Plain coordinates are pixels of your latest screenshot (scale {_shotScale.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)}, taken at {_shotX},{_shotY}). " +
+              "The @x,y that `ui` prints are screen coordinates: give them as @x,y (click @1876,1006) or add --screen.");
+    }
+
+    /// <summary>Turns "@x,y" (the form `ui` prints: screen coordinates) into two numbers. True when any was given.</summary>
+    private static bool ExpandAt(ArgParser a)
+    {
+        var any = false;
+        for (var i = a.Positionals.Count - 1; i >= 0; i--)
+        {
+            var p = a.Positionals[i];
+            if (p.Length < 4 || p[0] != '@') continue;
+            var parts = p[1..].Split(',');
+            if (parts.Length != 2) continue;
+            a.Positionals.RemoveAt(i);
+            a.Positionals.InsertRange(i, parts);
+            any = true;
+        }
+
+        return any;
     }
 
     // ------------------------------------------------------------------ screenshot
@@ -284,8 +343,10 @@ internal static partial class UiTools
     private static async Task<int> ClickAsync(ToolContext ctx, string[] args)
     {
         var a = ArgParser.Parse(args, "double", "screen", "hover");
+        var raw = ExpandAt(a) | a.Flag("screen");
         if (!Coordinates(ctx, a, 2, out var v)) return 2;
-        var (x, y) = ToScreen(v[0], v[1], a.Flag("screen"));
+        var (x, y) = ToScreen(v[0], v[1], raw);
+        if (OutsideDesktop(x, y, raw) is { } outside) return ctx.Fail("click: " + outside);
         if (a.Flag("hover"))
         {
             // Two steps, so the window under the pointer sees a real movement and not only a jump.
@@ -320,9 +381,11 @@ internal static partial class UiTools
     private static async Task<int> DragAsync(ToolContext ctx, string[] args)
     {
         var a = ArgParser.Parse(args, "screen");
+        var raw = ExpandAt(a) | a.Flag("screen"); // both ends in the same kind of coordinates
         if (!Coordinates(ctx, a, 4, out var v)) return 2;
-        var (x1, y1) = ToScreen(v[0], v[1], a.Flag("screen"));
-        var (x2, y2) = ToScreen(v[2], v[3], a.Flag("screen"));
+        var (x1, y1) = ToScreen(v[0], v[1], raw);
+        var (x2, y2) = ToScreen(v[2], v[3], raw);
+        if ((OutsideDesktop(x1, y1, raw) ?? OutsideDesktop(x2, y2, raw)) is { } outside) return ctx.Fail("drag: " + outside);
         Mouse(x1, y1, 0x0001);
         await Task.Delay(50, ctx.Ct);
         Mouse(x1, y1, 0x0002);
@@ -349,10 +412,12 @@ internal static partial class UiTools
     private static unsafe Task<int> ScrollAsync(ToolContext ctx, string[] args)
     {
         var a = ArgParser.Parse(args, "screen");
+        var raw = ExpandAt(a) | a.Flag("screen");
         if (a.Positionals.Count == 0 || !int.TryParse(a.Positionals[0], out var notches)) return Task.FromResult(ctx.Fail("scroll: how many notches? (negative = down)"));
         if (a.Positionals.Count >= 3 && double.TryParse(a.Positionals[1], out var px) && double.TryParse(a.Positionals[2], out var py))
         {
-            var (x, y) = ToScreen(px, py, a.Flag("screen"));
+            var (x, y) = ToScreen(px, py, raw);
+            if (OutsideDesktop(x, y, raw) is { } outside) return Task.FromResult(ctx.Fail("scroll: " + outside));
             Mouse(x, y, 0x0001);
         }
 

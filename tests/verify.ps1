@@ -221,6 +221,45 @@ try {
     Check 'wait --idle --below: a busy process times out, and the message says what it used' ($r.Code -eq 124 -and $r.Out -match 'last used (\d+)(\.\d+)?% of a core' -and [double]$Matches[1] -gt 50) "$($r.Code) $($r.Out)"
     Check 'wait --below without --idle is an error' ((AP -t local wait --below 5 --timeout 1s).Code -notin 0, 124) ''
 
+    # The managed heap, against a process whose objects are known: 321 kept in a static list, 500 dropped.
+    $heapReady = Join-Path $work 'heap-ready.txt'
+    $heapScript = "Add-Type 'public class ApVerifyLeak { public byte[] Data = new byte[1000]; } public static class ApVerifyHolder { public static System.Collections.Generic.List<ApVerifyLeak> Kept = new System.Collections.Generic.List<ApVerifyLeak>(); }'; 1..321 | ForEach-Object { [ApVerifyHolder]::Kept.Add((New-Object ApVerifyLeak)) }; 1..500 | ForEach-Object { `$null = New-Object ApVerifyLeak }; 'ready' | Set-Content '$heapReady'; Start-Sleep 600"
+    $managed = Start-Process powershell -ArgumentList '-NoProfile', '-Command', $heapScript -WindowStyle Hidden -PassThru
+    1..60 | ForEach-Object { if (-not (Test-Path $heapReady)) { Start-Sleep -Milliseconds 500 } }
+    $r = AP -t local heap $managed.Id --type ApVerifyLeak --live
+    Check 'heap --live counts exactly the objects that are still referenced (321)' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s*321\s+\S+\s+ApVerifyLeak\s*$') $r.Out
+    $r = AP -t local heap $managed.Id --type ApVerifyLeak
+    $all = if ($r.Out -match '(?m)^\s*(\d+)\s+\S+\s+ApVerifyLeak\s*$') { [int]$Matches[1] } else { -1 }
+    Check 'heap without --live also counts garbage (321..821) and says so' ($all -ge 321 -and $all -le 821 -and $r.Out -match 'garbage not yet collected included') "$all / $($r.Out)"
+    $r = AP -t local heap $managed.Id --why ApVerifyLeak
+    Check 'heap --why: the chain from the root, through the list that holds it, to the object' ($r.Code -eq 0 -and $r.Out -match '(?m)^root: ' -and $r.Out -match 'List<ApVerifyLeak> \(\d+B\)\s+-> \._items' -and ($r.Out -split "`n")[-1] -match '^\s+ApVerifyLeak \(\d+B\)$') $r.Out
+    $r = AP -t local heap $managed.Id --why NoSuchTypeForVerify
+    Check 'heap --why for a type nothing reachable has: says so, with how much was looked at' ($r.Out -match "no reachable object whose type contains 'NoSuchTypeForVerify' \([\d,]+ reachable objects looked at\)") $r.Out
+    Stop-Process -Id $managed.Id -Force
+    $native = Start-Process ping -ArgumentList '-n', '60', '127.0.0.1' -WindowStyle Hidden -PassThru; Start-Sleep 1
+    $r = AP -t local heap $native.Id
+    Check 'heap: a process without .NET is an error, not an empty heap' ($r.Code -ne 0 -and $r.Out -match 'no \.NET runtime is loaded') "$($r.Code) $($r.Out)"
+    Stop-Process -Id $native.Id -Force
+    $ps32 = "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+    if (Test-Path $ps32) {
+        $x86 = Start-Process $ps32 -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 60' -WindowStyle Hidden -PassThru; Start-Sleep 2
+        $r = AP -t local heap $x86.Id
+        Check 'heap: a 32-bit process is refused with the reason, nothing is guessed' ($r.Code -ne 0 -and $r.Out -match 'is a 32-bit process') "$($r.Code) $($r.Out)"
+        Stop-Process -Id $x86.Id -Force
+    }
+
+    # A click must not land outside the desktop, and the coordinates `ui` prints can be passed as they are.
+    $r = AP -t local click 999999 999999 --screen
+    Check 'click: a point outside the desktop is refused, not clicked' ($r.Code -ne 0 -and $r.Out -match 'is outside the desktop' -and $r.Out -match 'nothing was done') "$($r.Code) $($r.Out)"
+    $r = AP -t local click '@999999,999999'
+    Check 'click @x,y is read as screen coordinates' ($r.Code -ne 0 -and $r.Out -match '999999,999999 is outside the desktop' -and $r.Out -match 'Screen coordinates were given') "$($r.Code) $($r.Out)"
+    $r = AP -t local dump $helper.Id --keep-remote
+    $kept = if ($r.Out -match 'kept on the target: (.+\.dmp)') { $Matches[1].Trim() } else { $null }
+    Check 'dump --keep-remote leaves the dump on the target and prints where' ($r.Code -eq 0 -and $kept -and (Test-Path $kept) -and (Get-Item $kept).Length -gt 10000) $r.Out
+    if ($kept) { Remove-Item $kept -Force -ErrorAction SilentlyContinue }
+    $r = AP -t local windows --class
+    Check 'windows --class adds the class of each window' ($r.Out -match '(?m)^HWND\s+PID\s+PROCESS\s+POSITION\s+STATE\s+CLASS\s+TITLE') ($r.Out -split "`n" | Select-Object -First 1)
+
     # A question from Windows itself (here: a credential prompt) must show up in `windows`, `triage` and after `exec`.
     # It appears on the screen for a few seconds, so it is left out on a PC someone is using.
     if (-not $SkipInput) {
