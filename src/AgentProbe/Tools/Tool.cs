@@ -41,6 +41,7 @@ internal static class ToolRegistry
         .. ProcessTools.Tools,
         .. SystemTools.Tools,
         .. NetTools.Tools,
+        .. FirewallTools.Tools,
         .. EventTools.Tools,
         .. DebugOutputTools.Tools,
         .. DepsTool.Tools,

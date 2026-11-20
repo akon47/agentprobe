@@ -68,7 +68,9 @@ agentprobe kill app
   would end at once while the app runs on untracked. With `--exe` the job has the app's pid and its exit code
   (crash codes are named), and `kill <job>` / `wait --job <job>` act on the app.
 - A program that opens a network port from a new path (anything you `push` and run) makes Windows Firewall ask
-  the person at the target to allow it. `windows`, `triage` and the end of `exec`/`start` output report such a
+  the person at the target to allow it. On an elevated target run `firewall allow <exe>` BEFORE starting it: that is
+  the prompt's "Allow" as a rule for this session, and the prompt never appears. If one is already up,
+  `firewall dismiss <pid>` closes it like "Cancel" (its buttons cannot be pressed remotely). `windows`, `triage` and the end of `exec`/`start` output report such a
   SYSTEM PROMPT with its title (also UAC, credentials, SmartScreen, a packaged app's file picker); you cannot answer
   it remotely, so tell the user. This is found by the system process that shows the dialog, as Windows 11 does it:
   on a Windows that shows the firewall question another way it is not reported, so a silent stall after starting

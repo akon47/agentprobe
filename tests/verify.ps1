@@ -552,12 +552,39 @@ Add-Type -AssemblyName System.Windows.Forms
                 Check 'history lists what was run, with exit codes' ($h -match 'exit 7\s+exec Write-Output' -and $h -match 'exit 124') $h
                 $shotR = Join-Path $work 'remote.png'; [void](AP -t verify screenshot --scale 0.25 -o $shotR)
                 Check 'screenshot arrives over the session' ((Test-Path $shotR) -and (Get-Item $shotR).Length -gt 1000) ''
+                # The firewall: "allow" is a rule for the length of the session. It needs administrator rights, which
+                # this script has on the build machine and usually not on a developer's PC; both cases are checked.
+                $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+                $fwApp = Join-Path $work 'fwapp.exe'; Copy-Item "$env:WINDIR\System32\where.exe" $fwApp
+                $fwBlocked = Join-Path $work 'fwblocked.exe'; Copy-Item "$env:WINDIR\System32\where.exe" $fwBlocked
+                Check 'firewall show: a program without a rule is said to have none' ((AP -t verify firewall show $fwApp).Out -match '^no inbound rule for ') ''
+                $r = AP -t verify firewall allow $fwApp
+                if (-not $elevated) {
+                    Check 'firewall allow without administrator rights: refused with the reason, nothing changed' ($r.Code -ne 0 -and $r.Out -match 'needs an elevated target' -and -not (Get-NetFirewallApplicationFilter -Program $fwApp -ErrorAction SilentlyContinue)) "$($r.Code) $($r.Out)"
+                } else {
+                    $made = @(Get-NetFirewallApplicationFilter -Program $fwApp -ErrorAction SilentlyContinue | Get-NetFirewallRule)
+                    Check 'firewall allow adds an enabled inbound allow rule for exactly that program' ($r.Code -eq 0 -and $made.Count -eq 1 -and "$($made[0].Action)" -eq 'Allow' -and "$($made[0].Direction)" -eq 'Inbound' -and "$($made[0].Enabled)" -eq 'True') "$($r.Code) $($r.Out)"
+                    Check 'firewall show lists it' ((AP -t verify firewall show $fwApp).Out -match '(?m)^allow\s+yes\s+agentprobe session fwapp\.exe') (AP -t verify firewall show $fwApp).Out
+                    [void](New-NetFirewallRule -DisplayName 'agentprobe verify block' -Direction Inbound -Program $fwBlocked -Action Block)
+                    $r = AP -t verify firewall allow $fwBlocked
+                    $block = Get-NetFirewallRule -DisplayName 'agentprobe verify block'
+                    Check 'firewall allow switches off a block rule for the same program (a block would win)' ($r.Code -eq 0 -and $r.Out -match 'switched off the block rule' -and "$($block.Enabled)" -eq 'False') "$($r.Code) $($r.Out)"
+                }
+                Check 'firewall dismiss refuses a pid that shows no system dialog' ((AP -t verify firewall dismiss $PID).Code -ne 0 -and (AP -t verify firewall dismiss $PID).Out -match 'shows no system dialog') ''
+
                 # Closing the start screen's window asks for this: it must never cut off a connected PC,
                 # and with nothing connected it must leave no process behind (the exe stays locked otherwise).
                 $k = AP stop --if-idle
                 Check 'stop --if-idle keeps the background process while a PC is connected' ($k.Out -match 'kept running: 1 target PC is connected' -and (AP list).Out -match '(?m)^verify\s') $k.Out
                 $e = AP -t verify end
                 Check 'end closes the session and removes the workspace' ($e.Code -eq 0 -and $share.WaitForExit(8000)) $e.Out
+                if ($elevated) {
+                    $after = @(Get-NetFirewallApplicationFilter -Program $fwApp -ErrorAction SilentlyContinue)
+                    $block = Get-NetFirewallRule -DisplayName 'agentprobe verify block' -ErrorAction SilentlyContinue
+                    Check 'end takes the session''s firewall rule away and switches the block rule back on' ($after.Count -eq 0 -and $block -and "$($block.Enabled)" -eq 'True') "rules left: $($after.Count), block enabled: $($block.Enabled)"
+                    Get-NetFirewallRule -DisplayName 'agentprobe verify block' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+                    Get-NetFirewallRule -DisplayName 'agentprobe session fw*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+                }
                 Start-Sleep 1
                 $k = AP stop --if-idle
                 Start-Sleep 2
