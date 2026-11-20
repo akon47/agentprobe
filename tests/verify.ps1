@@ -245,7 +245,7 @@ public static class CredPrompt {
             Start-Sleep 1
             $w = (AP -t local windows).Out; $tr = (AP -t local triage).Out; $ex = (AP -t local exec 'Write-Output ran').Out
             Check 'windows marks a prompt from Windows itself as SYSTEM PROMPT' ($w -match "(?m)\s$($broker.Id)\s+CredentialUIBroker\.exe\s.*SYSTEM PROMPT") $w
-            Check 'triage and exec report the waiting system prompt' ($tr -match "(?m)^prompt\s.*CredentialUIBroker\.exe pid $($broker.Id)" -and $ex -match 'ran' -and $ex -match 'a system prompt is waiting') "$tr`n$ex"
+            Check 'triage and exec report the waiting system prompt' ($tr -match "(?m)^prompt\s.*CredentialUIBroker\.exe pid $($broker.Id)" -and $ex -match 'ran' -and $ex -match 'a system dialog is waiting') "$tr`n$ex"
         }
         Stop-Process -Id $prompter.Id -Force -ErrorAction SilentlyContinue; Start-Sleep 1
         Get-Process CredentialUIBroker -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep 1
