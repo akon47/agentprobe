@@ -69,7 +69,6 @@ input[type=checkbox]{accent-color:var(--accent)}
 .tag.admin{color:#b45309;background:color-mix(in srgb,var(--busy) 12%,var(--surface));border-color:color-mix(in srgb,var(--busy) 35%,var(--border))}
 :root[data-theme=dark] .tag.admin{color:var(--busy)}
 kbd{font:500 11px var(--ui);color:var(--faint);border:1px solid var(--border);border-radius:4px;padding:0 5px;background:var(--subtle)}
-
 /* ---------- frame */
 .app{display:grid;grid-template-rows:auto auto 1fr;height:100%}
 .top{display:flex;align-items:center;gap:10px;height:56px;padding:0 20px;background:var(--surface);border-bottom:1px solid var(--border)}
@@ -130,6 +129,19 @@ kbd{font:500 11px var(--ui);color:var(--faint);border:1px solid var(--border);bo
 .cmd{margin-top:11px;padding-top:10px;border-top:1px solid var(--border);font:12px var(--mono);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cmd:empty{display:none}
 
+/* ---------- small labels in a fixed-height pill (count, rights, state, age)
+   They are centred on the height of the capitals. Centring the font's own line box, which is all a flex container
+   can do, leaves digits and Hangul about a pixel too high at these sizes. Browsers without text-box get a nudge. */
+@supports (text-box:trim-both cap alphabetic){
+  .kpi b,.tag{display:inline-block;align-content:center;text-align:center}
+  .kpi b,.tag,.age,.bs{text-box:trim-both cap alphabetic}
+  .age{align-content:center}
+}
+@supports not (text-box:trim-both cap alphabetic){
+  .kpi b,.tag,.badge{padding-top:2px}
+  .age{line-height:22px}
+}
+
 /* ---------- list */
 .listwrap{border:1px solid var(--border);border-radius:12px;background:var(--surface);box-shadow:var(--shadow-sm);overflow:auto}
 table.list{width:100%;border-collapse:separate;border-spacing:0}
@@ -182,14 +194,22 @@ pre.wrap{white-space:pre-wrap;word-break:break-word}
 @keyframes sp{to{transform:rotate(360deg)}}
 
 /* ---------- agent sheet + toast */
-.modal{position:fixed;inset:0;background:rgba(9,9,11,.5);backdrop-filter:blur(2px);display:none;place-items:center;z-index:8;padding:24px}
+/* One grid cell exactly as large as the window: without it the cell grows with its content, the dialog's
+   max-height has nothing to hold on to, and a tall dialog runs off the bottom with no way to scroll. */
+.modal{position:fixed;inset:0;background:rgba(9,9,11,.5);backdrop-filter:blur(2px);display:none;grid-template:minmax(0,1fr)/minmax(0,1fr);place-items:center;z-index:8;padding:24px}
 .modal.open{display:grid;animation:fade .14s ease-out}
 @keyframes fade{from{opacity:0}}
 .sheet{background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow-lg);width:min(780px,100%);max-height:100%;display:flex;flex-direction:column}
 .sheet header{display:flex;align-items:center;gap:10px;padding:18px 20px 4px}
 .sheet h2{margin:0;font-size:17px;font-weight:600;flex:1;letter-spacing:-.015em}
-.sheet .body{padding:2px 20px 20px;overflow:auto}
+.sheet .body{padding:2px 20px 20px;overflow:auto;min-height:0}
 .sheet p{color:var(--muted);margin:6px 0}
+.sheet.sm{width:min(560px,100%)}
+.sheet .say{white-space:pre-wrap;color:var(--fg2);margin:8px 0 0}
+.sheet .note{white-space:pre-wrap;font-size:12.5px;line-height:1.55;margin:12px 0 0;padding:10px 12px;border-radius:var(--r);color:var(--fg2);border:1px solid color-mix(in srgb,var(--busy) 35%,var(--border));background:color-mix(in srgb,var(--busy) 10%,var(--surface))}
+.sheet .acts{display:flex;gap:8px;margin-top:16px}
+a.btn{text-decoration:none}
+[hidden]{display:none!important}
 .step{display:flex;gap:12px;align-items:flex-start;margin-top:18px}
 .step>b{flex:none;width:22px;height:22px;border-radius:50%;background:var(--fg);color:var(--bg);display:grid;place-items:center;font-size:11.5px;font-weight:600}
 .step>div{flex:1;min-width:0}.step .t{font-weight:600}
@@ -217,6 +237,7 @@ pre.wrap{white-space:pre-wrap;word-break:break-word}
     </nav>
     <div class="grow"></div>
     <div class="conn" id="conn"><span class="dot idle"></span><span>live</span></div>
+    <button class="btn" id="upd-open" hidden><span class="dot busy"></span><span id="upd-label"></span></button>
     <button class="btn primary" id="agent-open" data-t="ag_btn">Connect an agent</button>
     <select id="lang" title="Language"><option value="en">English</option><option value="ko">한국어</option></select>
     <button class="btn icon" id="theme" title="Light / dark (T)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
@@ -250,6 +271,7 @@ pre.wrap{white-space:pre-wrap;word-break:break-word}
           <h2><span class="dot" id="d-dot"></span><span id="d-name"></span><span class="tag" id="d-rights"></span></h2>
           <div class="sub" id="d-sub"></div>
         </div>
+        <button class="btn" id="d-update" hidden></button>
         <button class="btn" id="d-rename" data-t="rename">Rename</button>
         <button class="btn icon" id="d-close" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </div>
@@ -275,6 +297,13 @@ pre.wrap{white-space:pre-wrap;word-break:break-word}
       <div class="copy"><code id="ag-mcp2"></code><button class="btn" data-copy="ag-mcp2" data-t="copy">Copy</button></div></div></div>
     <div class="step"><b>4</b><div><div class="t" data-t="ag_3"></div><p data-t="ag_3d"></p><div class="guide"><pre class="wrap" id="ag-guide"></pre></div></div></div>
   </div></div></div>
+<div class="modal" id="upd"><div class="sheet sm">
+  <header><h2 id="upd-title"></h2><button class="btn icon" id="upd-close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button></header>
+  <div class="body">
+    <div class="say" id="upd-text"></div>
+    <div class="note" id="upd-notice" hidden></div>
+    <div class="acts"><button class="btn primary" id="upd-go"></button><a class="btn" id="upd-page" target="_blank" rel="noreferrer" data-t="upd_notes" hidden></a></div>
+  </div></div></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -293,7 +322,7 @@ const I18N = {
     empty_t: 'No PC has connected yet', empty_d: 'Share a PC and it appears here by itself.',
     empty_1: 'Copy <code>agentprobe.exe</code> to the PC you want to test.', empty_2: 'Run it there and approve this PC.', empty_3: 'Use <code>agentprobe list</code> or this page.',
     none_t: 'Nothing matches', none_d: 'Clear the search or pick another filter.',
-    waiting: 'waiting for screen…', spaused: 'screens paused', admin: 'admin', user: 'user', ago: '{0} ago',
+    waiting: 'waiting for screen…', spaused: 'screens paused', admin: 'Admin', user: 'User', ago: '{0} ago',
     h_name: 'Name', h_state: 'State', h_machine: 'Machine', h_user: 'User', h_address: 'Address', h_os: 'OS', h_last: 'Last command', h_ver: 'Ver',
     rename: 'Rename', t_overview: 'Overview', t_screen: 'Screen', t_processes: 'Processes', t_activity: 'Activity', t_console: 'Console',
     refresh: 'Refresh', noout: '(no output)', is_offline: '{0} is offline', last_seen: 'Last seen {0}.', last_cmd: 'Last command',
@@ -306,6 +335,11 @@ const I18N = {
     c_ph: 'command, e.g.  exec Get-Date', run: 'Run', rename_q: 'Name for this PC (no spaces; empty = use the machine name)', renamed: 'Renamed',
     u_s: 's', u_m: 'm', u_h: 'h', u_d: 'd',
     ag_btn: 'Connect an agent', ag_title: 'Connect an AI agent', copy: 'Copy', copied: 'Copied',
+    upd_btn: 'Update {0}', upd_title: 'Update agentprobe to {0}', upd_go: 'Update now', upd_force: 'Update anyway', upd_working: 'Updating...', upd_notes: 'Release notes',
+    upd_lead: 'This PC runs {0}. The new exe is downloaded from the release, checked against its SHA-256 and put in the place of the current one. agentprobe then restarts by itself.',
+    upd_online: 'Connected PCs ({0}) reconnect by themselves within seconds.', upd_reload: 'This page reloads when the new version is up.',
+    upd_t_btn: 'Update to {0}', upd_t_title: 'Update {0}',
+    upd_t_lead: '{0} runs agentprobe {1}; this PC has {2}. This PC sends its exe there, and agentprobe restarts on that PC in a new window. The session, its approval and its workspace carry over.',
     ag_lead: 'agentprobe is a command-line tool, so any agent that can run shell commands on this PC can use it: Claude Code, Codex, Gemini CLI, Cursor and others. The steps are the same for all of them and there is nothing to install or register.',
     ag_1: 'Tell the agent the tool exists', ag_1d: 'Add this line to the instructions file your agent reads in the project (CLAUDE.md, AGENTS.md, ...). The wording is the same for every agent.',
     ag_2: 'Or just say it once in the chat', ag_2d: 'For a one-off session, paste this to the agent:',
@@ -335,6 +369,11 @@ const I18N = {
     c_ph: '명령 (예: exec Get-Date)', run: '실행', rename_q: '이 PC의 이름 (공백 없이, 비우면 컴퓨터 이름 사용)', renamed: '이름을 바꿨습니다',
     u_s: '초', u_m: '분', u_h: '시간', u_d: '일',
     ag_btn: '에이전트 연결', ag_title: 'AI 에이전트 연결', copy: '복사', copied: '복사했습니다',
+    upd_btn: '업데이트 {0}', upd_title: 'agentprobe {0}(으)로 업데이트', upd_go: '지금 업데이트', upd_force: '그래도 업데이트', upd_working: '업데이트하는 중...', upd_notes: '릴리스 노트',
+    upd_lead: '이 PC는 {0}입니다. 새 exe를 릴리스에서 내려받아 SHA-256을 확인한 뒤 지금 exe 자리에 놓습니다. 그다음 agentprobe가 스스로 다시 시작합니다.',
+    upd_online: '연결된 PC({0}대)는 몇 초 안에 스스로 다시 연결됩니다.', upd_reload: '새 버전이 뜨면 이 페이지가 다시 열립니다.',
+    upd_t_btn: '{0}(으)로 업데이트', upd_t_title: '{0} 업데이트',
+    upd_t_lead: '{0}은(는) agentprobe {1}이고 이 PC는 {2}입니다. 이 PC의 exe를 그 PC로 보내면 거기서 agentprobe가 새 창으로 다시 시작합니다. 세션, 승인, 작업 폴더는 그대로 이어집니다.',
     ag_lead: 'agentprobe는 명령줄 도구이므로, 이 PC에서 셸 명령을 실행할 수 있는 에이전트라면 무엇이든 쓸 수 있습니다. Claude Code, Codex, Gemini CLI, Cursor 모두 방법이 같고, 설치하거나 등록할 것은 없습니다.',
     ag_1: '에이전트에게 도구가 있다고 알려 주기', ag_1d: '프로젝트에서 에이전트가 읽는 지침 파일(CLAUDE.md, AGENTS.md 등)에 이 한 줄을 넣으세요. 어떤 에이전트든 문구는 같습니다.',
     ag_2: '또는 대화에서 한 번만 말하기', ag_2d: '한 번만 쓸 때는 에이전트에게 이렇게 붙여 넣으세요.',
@@ -503,6 +542,7 @@ function header() {
   $('#d-dot').className = 'dot ' + t.state; $('#d-name').textContent = t.name;
   const r = $('#d-rights'); r.textContent = rightsText(t); r.className = 'tag' + (t.admin === '1' ? ' admin' : '');
   $('#d-sub').textContent = `${t.user}@${t.machine} · ${t.address} · ${t.os} · ${stateText(t)} · agentprobe ${t.version}`;
+  const u = $('#d-update'); u.hidden = !info || t.state === 'offline' || t.version === info.version; if (!u.hidden) u.textContent = T('upd_t_btn', info.version);
 }
 function open(id) { sel = id; $('#drawer').classList.add('open'); header(); showTab(tab); render(); }
 function close() { sel = null; $('#drawer').classList.remove('open'); render(); }
@@ -571,7 +611,7 @@ $('#pane').addEventListener('keydown', e => {
 });
 $('#agent-open').onclick = async () => {
   $('#agent').classList.add('open');
-  try { const r = await api('/api/info'); if (r.ok) { info = await r.json(); agentText(); } } catch {}
+  try { const r = await api('/api/info?lang=' + lang); if (r.ok) { info = await r.json(); agentText(); } } catch {}
   if (!$('#ag-guide').textContent) { const r = await api('/guide'); $('#ag-guide').textContent = r.ok ? await r.text() : ''; }
 };
 $('#agent-close').onclick = () => $('#agent').classList.remove('open');
@@ -580,6 +620,44 @@ $('#agent').addEventListener('click', e => {
   const b = e.target.closest('[data-copy]'); if (!b) return;
   navigator.clipboard.writeText(document.getElementById(b.dataset.copy).textContent).then(() => toast(T('copied')));
 });
+// ---------- updates: this PC from the newest release, a connected PC from this PC
+let myVersion = null, upd = null;   // upd: what the dialog is about, {id, name, version} for a connected PC or {} for this PC
+async function checkInfo() {
+  try { const r = await api('/api/info?lang=' + lang); if (!r.ok) return; info = await r.json(); } catch { return; }
+  if (myVersion && info.version !== myVersion) return location.reload();   // this PC was updated: the page of the new version
+  myVersion = info.version;
+  $('#upd-open').hidden = !info.latest; if (info.latest) $('#upd-label').textContent = T('upd_btn', info.latest);
+  if (P.has('update') && info.latest && !upd) { upd = {}; updShow(); }   // deep link, like ?agent
+  if (sel) header();
+}
+function updShow(text, notice) {
+  const self = !upd.id;
+  $('#upd-title').textContent = self ? T('upd_title', info.latest) : T('upd_t_title', upd.name);
+  $('#upd-text').textContent = text ?? (self ? T('upd_lead', info.version) + (+info.online ? ' ' + T('upd_online', info.online) : '') : T('upd_t_lead', upd.name, upd.version, info.version));
+  notice = notice ?? (self ? info.busyNotice : null);
+  $('#upd-notice').hidden = !notice; $('#upd-notice').textContent = notice || '';
+  const go = $('#upd-go'); go.hidden = false; go.disabled = false; go.dataset.force = notice ? '1' : ''; go.textContent = T(notice ? 'upd_force' : 'upd_go');
+  const page = $('#upd-page'); page.hidden = !self || !/^https:\/\//.test(info.page || ''); if (!page.hidden) page.href = info.page;
+  $('#upd').classList.add('open');
+}
+$('#upd-open').onclick = () => { upd = {}; updShow(); };
+$('#d-update').onclick = () => { const t = current(); if (t) { upd = {id: t.id, name: t.name, version: t.version}; updShow(); } };
+$('#upd-close').onclick = () => $('#upd').classList.remove('open');
+$('#upd').addEventListener('click', e => { if (e.target.id === 'upd') $('#upd').classList.remove('open'); });
+$('#upd-go').onclick = async () => {
+  const go = $('#upd-go'), self = !upd.id; go.disabled = true; $('#upd-text').textContent = T('upd_working'); $('#upd-notice').hidden = true;
+  let r, text;
+  try {
+    r = await api((self ? '/api/update?' : `/api/update-target?id=${encodeURIComponent(upd.id)}&`) + 'lang=' + lang + (go.dataset.force ? '&force=1' : ''), {method: 'POST'});
+    text = await r.text();
+  } catch (e) { return updShow(String(e)); }
+  if (r.status === 409) return updShow(null, text);   // commands are running: say what that means and offer 'anyway'
+  if (!r.ok) return updShow(text);
+  // 202: this PC's exe was replaced and agentprobe is restarting; the page reloads once the new version answers.
+  const restarting = self && r.status === 202;
+  $('#upd-text').textContent = text + (restarting ? '\n' + T('upd_reload') : ''); go.hidden = true; $('#upd-page').hidden = true;
+  if (restarting) { if (!upd.poll) upd.poll = setInterval(checkInfo, 1500); } else { checkInfo(); load(); }
+};
 $('#d-close').onclick = close;
 $('#d-rename').onclick = async () => {
   const t = current(); if (!t) return;
@@ -591,12 +669,12 @@ $('#q').oninput = render;
 $('#size').oninput = e => { document.documentElement.style.setProperty('--tile', e.target.value + 'px'); store('size', e.target.value); };
 $('#rate').onchange = e => { rate = +e.target.value; store('rate', rate); render(); refreshThumbs(); };
 $('#sort').onchange = e => { sortKey = e.target.value; asc = true; store('sort', sortKey); render(); };
-$('#lang').onchange = e => { lang = e.target.value; store('lang', lang); applyStatic(); $('#content').innerHTML = ''; render(); if (sel) showTab(tab); };
+$('#lang').onchange = e => { lang = e.target.value; store('lang', lang); applyStatic(); checkInfo(); $('#content').innerHTML = ''; render(); if (sel) showTab(tab); };
 const setTheme = t => { document.documentElement.dataset.theme = t; store('theme', t); };
 $('#theme').onclick = () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
 document.addEventListener('keydown', e => {
   const typing = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
-  if (e.key === 'Escape') { if ($('#agent').classList.contains('open')) $('#agent').classList.remove('open'); else if (typing) document.activeElement.blur(); else close(); }
+  if (e.key === 'Escape') { if ($('#upd').classList.contains('open')) $('#upd').classList.remove('open'); else if ($('#agent').classList.contains('open')) $('#agent').classList.remove('open'); else if (typing) document.activeElement.blur(); else close(); }
   if (typing) return;
   if (e.key === '/') { $('#q').focus(); e.preventDefault(); }
   if (e.key === 't') $('#theme').click();
@@ -610,7 +688,7 @@ $('#size').value = store('size') || 300; document.documentElement.style.setPrope
 $('#rate').value = rate; $('#sort').value = sortKey;
 applyStatic();
 if (P.has('agent')) $('#agent-open').click();
-load(); setInterval(load, 2500); setInterval(refreshThumbs, 1000); setInterval(tickAges, 1000);
+load(); checkInfo(); setInterval(checkInfo, 20000); setInterval(load, 2500); setInterval(refreshThumbs, 1000); setInterval(tickAges, 1000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { load(); refreshThumbs(); } });
 </script>
 </body>

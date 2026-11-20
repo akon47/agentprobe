@@ -11,7 +11,7 @@
 "It only happens on that PC." The usual answer is to install an SSH server there, open a firewall port, hand over
 credentials, and remember to undo all of it afterwards. **agentprobe** replaces that with one step:
 
-1. Copy `agentprobe.exe` to the PC with the problem and double-click it.
+1. Copy `agentprobe.exe` to the PC with the problem, double-click it and choose **Share this PC**.
 2. It finds your developer PC on the network by itself. The person at that PC presses **Enter** to allow it.
 3. Your agent (Claude Code, or you in a terminal) runs `agentprobe ...` commands on your PC. They execute over there.
 
@@ -91,7 +91,10 @@ about 2 KB in total, and its instructions tell the agent where the exe is, so an
 command line, where output can be piped, filtered and saved to files. Nothing is lost through MCP: `run` reaches
 every command in this README.
 
-Different subnet or VPN, where broadcast discovery cannot reach? Start it with the address instead:
+The tested PC looks for the developer PC on every network it is on: by broadcast, and by a probe to each address of
+every subnet up to /22 (1022 addresses), which is what finds it across a VPN, since VPN tunnels carry neither
+broadcast nor multicast. `agentprobe share --dry-run` lists where it looks and which developer PCs answer, without sharing anything. A developer PC
+behind a router or on a larger VPN is not found that way; start it with the address instead:
 `agentprobe share 192.168.0.20`.
 
 ## Why not just SSH?
@@ -123,7 +126,7 @@ Different subnet or VPN, where broadcast discovery cannot reach? Start it with t
 
 | Area | Commands |
 |---|---|
-| Run | `exec` (PowerShell, pwsh, 32-bit PowerShell, cmd), `start` / `jobs` / `logs` / `kill` background jobs, `wait` for a process, window, port, file, log line or idle CPU |
+| Run | `exec` (PowerShell, pwsh, 32-bit PowerShell, cmd; `exec -f script.ps1 -Arg value` sends a script with its arguments), `start` / `jobs` / `logs` / `kill` background jobs (`start --exe app.exe` tracks a GUI app itself), `wait` for a process, window, port, file, log line or idle CPU |
 | Files | `push`, `pull` (files and folders), `ls`, `read` (tail, grep, line ranges, only-new), `stat` (version, x86/x64, .NET or native, SHA-256, blocked-download flag), `locks` (who holds a file open) |
 | First look | `triage`: load, hung windows, recent crashes and errors, low disk, pending reboot, and what to try next |
 | Processes | `ps`, `top`, `proc`, `threads` (CPU per thread, wait reason, start module), `stacks` (call stacks of a live process, identical ones grouped), `modules` (loaded DLLs, versions, paths), `handles` (by type, and what grew), `vmmap` (which kind of memory grows: heaps, stacks, images, mapped files), `dump` (small or full memory dump, fetched to your PC) |
@@ -132,7 +135,7 @@ Different subnet or VPN, where broadcast discovery cannot reach? Start it with t
 | Logs | `events` (Windows event logs, filtered and de-duplicated), `crashes` (faulting module, exception code, dump files, blue screens), `dbg` (OutputDebugString capture, like DebugView) |
 | Monitor | `watch`: per-process private bytes, handles, GDI/USER objects, threads and CPU with growth rates and a leak verdict; process start/exit with decoded exit codes; windows that stop responding |
 | Capture | `trace` (which file and registry accesses FAIL for a process, counted and grouped: Process Monitor's most useful view as a short table), `crashdumps on` (Windows saves a dump whenever the app crashes), `wpr start/stop` (Windows Performance Recorder traces: CPU, disk, file, registry, heap) |
-| Desktop | `ui` (a window's controls as text; click, read and fill them by name), `windows`, `screenshot` (screen, display or one window, scaled), `click`, `drag`, `scroll`, `type`, `key`, `focus` |
+| Desktop | `ui` (a window's controls as text; click, read and fill them by name), `windows` (also flags a Windows prompt waiting for the person: firewall, UAC, credentials), `screenshot` (screen, display or one window, scaled), `click`, `drag`, `scroll`, `type`, `key`, `focus` |
 | Session | `list`, `dashboard`, `name`, `history`, `result`, `reboot --wait`, `end` |
 
 `agentprobe help` lists everything; `agentprobe help <command>` shows the options.
@@ -183,16 +186,56 @@ agentprobe dump MyApp --full -o .\dumps\       # open in WinDbg / Visual Studio 
   noted in that PC's activity log.
 - `agentprobe list --all` includes PCs that went offline, with when they were last seen and what they were doing.
 
-Double-clicking the exe picks the right role by itself. On a PC that has been used as a developer PC it shows the
-start screen; on any other PC it offers that PC for testing, and pressing `D` there says "this is my developer PC".
-`agentprobe share` and `agentprobe home` force either.
+Double-clicking the exe asks which side this PC is: `1` shares it for testing, `2` makes it the developer PC and shows
+the start screen. Enter takes what the PC was last time (a PC that has been a developer PC stays one; any other PC
+is shared). `agentprobe share` and `agentprobe home` go there without the question.
 
-The start screen is what you copy from: the dashboard link, the one line for your agent's instructions file, the
-`claude mcp add` / `codex mcp add` commands with this exe's path already filled in, and a prompt to paste into a chat.
-Press an item's number or click it to copy it (items highlight under the mouse), and the PCs that are connected are
-listed live. A command line stays at the bottom of the window: type `list`, `help` or `-t <name> triage` there instead
+The start screen is a short list of lines to click. Four of them copy what an agent needs: the one line for its
+instructions file, the `claude mcp add` / `codex mcp add` commands with this exe's path already filled in, and a
+prompt to paste into a chat. The others open the dashboard, list the connected PCs, share this PC, run the one-time
+setup and, when there is one, install an update. Click a line or press its number (lines highlight under the mouse);
+the PCs that are connected are listed live. A command line stays at the bottom of the window: type `list`, `help` or `-t <name> triage` there instead
 of opening another terminal. It adapts to the window size and works in Windows Terminal and in the classic console,
 from cmd and from PowerShell. Piped (an agent calling `agentprobe home`), the same information comes as plain text.
+Typing `share` there opens the sharing window for this PC.
+
+Closing a start screen that was opened by a double-click also ends agentprobe's background process, unless a PC is
+connected, another agentprobe command is in progress, or the dashboard page asked for something within the last 90
+seconds; the next `agentprobe` command starts it again. From a terminal,
+`agentprobe stop --if-idle` does the same and `agentprobe stop` always ends it.
+
+## Updates
+
+```powershell
+agentprobe update --check        # is there a newer release?
+agentprobe update                # install it on this PC
+agentprobe -t LAB-PC01 update    # bring a connected PC to this PC's version
+```
+
+agentprobe is one exe, and updating it keeps it that way. The background process on the developer PC looks at this
+repository's latest release twice a day (set `AGENTPROBE_NO_UPDATE_CHECK=1` to stop that; a tested PC never looks). When
+there is a newer one, the start screen shows a line to click, the dashboard a button, and `agentprobe list` says so
+in one line. Installing downloads `agentprobe.exe` and its `.sha256` from the release, refuses the file unless the
+checksum matches and the exe starts, moves the running exe aside (a running file cannot be overwritten, but it can be
+renamed), puts the new one in its place and restarts the background process from it. What was moved aside is deleted
+once nothing runs from it any more (at the latest when agentprobe is started the next time), so no second file stays
+behind. An open dashboard page reloads itself as the new
+version.
+
+Connected PCs keep their sessions through this: they reconnect by themselves within seconds and commands running
+there keep running. Only a command that is being waited for on the developer PC ends with "connection lost" and its
+run number (`agentprobe result <n>` fetches the result), so while commands are running the update explains this,
+ends with exit code 4 and waits for `--force`, or a second click.
+
+A tested PC is updated from the developer PC, not from the internet: `agentprobe -t <name> update` sends this PC's
+exe over the existing connection, and agentprobe restarts there from it in a new window, with the session, its
+approval and its workspace carried over. Background jobs and commands that are running there are not carried over,
+so that too asks for `--force` while there are any. A tested PC that still runs 0.1 has to get the new exe by hand
+once.
+
+The checksum comes from the same release as the exe: it guards against a broken download, not against a release
+that was tampered with. Use `AGENTPROBE_UPDATE_URL` to point at a mirror of your own (https only) if you distribute
+builds inside your organisation.
 
 ## Reboots
 
@@ -252,8 +295,12 @@ show what a 32-bit process sees, and `dump` notes the extra step WinDbg needs fo
 - The secure desktop (UAC prompts, the lock screen) cannot be captured or clicked.
 - Language: the dashboard and everything a person reads on the tested PC (approval prompt, banner) come in English
   and Korean and follow the Windows display language; switch in the dashboard, or start with `--lang en|ko`.
-  Command output and the activity log are always English, so agents read the same text on every machine.
-- Developed and tested on Windows 11. Version 0.1: the protocol may still change, so use the same version on both PCs.
+  What a tool reports from the tested PC and the activity log are always English, so agents read the same text on
+  every machine. What the command line says itself (`list`, `help`, guidance and errors) is Korean for a person at a
+  console on a Korean Windows and English when the output is piped, as it is for an agent; an agent whose shell is
+  a pseudo-terminal can set `AGENTPROBE_LANG=en`.
+- Developed and tested on Windows 11. Version 0.x: the protocol may still change, so use the same version on both PCs
+  (`agentprobe list` says when a connected PC runs another one, and `agentprobe -t <name> update` fixes that).
 
 ## Does it tell the truth?
 

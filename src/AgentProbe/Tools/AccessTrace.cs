@@ -15,7 +15,7 @@ namespace AgentProbe.Tools;
 /// </summary>
 internal sealed unsafe partial class AccessTracer : IDisposable
 {
-    private const string SessionName = "agentprobe-access-trace";
+    private static readonly string SessionName = "agentprobe-access-trace" + AppInfo.Instance; // per instance, like everything else
     private static readonly Guid FileProvider = new("EDD08927-9CC4-4E65-B970-C2560FB5C289");
     private static readonly Guid RegistryProvider = new("70EB4F03-C1DE-4F73-A051-33D13D5413BD");
     private static readonly Guid ProcessProvider = new("22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716");

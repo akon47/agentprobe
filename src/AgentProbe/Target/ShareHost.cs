@@ -32,9 +32,16 @@ internal sealed partial class ShareHost
     private string _controllerName = "developer PC";
     private int _ended;
     private bool _switchToDeveloper;
+    private bool _resumedAfterUpdate;
+    private volatile bool _connected; // a developer PC is connected right now
+    private int _continueRunsAfter;
+    private string? _handingOverTo; // the version a new instance of this exe is taking the session over as
 
     /// <summary>Exit code of share mode when the person pressed D: "this is my developer PC".</summary>
     public const int SwitchToDeveloper = 100;
+
+    /// <summary>The person has just picked "share this PC" at the role question, so offering D again would be noise.</summary>
+    public static bool RoleChosen { get; set; }
 
     private ShareHost(ArgParser args)
     {
@@ -53,8 +60,9 @@ internal sealed partial class ShareHost
 
     public static async Task<int> RunAsync(string[] argv)
     {
-        var args = ArgParser.Parse(argv, "yes", "resume");
+        var args = ArgParser.Parse(argv, "yes", "resume", "dry-run");
         if (args.Get("lang") is { } lang) Lang.Set(lang);
+        if (args.Flag("dry-run")) return await new ShareHost(args).DryRunAsync();
         if (args.Get("trust") is { } trust && trust.Replace("-", "").Length != 16)
         {
             // A shortened key would accept every developer PC whose key merely starts the same way.
@@ -64,8 +72,24 @@ internal sealed partial class ShareHost
             return 2;
         }
 
+        // Started by an instance that has just replaced the exe and is about to leave: let it go first.
+        if (int.TryParse(args.Get("after"), out var previous) && previous > 0)
+        {
+            try
+            {
+                using var old = Process.GetProcessById(previous);
+                old.WaitForExit(20000);
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+            {
+                // already gone
+            }
+        }
+
+        Controller.Updater.CleanupOld();
+
         // Two instances on one PC would fight over the workspace, the banner and the resume-after-reboot state.
-        using var single = new Mutex(true, $"Local\\{AppInfo.Name}-share", out var first);
+        using var single = new Mutex(true, $"Local\\{AppInfo.Name}-share{AppInfo.Instance}", out var first);
         if (!first)
         {
             Console.WriteLine(Lang.T(
@@ -117,6 +141,8 @@ internal sealed partial class ShareHost
             workDir = Directory.Exists(state.WorkDir) ? state.WorkDir : null;
             if (state.ControllerName.Length > 0) _controllerName = state.ControllerName;
             resumedHistory = state.History;
+            _resumedAfterUpdate = state.Reason == "update";
+            _continueRunsAfter = state.LastRun;
         }
         else
         {
@@ -126,12 +152,14 @@ internal sealed partial class ShareHost
         _runtime = new TargetRuntime(Label, workDir)
         {
             PrepareReboot = PrepareReboot,
+            UpdateTo = UpdateTo,
             RequestEnd = removeExe => _ = Task.Run(() => End(removeExe, askedToEnd: true)),
         };
         _instance = this;
         WatchLogoffAndShutdown();
         ConsoleLog.Start();
         if (resumedHistory != null) _runtime.SeedHistory(resumedHistory);
+        _runtime.ContinueRunsAfter(_continueRunsAfter); // a run number printed before an update never comes to mean another command
         _runtime.Audit.Line += line => ConsoleLog.Write("  " + line[11..]); // time of day is enough on screen
 
         using var close = PosixSignalRegistration.Create(PosixSignal.SIGHUP, _ => End(false));
@@ -140,9 +168,11 @@ internal sealed partial class ShareHost
 
         PrintBanner();
         KeepAwake(true);
-        _runtime.Audit.Write(IsResume ? "sharing resumed after reboot" : $"sharing started by {Environment.UserName}");
+        _runtime.Audit.Write(_resumedAfterUpdate ? $"sharing resumed as agentprobe {AppInfo.Version} after an update"
+            : IsResume ? "sharing resumed after reboot"
+            : $"sharing started by {Environment.UserName}");
 
-        var probing = Task.Run(() => Discovery.ProbeAsync(OnControllerSeen, _extraHosts, _stop.Token));
+        var probing = Task.Run(() => Discovery.ProbeAsync(OnControllerSeen, _extraHosts, () => _connected, _stop.Token));
         try
         {
             await ConnectLoopAsync();
@@ -163,26 +193,82 @@ internal sealed partial class ShareHost
         if (Lang.Korean)
         {
             var who = Environment.IsPrivilegedProcess ? "관리자 권한" : "일반 사용자 권한";
-            Console.WriteLine($"agentprobe {AppInfo.Version}  -  같은 네트워크의 개발 PC가 이 PC를 디버깅하고 테스트하게 합니다");
-            Console.WriteLine();
-            Console.WriteLine($"  이 PC      {name}   사용자 {Environment.UserName} ({who})");
-            Console.WriteLine("  활동 기록  원격에서 하는 모든 일이 아래에 나열되고 이 파일에 저장됩니다");
-            Console.WriteLine($"             {log}");
-            Console.WriteLine("  중지       언제든 이 창을 닫으면 됩니다. 설치되는 것은 없습니다.");
+            Console.WriteLine($"agentprobe {AppInfo.Version}  -  이 PC 공유 중: {name}, 사용자 {Environment.UserName} ({who})");
+            Console.WriteLine($"  원격에서 하는 모든 일이 아래에 나오고 여기에 남습니다: {log}");
+            Console.WriteLine("  멈추려면 이 창을 닫으세요. 설치되는 것은 없습니다.");
         }
         else
         {
             var who = Environment.IsPrivilegedProcess ? "administrator" : "standard user rights";
-            Console.WriteLine($"agentprobe {AppInfo.Version}  -  let a developer PC on your network debug and test this PC");
-            Console.WriteLine();
-            Console.WriteLine($"  This PC    {name}   user {Environment.UserName} ({who})");
-            Console.WriteLine("  Activity   everything the remote side does is listed below and saved to");
-            Console.WriteLine($"             {log}");
-            Console.WriteLine("  Stop       close this window at any time. Nothing is installed.");
+            Console.WriteLine($"agentprobe {AppInfo.Version}  -  sharing this PC: {name}, user {Environment.UserName} ({who})");
+            Console.WriteLine($"  Everything the remote side does is listed below and saved to {log}");
+            Console.WriteLine("  Close this window to stop. Nothing is installed.");
         }
 
         Console.WriteLine();
     }
+
+    /// <summary>
+    /// <c>share --dry-run</c>: where this PC looks for a developer PC and which ones answer, without sharing anything.
+    /// It answers "why is it not found?" at the PC to test, and it never connects to what it finds.
+    /// </summary>
+    private async Task<int> DryRunAsync()
+    {
+        Console.OutputEncoding = Encoding.UTF8;
+        var plan = Discovery.Plan(_extraHosts, AppInfo.Port);
+        var broadcast = Lang.T("broadcast", "브로드캐스트");
+        var each = Lang.T("each address", "주소마다");
+        var none = Lang.T("NOT SEARCHED", "검색 안 함");
+        var given = Lang.T("address", "주소");
+        static int Cells(string s) => s.Sum(c => c >= 0x1100 ? 2 : 1); // the labels are ASCII or Hangul
+        var width = new[] { broadcast, each, none, given }.Max(Cells) + 2;
+        string Row(string how, string where, string rest) =>
+            $"  {how}{new string(' ', width - Cells(how))}{where,-20}{rest}".TrimEnd();
+
+        Console.WriteLine(Lang.T(
+            $"Where this PC looks for a developer PC (UDP port {AppInfo.Port}). This command only looks; nothing is shared.",
+            $"이 PC가 개발 PC를 찾는 곳 (UDP 포트 {AppInfo.Port}). 이 명령은 찾기만 하고 아무것도 공유하지 않습니다."));
+        Console.WriteLine(Row(broadcast, IPAddress.Broadcast.ToString(), ""));
+        foreach (var n in plan.Networks)
+        {
+            if (n.Broadcast != null && n.CarriesBroadcast) Console.WriteLine(Row(broadcast, n.Broadcast.ToString(), $"{n.Cidr}  {n.Adapter}"));
+            if (n.SweptAddresses > 0)
+                Console.WriteLine(Row(each, n.Cidr, Lang.T($"{n.SweptAddresses} addresses  {n.Adapter}", $"주소 {n.SweptAddresses}개  {n.Adapter}")));
+            if (!n.Searched) Console.WriteLine(Row(none, n.Cidr, $"{n.Adapter}  ({NotSearchedReason(n)})"));
+        }
+
+        foreach (var h in plan.Hosts) Console.WriteLine(Row(given, h.ToString(), ""));
+        foreach (var h in plan.Unresolved) Console.WriteLine(Row(none, h, Lang.T("(the name does not resolve to an IPv4 address)", "(이름을 IPv4 주소로 찾을 수 없음)")));
+        const int seconds = 3;
+        var answers = new ConcurrentDictionary<string, ControllerInfo>();
+        using (var cts = new CancellationTokenSource(seconds * 1000))
+        {
+            await Discovery.ProbeAsync(c => answers[$"{c.Fingerprint} {c.Endpoint.Address}"] = c, _extraHosts, () => false, cts.Token);
+        }
+
+        Console.WriteLine();
+        Console.WriteLine(answers.IsEmpty
+            ? Lang.T($"No developer PC answered within {seconds} s.", $"{seconds}초 안에 응답한 개발 PC가 없습니다.")
+            : Lang.T($"Developer PCs that answered within {seconds} s:", $"{seconds}초 안에 응답한 개발 PC:"));
+        // One developer PC answers from each of its addresses this PC can reach: one line per key.
+        foreach (var pc in answers.Values.GroupBy(c => c.Fingerprint).OrderBy(g => g.First().Name, StringComparer.OrdinalIgnoreCase))
+        {
+            var c = pc.First();
+            var at = string.Join(", ", pc.Select(x => x.Endpoint.Address.ToString()).Distinct().Order(StringComparer.Ordinal));
+            Console.WriteLine(Lang.T(
+                $"  {c.Name}  (user {c.User})  key {c.Fingerprint}  at {at}",
+                $"  {c.Name}  (사용자 {c.User})  키 {c.Fingerprint}  주소 {at}"));
+        }
+
+        Console.WriteLine(Lang.T(
+            "A developer PC anywhere else (behind a router, on a network not searched): agentprobe share <developer-pc-address>",
+            "그 밖의 곳에 있는 개발 PC (라우터 너머, 검색하지 않는 네트워크): agentprobe share <개발 PC 주소>"));
+        return 0;
+    }
+
+    private static string NotSearchedReason(SearchNetwork n) => n.Broadcast == null
+        ? Lang.T("the adapter has no subnet to search", "어댑터에 검색할 서브넷이 없음")
+        : Lang.T("a VPN adapter carries no broadcast, and there are too many addresses to try one by one", "VPN 어댑터는 브로드캐스트를 전달하지 않고, 하나씩 시도하기에는 주소가 너무 많음");
 
     private void OnControllerSeen(ControllerInfo info)
     {
@@ -233,12 +319,14 @@ internal sealed partial class ShareHost
                     Lang.T($"Remote control active  -  {_controllerName}", $"원격 제어 중  -  {_controllerName}"),
                     Lang.T("agentprobe: this PC is being controlled remotely. Close its window to stop.", "agentprobe: 이 PC가 원격으로 제어되고 있습니다. 멈추려면 agentprobe 창을 닫으세요."));
                 var session = new TargetSession(channel, _runtime, _controllerName, a => Badge.SetDetail(DateTime.Now.ToString("HH:mm:ss") + "  " + a));
+                _connected = true;
                 try
                 {
                     await session.RunAsync(BuildHello(), ct);
                 }
                 finally
                 {
+                    _connected = false;
                     Badge.Hide();
                 }
 
@@ -284,9 +372,9 @@ internal sealed partial class ShareHost
     private async Task<ControllerInfo?> ChooseControllerAsync(CancellationToken ct)
     {
         Console.WriteLine(Lang.T(
-            "Looking for a developer PC on this network...  (it shows up as soon as `agentprobe` runs there)",
-            "이 네트워크에서 개발 PC를 찾는 중...  (개발 PC에서 `agentprobe`를 실행하면 바로 나타납니다)"));
-        var canAsk = !Console.IsInputRedirected && !IsResume;
+            "Looking for a developer PC...  (agentprobe has to be running there)",
+            "개발 PC를 찾는 중...  (개발 PC에서 agentprobe가 켜져 있어야 합니다)"));
+        var canAsk = !Console.IsInputRedirected && !IsResume && !RoleChosen;
         if (canAsk)
         {
             Console.WriteLine(Lang.T(
@@ -315,10 +403,12 @@ internal sealed partial class ShareHost
             if (waited == 20000)
             {
                 Console.WriteLine(Lang.T(
-                    "  Still looking. Check that both PCs are on the same network and that the developer PC ran\n" +
-                    "  `agentprobe setup` once. Different subnet or VPN? Start this as: agentprobe share <developer-pc-address>",
-                    "  아직 찾는 중입니다. 두 PC가 같은 네트워크에 있는지, 개발 PC에서 `agentprobe setup`을 한 번\n" +
-                    "  실행했는지 확인하세요. 서브넷이 다르거나 VPN이면: agentprobe share <개발 PC 주소>"));
+                    "  Still looking. Check that both PCs are on the same network or VPN and that the developer PC ran\n" +
+                    "  `agentprobe setup` once. Different subnet? Start this as: agentprobe share <developer-pc-address>",
+                    "  아직 찾는 중입니다. 두 PC가 같은 네트워크나 VPN에 있는지, 개발 PC에서 `agentprobe setup`을 한 번\n" +
+                    "  실행했는지 확인하세요. 서브넷이 다르면: agentprobe share <개발 PC 주소>"));
+                foreach (var n in Discovery.Plan(_extraHosts, AppInfo.Port).Networks.Where(n => !n.Searched))
+                    Console.WriteLine(Lang.T($"  Not searched: {n.Cidr} ({n.Adapter}): {NotSearchedReason(n)}", $"  검색하지 않음: {n.Cidr} ({n.Adapter}): {NotSearchedReason(n)}"));
             }
         }
 
@@ -340,6 +430,14 @@ internal sealed partial class ShareHost
             Console.WriteLine(Lang.T("Cannot ask for approval without a console. Start with --yes or --trust <key>.", "콘솔이 없어 승인을 물을 수 없습니다. --yes 또는 --trust <키>로 시작하세요."));
             _stop.Cancel();
             return null;
+        }
+
+        // Asked as a clickable menu where the console can show one; as typed text otherwise (below).
+        if (AskWithMenu(candidates, ct) is { } answered)
+        {
+            if (answered.chosen == null) Deny(candidates);
+            else Console.WriteLine(Lang.T($"  Allowed: {answered.chosen.Name}  key {answered.chosen.Fingerprint}", $"  허용함: {answered.chosen.Name}  키 {answered.chosen.Fingerprint}"));
+            return answered.chosen;
         }
 
         Console.WriteLine();
@@ -374,13 +472,40 @@ internal sealed partial class ShareHost
         if (candidates.Count == 1 && answer is "" or "y" or "yes") chosen = candidates[0];
         else if (int.TryParse(answer, out var n) && n >= 1 && n <= candidates.Count) chosen = candidates[n - 1];
 
-        if (chosen == null)
-        {
-            foreach (var c in candidates) _rejected.Add(c.Fingerprint);
-            Console.WriteLine(Lang.T("Not allowed. Still looking for other developer PCs; close this window to quit.", "허용하지 않았습니다. 다른 개발 PC를 계속 찾습니다. 끝내려면 이 창을 닫으세요."));
-        }
-
+        if (chosen == null) Deny(candidates);
         return chosen;
+    }
+
+    private void Deny(List<ControllerInfo> candidates)
+    {
+        foreach (var c in candidates) _rejected.Add(c.Fingerprint);
+        Console.WriteLine(Lang.T("Not allowed. Still looking for other developer PCs; close this window to quit.", "허용하지 않았습니다. 다른 개발 PC를 계속 찾습니다. 끝내려면 이 창을 닫으세요."));
+    }
+
+    /// <summary>
+    /// The approval question as a menu: one line per developer PC that answered, and one to allow none.
+    /// Returns null when this console cannot show a menu.
+    /// </summary>
+    private static (ControllerInfo? chosen, bool asked)? AskWithMenu(List<ControllerInfo> candidates, CancellationToken ct)
+    {
+        var rights = Environment.IsPrivilegedProcess
+            ? Lang.T("ADMINISTRATOR rights", "관리자 권한")
+            : Lang.T($"the rights of {Environment.UserName}", $"{Environment.UserName}의 권한");
+        var question = Lang.T(
+            $"Which developer PC may run commands on this PC, with {rights}?",
+            $"어느 개발 PC가 이 PC에서 {rights}으로 명령을 실행하도록 허용할까요?");
+        var options = candidates
+            .Select(c => new Controller.MenuOption(
+                Lang.T($"Allow {c.Name}", $"{c.Name} 허용"),
+                Lang.T($"user {c.User}   {c.Endpoint.Address}   key {c.Fingerprint}", $"사용자 {c.User}   {c.Endpoint.Address}   키 {c.Fingerprint}")))
+            .Append(new Controller.MenuOption(Lang.T("Allow none", "허용 안 함")))
+            .ToList();
+        var title = Lang.T($"agentprobe - sharing this PC ({Environment.MachineName})", $"agentprobe - 이 PC 공유 ({Environment.MachineName})");
+
+        // Nothing is preselected: allowing a PC takes a click on its line or its number, never a stray Enter.
+        var picked = Controller.ConsoleMenu.Choose(title, question, options, -1, ct);
+        if (picked == null) return null;
+        return (picked >= 0 && picked < candidates.Count ? candidates[picked.Value] : null, true);
     }
 
     private Dictionary<string, string> BuildHello()
@@ -413,20 +538,73 @@ internal sealed partial class ShareHost
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(guid + "|" + Environment.UserName)), 0, 8);
     }
 
-    private string PrepareReboot()
+    /// <summary>What the next instance needs to carry this session on without asking the person again.</summary>
+    private ResumeState ResumeStateFor(string reason, TimeSpan validFor)
     {
         if (_trustedKey == null || _lastEndpoint == null) throw new InvalidOperationException("not connected");
-        var how = Resume.Register(new ResumeState
+        return new ResumeState
         {
+            Reason = reason,
             ControllerKey = Convert.ToBase64String(_trustedKey),
             ControllerHost = _lastEndpoint.Address.ToString(),
             ControllerPort = _lastEndpoint.Port,
             TargetKey = Convert.ToBase64String(_identity.ExportPrivateKey()),
             WorkDir = _runtime.HasWorkDir ? _runtime.WorkDir : "",
             ControllerName = _controllerName,
-            History = _runtime.ExportHistory(60),
-            ExpiresUtc = DateTime.UtcNow.AddHours(24),
+            // Only a reboot's history is carried over: its entries read "before reboot", which would be false here.
+            History = reason.Length == 0 ? _runtime.ExportHistory(60) : [],
+            LastRun = _runtime.LastRunNumber,
+            ExpiresUtc = DateTime.UtcNow.Add(validFor),
+        };
+    }
+
+    /// <summary>
+    /// The developer PC sent a newer exe: put it in this exe's place and continue the session from it. The running
+    /// file is moved aside (it cannot be overwritten), the new instance starts in its own window and takes over as
+    /// soon as this one has left; approval and the workspace go with it.
+    /// </summary>
+    private string UpdateTo(string newExe, string version)
+    {
+        var state = ResumeStateFor("update", TimeSpan.FromMinutes(5));
+        Controller.Updater.Replace(newExe, AppInfo.ExePath);
+        try
+        {
+            Resume.Register(state, autostart: false);
+            var start = new ProcessStartInfo(AppInfo.ExePath) { UseShellExecute = true };
+            foreach (var word in new[] { "share", "--resume", "--after", Environment.ProcessId.ToString() }) start.ArgumentList.Add(word);
+            if (Label != null)
+            {
+                start.ArgumentList.Add("--name");
+                start.ArgumentList.Add(Label);
+            }
+
+            Process.Start(start)?.Dispose();
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException or UnauthorizedAccessException)
+        {
+            Resume.Unregister();
+            throw new InvalidOperationException($"the exe was replaced with {version}, but the new instance could not be started ({ex.Message}). This session continues on {AppInfo.Version}; the new version is used the next time agentprobe is started here.");
+        }
+
+        // What this session changed or left running in the background (crash-dump capture, a trace, a watch, a
+        // debug-output capture) cannot be followed by the new instance, so it is reverted and stopped now rather
+        // than left behind.
+        var reverted = _runtime.RunUndo();
+        reverted.AddRange(_runtime.StopCaptures());
+        _handingOverTo = version;
+        _runtime.Audit.Write($"updating agentprobe {AppInfo.Version} -> {version} on request of {_controllerName}; the session continues in a new window");
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(700); // let the answer reach the developer PC first
+            End(false);
         });
+        return $"agentprobe on this PC is now {version} (was {AppInfo.Version}); restarting from it, the session resumes by itself. Run numbers continue; `history` starts empty." +
+               (reverted.Count > 0 ? " Stopped or reverted before the restart: " + string.Join(", ", reverted) + " (turn on again afterwards if needed)." : "");
+    }
+
+    private string PrepareReboot()
+    {
+        var how = Resume.Register(ResumeStateFor("", TimeSpan.FromHours(24)));
 
         // Settings this session changed (crash-dump capture, a running trace) cannot be tracked across a reboot,
         // so they are reverted now rather than left behind. They can be turned on again afterwards.
@@ -479,7 +657,12 @@ internal sealed partial class ShareHost
 
         // An explicit `end` always wins over a reboot that was requested earlier but has not happened.
         if (askedToEnd) _runtime.RebootPending = false;
-        if (_runtime.RebootPending)
+        if (_handingOverTo != null && !askedToEnd)
+        {
+            // A new instance of the updated exe is waiting to carry the session on: leave the workspace and its state to it.
+            _runtime.Audit.Write($"restarting as agentprobe {_handingOverTo}");
+        }
+        else if (_runtime.RebootPending)
         {
             // Windows is going down for the reboot we were asked for: keep the workspace and the resume entry.
             _runtime.Audit.Write("rebooting; will resume after logon");

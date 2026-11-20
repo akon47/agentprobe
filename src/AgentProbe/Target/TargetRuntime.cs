@@ -139,6 +139,12 @@ internal sealed class TargetRuntime
     /// <summary>Set by the host: registers a one-shot autostart and writes resume state before a reboot.</summary>
     public Func<string>? PrepareReboot { get; set; }
 
+    /// <summary>
+    /// Set by the host: replaces agentprobe's exe with the given one (already checked to run; its version is the
+    /// second argument) and restarts sharing from it with the session's approval and workspace. Returns what happens next.
+    /// </summary>
+    public Func<string, string, string>? UpdateTo { get; set; }
+
     /// <summary>Set by the host: ends sharing (optionally deleting the exe).</summary>
     public Action<bool>? RequestEnd { get; set; }
 
@@ -227,6 +233,43 @@ internal sealed class TargetRuntime
                 _runNo = Math.Max(_runNo, no);
             }
         }
+    }
+
+    /// <summary>The number of the newest run so far.</summary>
+    public int LastRunNumber => _runNo;
+
+    /// <summary>Makes the next run number follow <paramref name="number"/> (the session continues after a restart).</summary>
+    public void ContinueRunsAfter(int number)
+    {
+        lock (_history) _runNo = Math.Max(_runNo, number);
+    }
+
+    /// <summary>
+    /// Stops what tools left running in the background of this process (a watch, a debug-output capture, an access
+    /// trace) and returns their names. An ETW session in particular would outlive the process.
+    /// </summary>
+    public List<string> StopCaptures()
+    {
+        var stopped = new List<string>();
+        foreach (var (name, stop) in new (string, Action)[]
+                 {
+                     ("watch", () => { var w = Watcher; Watcher = null; w?.Dispose(); if (w != null) stopped.Add("watch"); }),
+                     ("debug-output capture", () => { var d = DebugCapture; DebugCapture = null; d?.Dispose(); if (d != null) stopped.Add("debug-output capture"); }),
+                     ("access trace", () => { var t = Tracer; Tracer = null; t?.Dispose(); if (t != null) stopped.Add("access trace"); }),
+                 })
+        {
+            try
+            {
+                stop();
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                Audit.Write($"could not stop the {name}: {ex.Message}");
+            }
+        }
+
+        foreach (var name in stopped) Audit.Write("stopped: " + name);
+        return stopped;
     }
 
     public RunRecord? FindRun(int no)

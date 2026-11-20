@@ -34,16 +34,56 @@ internal static partial class Home
         if (console) Console.OutputEncoding = new UTF8Encoding(false);
         if (console && ownWindow) Console.Title = Lang.T("agentprobe - developer PC", "agentprobe - 개발 PC");
 
+        // A person who closes this window expects agentprobe to be off: the background process ends with it unless
+        // it is serving a connected PC or an open dashboard. The X button ends this process without returning from
+        // Run(), so that case is caught here; Windows allows a few seconds for it.
+        using var windowClosed = console && ownWindow
+            ? PosixSignalRegistration.Create(PosixSignal.SIGHUP, _ =>
+            {
+                _closing = true;
+                Cli.StopIfIdleAsync().Wait(3000);
+            })
+            : null;
+
         if (console && interactive)
         {
             switch (new Screen(content).Run())
             {
                 case Closed.ByUser when ownWindow:
+                    await Cli.StopIfIdleAsync();
                     return 0; // the window goes away with us
                 case Closed.ByUser:
                     break;    // back in the person's shell: leave the information there as text
                 case Closed.Stopped:
                     Console.WriteLine(Lang.T("agentprobe stopped.", "agentprobe를 종료했습니다."));
+                    return 0;
+                case Closed.Updated:
+                    // The exe behind this window was replaced. In a window of its own the new version simply
+                    // takes the window over; in somebody's shell the prompt is theirs again.
+                    if (ownWindow)
+                    {
+                        try
+                        {
+                            windowClosed?.Dispose(); // the new one looks after the background process from here
+                            var next = new ProcessStartInfo(AppInfo.ExePath) { UseShellExecute = false };
+                            next.ArgumentList.Add("home");
+                            next.ArgumentList.Add("--own-window");
+                            using var successor = Process.Start(next);
+                            if (successor == null) return 0;
+
+                            // Some terminals close a window when the program they started ends, whatever else
+                            // is still using it: stay until the new start screen is done.
+                            await successor.WaitForExitAsync();
+                            Updater.CleanupOldAfterExit(); // this process is the last one running from the old file
+                            return successor.ExitCode;
+                        }
+                        catch (System.ComponentModel.Win32Exception)
+                        {
+                            // fall through: say what happened and let the person start it
+                        }
+                    }
+
+                    Console.WriteLine(Lang.T("agentprobe was updated. Start it again to use the new version.", "agentprobe를 업데이트했습니다. 다시 실행하면 새 버전입니다."));
                     return 0;
                 case Closed.NotSupported:
                     break;
@@ -56,15 +96,19 @@ internal static partial class Home
         {
             Console.WriteLine();
             Console.Write(Lang.T(
-                "Press Enter to close this window. agentprobe keeps running in the background (stop it with `agentprobe stop`).",
-                "Enter를 누르면 이 창이 닫힙니다. agentprobe는 백그라운드에서 계속 실행됩니다 (`agentprobe stop`으로 종료)."));
+                "Press Enter to close this window. agentprobe then stops too, unless a PC is connected or the dashboard is open.",
+                "Enter를 누르면 이 창이 닫힙니다. 연결된 PC나 열려 있는 대시보드가 없으면 agentprobe도 함께 종료됩니다."));
             Console.ReadLine();
+            await Cli.StopIfIdleAsync();
         }
 
         return 0;
     }
 
-    private sealed record Facts(string Url, string Key, string Addresses, string Targets);
+    /// <summary>Set once the window is going away, so the screen's refresh does not start the background process again.</summary>
+    private static volatile bool _closing;
+
+    private sealed record Facts(string Url, string Key, string Addresses, string Targets, string Update, string Other);
 
     private static async Task<Facts?> FetchAsync()
     {
@@ -78,7 +122,8 @@ internal static partial class Home
         }
 
         if (code != 0 || !values.TryGetValue("url", out var url)) return null;
-        return new Facts(url, values.GetValueOrDefault("key", "?"), values.GetValueOrDefault("addr", ""), values.GetValueOrDefault("targets", ""));
+        return new Facts(url, values.GetValueOrDefault("key", "?"), values.GetValueOrDefault("addr", ""), values.GetValueOrDefault("targets", ""),
+            values.GetValueOrDefault("update", ""), values.GetValueOrDefault("other", ""));
     }
 
     /// <summary>The texts of the start screen, built once and used by both the full-screen and the plain form.</summary>
@@ -91,6 +136,8 @@ internal static partial class Home
             var command = OnPath ? "agentprobe" : $"\"{exe}\"";
             Url = facts.Url;
             Targets = facts.Targets;
+            Update = facts.Update;
+            Other = facts.Other;
             Title = $"agentprobe {AppInfo.Version}  -  " + Lang.T("developer PC", "개발 PC") + $" \"{Environment.MachineName}\"";
             Instructions = $"To debug or test on the remote Windows PC, use the agentprobe CLI: {command}. Run `{command} guide` first.";
             ClaudeMcp = $"claude mcp add agentprobe -- \"{exe}\" mcp";
@@ -106,8 +153,8 @@ internal static partial class Home
             CodexLabel = Lang.T("Register as an MCP server in Codex (then restart the agent)", "Codex에 MCP 서버로 등록 (등록 후 에이전트 다시 시작)");
             ChatLabel = Lang.T("Or just say it in the chat", "또는 대화에서 바로 말하기");
             TargetHow = Lang.T(
-                $"PC to test: copy this exe there and run it, then approve \"{Environment.MachineName}\" there (key {facts.Key}).",
-                $"테스트할 PC: 이 exe를 그 PC에 복사해 실행하고, 거기서 \"{Environment.MachineName}\"(키 {facts.Key})을(를) 승인하세요.");
+                $"On the PC to test: run this exe, pick \"Share this PC\", then allow \"{Environment.MachineName}\" (key {facts.Key}).",
+                $"테스트할 PC에서: 이 exe 실행, \"이 PC 공유\" 선택, \"{Environment.MachineName}\" 허용 (키 {facts.Key})");
             TargetManual = Lang.T(
                 $"Not found automatically (other subnet, VPN)? Start it there as: agentprobe share <one of: {facts.Addresses}>",
                 $"자동으로 찾지 못하면 (다른 서브넷, VPN) 그 PC에서: agentprobe share <다음 중 하나: {facts.Addresses}>");
@@ -124,6 +171,12 @@ internal static partial class Home
 
         /// <summary>Names of the connected PCs; refreshed while the screen is open.</summary>
         public volatile string Targets;
+
+        /// <summary>The version a newer release offers, or "". Found out in the background, so it can arrive late.</summary>
+        public volatile string Update;
+
+        /// <summary>Connected PCs that run another agentprobe version than this PC, as "name (version), ...".</summary>
+        public volatile string Other;
 
         public string Title { get; }
 
@@ -180,6 +233,8 @@ internal static partial class Home
         if (c.Tip.Length > 0) o.WriteLine("  " + c.Tip);
         o.WriteLine();
         o.WriteLine("  " + c.Connected);
+        if (c.Update.Length > 0) o.WriteLine("  " + Lang.T($"agentprobe {c.Update} is available (this PC has {AppInfo.Version}): agentprobe update", $"agentprobe {c.Update}이(가) 나왔습니다 (이 PC는 {AppInfo.Version}): agentprobe update"));
+        if (c.Other.Length > 0) o.WriteLine("  " + Lang.T($"Connected PCs on another version: {c.Other}. Bring them to this PC's: agentprobe -t all update", $"다른 버전인 연결된 PC: {c.Other}. 이 PC와 같은 버전으로: agentprobe -t all update"));
     }
 
     private static void OpenBrowser(string url)
@@ -199,6 +254,9 @@ internal static partial class Home
         NotSupported,
         ByUser,
         Stopped,
+
+        /// <summary>An update replaced this PC's exe while the screen was open.</summary>
+        Updated,
     }
 
     /// <summary>One logical line of the view; it is wrapped to the window width when shown.</summary>
@@ -231,8 +289,13 @@ internal static partial class Home
         private List<Block> _blocks = [];
         private Task? _refreshTask;
         private Process? _process;
-        private int _width, _height, _top, _caret, _historyAt, _hot = -1, _ruleCells = 1, _inputStart;
-        private bool _follow, _dirty = true, _leftDown, _exit, _stopped, _exitWhenDone;
+        private int _width, _height, _top, _caret, _historyAt, _hot = -1, _ruleCells = 1, _inputStart, _back, _anyway;
+        private bool _follow, _dirty = true, _leftDown, _exit, _stopped, _exitWhenDone, _hasOutput, _updated;
+        private volatile bool _rebuild;
+        private int _pressed = -1;
+        private long _quietUntil;
+        private List<string> _lastWords = [];
+        private readonly (DateTime time, long size) _exeAtStart = ExeStamp();
         private volatile bool _layout = true;
         private string _status = "";
         private long _statusUntil;
@@ -281,39 +344,98 @@ internal static partial class Home
                 Console.SetError(oldError);
             }
 
-            return _stopped ? Closed.Stopped : Closed.ByUser;
+            return _updated ? Closed.Updated : _stopped ? Closed.Stopped : Closed.ByUser;
         }
 
         private List<Block> HomeBlocks()
         {
             _items.Clear();
-            var blocks = new List<Block> { new(_c.Title, 0, Sgr: "1"), new(""), new("", 2, Live: () => _c.Connected), new(""), new(_c.Give, 2) };
+            _hasOutput = false;
+            var blocks = new List<Block> { new(_c.Title, 0, Sgr: "1"), new(""), new("", 2, Live: () => _c.Connected), new("") };
 
-            void Item(string label, string detail, Func<string> action)
+            // Every line with a number is a button: a click or the number key does it. The texts that get copied
+            // are not spelled out here; the status line shows what went to the clipboard.
+            void Item(string label, Func<string> action)
             {
                 var index = _items.Count;
                 _items.Add((label, action));
-                blocks.Add(new Block($" [{index + 1}] {label} ", 3, index, true));
-                if (detail.Length > 0) blocks.Add(new Block(detail, 8, index, Sgr: "90"));
+                blocks.Add(new Block($" [{(index < 9 ? (index + 1).ToString() : "+")}] {label} ", 3, index, true)); // number keys go up to 9; the rest is click only
             }
 
-            Item(_c.InstructionsLabel, _c.Instructions, () => Copy(_c.Instructions));
-            Item(_c.ClaudeLabel, _c.ClaudeMcp, () => Copy(_c.ClaudeMcp));
-            Item(_c.CodexLabel, _c.CodexMcp, () => Copy(_c.CodexMcp));
-            Item(_c.ChatLabel, _c.Chat, () => Copy(_c.Chat));
+            string CopyItem(string text) => Copy(text) + ": " + text;
+            string Command(string line)
+            {
+                Run(line);
+                return "";
+            }
+
+            blocks.Add(new Block(Lang.T("For your AI agent: one of these, click to copy", "AI 에이전트에게 줄 것: 하나를 클릭해 복사"), 2));
+            Item(Lang.T("A line for its instructions file (CLAUDE.md, AGENTS.md)", "지침 파일에 넣을 한 줄 (CLAUDE.md, AGENTS.md)"), () => CopyItem(_c.Instructions));
+            Item(Lang.T("The command that registers MCP in Claude Code", "Claude Code에 MCP를 등록하는 명령"), () => CopyItem(_c.ClaudeMcp));
+            Item(Lang.T("The command that registers MCP in Codex", "Codex에 MCP를 등록하는 명령"), () => CopyItem(_c.CodexMcp));
+            Item(Lang.T("A prompt to paste into a chat", "대화에 붙여 넣을 문구"), () => CopyItem(_c.Chat));
             blocks.Add(new Block(""));
-            blocks.Add(new Block(Lang.T("Dashboard", "대시보드") + "  " + _c.Url, 2));
-            Item(Lang.T("Open it in the browser", "브라우저에서 열기"), "", () =>
+            blocks.Add(new Block(Lang.T("This PC", "이 PC"), 2));
+            Item(Lang.T("Open the dashboard", "대시보드 열기"), () =>
             {
                 OpenBrowser(_c.Url);
                 return Lang.T("opened in the browser", "브라우저에서 열었습니다");
             });
-            Item(Lang.T("Copy the link", "주소 복사"), "", () => Copy(_c.Url));
+            Item(Lang.T("List the connected PCs", "연결된 PC 목록"), () => Command("list"));
+            Item(Lang.T("Share this PC for testing", "이 PC를 테스트 대상으로 공유"), () => Command("share"));
+            if (!_c.OnPath) Item(Lang.T("Set up PATH and the firewall port (once)", "PATH와 방화벽 포트 설정 (처음 한 번)"), () => Command("setup"));
+            if (_c.Update.Length > 0 || _c.Other.Length > 0)
+            {
+                blocks.Add(new Block(""));
+                blocks.Add(new Block(Lang.T("Update", "업데이트"), 2));
+                if (_c.Update.Length > 0)
+                    Item(Lang.T($"Install agentprobe {_c.Update} on this PC (it has {AppInfo.Version})", $"이 PC에 agentprobe {_c.Update} 설치 (지금 {AppInfo.Version})"), () => Command("update"));
+                if (_c.Other.Length > 0)
+                    Item(Lang.T($"Bring the connected PCs to this PC's version: {_c.Other}", $"연결된 PC를 이 PC와 같은 버전으로: {_c.Other}"), () => Command("-t all update"));
+            }
+
             blocks.Add(new Block(""));
-            blocks.Add(new Block(_c.TargetHow, 2));
-            blocks.Add(new Block(_c.TargetManual, 2));
-            if (_c.Tip.Length > 0) blocks.Add(new Block(_c.Tip, 2));
+            blocks.Add(new Block(_c.TargetHow, 2, Sgr: "90"));
+
+            // Not on the start screen itself: shown under a command's output, to come back here with a click.
+            _back = _items.Count;
+            _items.Add(("", () =>
+            {
+                GoHome();
+                return "";
+            }));
+
+            // Offered under an update that held back because commands are running: the same once more, insisting.
+            _anyway = _items.Count;
+            _items.Add(("", () =>
+            {
+                RunWords([.. _lastWords, "--force"], string.Join(' ', _lastWords) + " --force");
+                return "";
+            }));
             return blocks;
+        }
+
+        private void GoHome()
+        {
+            _blocks = HomeBlocks();
+            (_follow, _top, _layout) = (false, 0, true);
+            _quietUntil = Environment.TickCount64 + 400;
+        }
+
+        /// <summary>True for `update` and `-t &lt;name&gt; update`: the command, not a word somewhere in another command's text.</summary>
+        private static bool IsUpdate(List<string> words)
+        {
+            var i = 0;
+            while (i + 1 < words.Count && words[i] is "-t" or "--target") i += 2;
+            return i < words.Count && words[i].Equals("update", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Ends a command's output with the line that leads back to the start screen.</summary>
+        private void OfferBack()
+        {
+            _blocks.RemoveAll(b => b.Item == _back);
+            Append(new Block("", 0, _back));
+            Append(new Block(Lang.T(" [0] Back to the start screen ", " [0] 처음 화면으로 "), 1, _back, true));
         }
 
         private void Loop(nint input)
@@ -332,6 +454,21 @@ internal static partial class Home
                     _process?.Dispose();
                     _process = null;
                     if (item.code != 0) Append(new Block(Lang.T($"(exit code {item.code})", $"(종료 코드 {item.code})"), 0, Sgr: "90"));
+                    var updating = IsUpdate(_lastWords) && !_lastWords.Contains("--check");
+                    if (updating && item.code == 0 && ExeStamp() != _exeAtStart)
+                    {
+                        // This PC's exe was replaced: this screen is the old version, so it makes way for the new one.
+                        (_updated, _exit) = (true, true);
+                        continue;
+                    }
+
+                    if (updating && item.code == 4 && !_lastWords.Contains("--force")) // 4 = held back, --force goes ahead
+                    {
+                        Append(new Block(""));
+                        Append(new Block(Lang.T(" [9] Update now anyway ", " [9] 그래도 지금 업데이트 "), 1, _anyway, true));
+                    }
+
+                    OfferBack();
                     _dirty = true;
                     if (_exitWhenDone)
                     {
@@ -352,6 +489,12 @@ internal static partial class Home
                 {
                     (_status, _statusUntil) = ("", 0);
                     _dirty = true;
+                }
+
+                if (_rebuild)
+                {
+                    _rebuild = false;
+                    if (!_hasOutput) GoHome(); // an update became known, or a PC with another version connected
                 }
 
                 if (_layout) Layout();
@@ -434,7 +577,8 @@ internal static partial class Home
 
             var status = _status.Length > 0 ? _status
                 : _process != null ? Lang.T("Running...   Esc: stop it", "실행 중...   Esc: 중단")
-                : Lang.T("Number key or click: run an item above   |   Enter: run the command   |   Esc: close", "숫자 키 또는 클릭: 위 항목 실행   |   Enter: 명령 실행   |   Esc: 닫기");
+                : _hasOutput ? Lang.T("Esc or [0]: back to the start screen   |   Enter: run the command", "Esc 또는 [0]: 처음 화면   |   Enter: 명령 실행")
+                : Lang.T("Click a line or press its number   |   Enter: run the command   |   Esc: close", "항목을 클릭하거나 숫자 키   |   Enter: 명령 실행   |   Esc: 닫기");
             sb.Append("\u001b[0m\u001b[").Append(_height).Append(";1H")
                 .Append(_status.Length > 0 ? "\u001b[32m" : "\u001b[90m").Append(' ').Append(Clip(status, _width - 2)).Append("\u001b[0m\u001b[K");
 
@@ -534,18 +678,23 @@ internal static partial class Home
                 _dirty = true;
             }
 
+            // An item runs when the button comes up again over the line it went down on. A press that arrives
+            // right after the picture changed is the second half of a double-click meant for the old picture.
             var left = (buttons & 1) != 0;
             if (left && !_leftDown)
             {
-                if (item >= 0)
-                {
-                    RunItem(item);
-                }
-                else if (y == _height - 3 && _input.Length > 0) // the command line: put the caret where the click was
+                _pressed = Environment.TickCount64 < _quietUntil ? -2 : item;
+                if (item < 0 && y == _height - 3 && _input.Length > 0) // the command line: put the caret where the click was
                 {
                     _caret = Math.Min(_input.Length, _inputStart + Clip(_input.ToString(_inputStart, _input.Length - _inputStart), Math.Max(0, x - 3)).Length);
                     _dirty = true;
                 }
+            }
+            else if (!left && _leftDown)
+            {
+                var pressed = _pressed;
+                _pressed = -1;
+                if (pressed >= 0 && pressed == item) RunItem(item);
             }
 
             _leftDown = left;
@@ -559,9 +708,10 @@ internal static partial class Home
                 case 0x0D:
                     Enter();
                     return;
-                case 0x1B: // Esc: stop the command, else empty the line, else leave
+                case 0x1B: // Esc: stop the command, else empty the line, else back to the start screen, else leave
                     if (_process != null) StopCommand();
                     else if (_input.Length > 0) (_caret, _) = (0, _input.Clear());
+                    else if (_hasOutput) GoHome();
                     else _exit = true;
                     return;
                 case 0x08:
@@ -612,10 +762,12 @@ internal static partial class Home
             }
 
             if (ch < 32 || ch == 127) return;
-            if (alone && _input.Length == 0 && ch >= '1' && ch < '1' + _items.Count)
+            // A number runs the item with that number, as long as that item is on the screen.
+            var wanted = ch == '0' ? _back : ch == '9' && _blocks.Any(b => b.Item == _anyway) ? _anyway : ch >= '1' && ch <= '9' ? ch - '1' : -1;
+            if (alone && _input.Length == 0 && wanted >= 0 && (wanted == _back || wanted == _anyway || wanted < _back) && _blocks.Any(b => b.Item == wanted))
             {
-                _hot = ch - '1'; // show which line the key meant
-                RunItem(ch - '1');
+                _hot = wanted; // show which line the key meant
+                RunItem(wanted);
                 return;
             }
 
@@ -631,7 +783,11 @@ internal static partial class Home
             _caret = index;
         }
 
-        private void RunItem(int index) => Say($"[{index + 1}] {_items[index].action()}");
+        private void RunItem(int index)
+        {
+            var said = _items[index].action();
+            if (said.Length > 0) Say(said);
+        }
 
         // ---------------------------------------------------------------- commands
 
@@ -649,31 +805,87 @@ internal static partial class Home
             _caret = 0;
             if (_history.Count == 0 || _history[^1] != line) _history.Add(line);
             _historyAt = _history.Count;
+            Run(line);
+        }
+
+        /// <summary>Runs one agentprobe command line, typed or behind a clicked item, and shows what it prints.</summary>
+        private void Run(string line)
+        {
+            if (_process != null)
+            {
+                Say(Lang.T("A command is still running. Esc stops it.", "명령이 아직 실행 중입니다. Esc로 중단할 수 있습니다."));
+                return;
+            }
 
             var words = CommandLine.Tokenize(line).Select(t => t.text).ToList();
             if (words.Count > 0 && (words[0].Equals(AppInfo.Name, StringComparison.OrdinalIgnoreCase) || words[0].Equals(AppInfo.Name + ".exe", StringComparison.OrdinalIgnoreCase))) words.RemoveAt(0);
+            RunWords(words, line);
+        }
+
+        private void RunWords(List<string> words, string line)
+        {
+            if (_process != null)
+            {
+                Say(Lang.T("A command is still running. Esc stops it.", "명령이 아직 실행 중입니다. Esc로 중단할 수 있습니다."));
+                return;
+            }
+
             if (words.Count == 0) return;
             var name = words[0].ToLowerInvariant();
             if (name is "clear" or "cls" or "home")
             {
-                _blocks = HomeBlocks();
-                (_follow, _top, _layout) = (false, 0, true);
+                GoHome();
                 return;
             }
 
+            if (name is "exit" or "quit")
+            {
+                _exit = true;
+                return;
+            }
+
+            // The first command takes the place of the start screen (one click or Esc brings it back);
+            // later ones add to what is there.
+            if (!_hasOutput)
+            {
+                _blocks = [new Block(_c.Title, 0, Sgr: "1")];
+                (_hasOutput, _top) = (true, 0);
+                _quietUntil = Environment.TickCount64 + 400;
+            }
+
+            _blocks.RemoveAll(b => b.Item == _back || b.Item == _anyway);
+            _lastWords = words;
             Append(new Block(""));
             Append(new Block("> " + line, 0, Sgr: "1"));
             switch (name)
             {
-                case "exit" or "quit":
-                    _exit = true;
-                    return;
                 case "dashboard":
                     OpenBrowser(_c.Url);
                     Append(new Block(Lang.T("opened in the browser: ", "브라우저에서 열었습니다: ") + _c.Url));
+                    OfferBack();
                     return;
-                case "share" or "daemon" or "mcp":
+                case "share" when !words.Contains("--dry-run"):
+                    // Sharing asks for approval and shows its activity log: it gets a console window of its own.
+                    // (`share --dry-run` only prints, so it runs here like any other command.)
+                    try
+                    {
+                        var share = new ProcessStartInfo(AppInfo.ExePath) { UseShellExecute = true };
+                        foreach (var word in words) share.ArgumentList.Add(word);
+                        using var started = Process.Start(share);
+                        Append(new Block(Lang.T(
+                            "Sharing this PC started in a new window. Close that window to stop sharing.",
+                            "새 창에서 이 PC의 공유를 시작했습니다. 공유를 멈추려면 그 창을 닫으세요.")));
+                    }
+                    catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+                    {
+                        Append(new Block(Lang.T("could not start the command: ", "명령을 시작하지 못했습니다: ") + ex.Message, 0, Sgr: "33"));
+                    }
+
+                    OfferBack();
+                    return;
+                case "daemon" or "mcp":
                     Append(new Block(Lang.T($"`{name}` needs a window of its own: run it from a terminal.", $"`{name}`은(는) 별도의 창이 필요합니다. 터미널에서 실행하세요."), 0, Sgr: "33"));
+                    OfferBack();
                     return;
                 case "stop":
                     // Ends the background process, so this screen has nothing left to show: leave when it is done,
@@ -695,6 +907,7 @@ internal static partial class Home
                     StandardOutputEncoding = Encoding.UTF8,
                     StandardErrorEncoding = Encoding.UTF8,
                 };
+                start.Environment["AGENTPROBE_PERSON"] = "1"; // a person reads this output: Korean on a Korean Windows
                 foreach (var word in words) start.ArgumentList.Add(word);
                 var process = Process.Start(start)!;
                 process.StandardInput.Close();
@@ -719,6 +932,7 @@ internal static partial class Home
             {
                 _exitWhenDone = false;
                 Append(new Block(Lang.T("could not start the command: ", "명령을 시작하지 못했습니다: ") + ex.Message, 0, Sgr: "33"));
+                OfferBack();
             }
         }
 
@@ -749,8 +963,16 @@ internal static partial class Home
                 while (true)
                 {
                     await Task.Delay(3000, _refreshStop.Token);
+                    if (_closing) return;
                     var facts = await FetchAsync();
-                    if (facts == null || _refreshStop.IsCancellationRequested || facts.Targets == _c.Targets) continue;
+                    if (facts == null || _refreshStop.IsCancellationRequested) continue;
+                    if (facts.Update != _c.Update || facts.Other != _c.Other)
+                    {
+                        (_c.Update, _c.Other) = (facts.Update, facts.Other);
+                        _rebuild = true;
+                    }
+
+                    if (facts.Targets == _c.Targets) continue;
                     _c.Targets = facts.Targets;
                     _layout = true;
                 }
@@ -762,6 +984,20 @@ internal static partial class Home
             catch (Exception ex) when (ex is IOException or InvalidOperationException or UnauthorizedAccessException)
             {
                 // the line simply stops updating
+            }
+        }
+
+        /// <summary>Tells one file at the exe's path from another: an update puts a new file there.</summary>
+        private static (DateTime time, long size) ExeStamp()
+        {
+            try
+            {
+                var file = new FileInfo(AppInfo.ExePath);
+                return (file.LastWriteTimeUtc, file.Length);
+            }
+            catch (IOException)
+            {
+                return default;
             }
         }
 
@@ -782,13 +1018,13 @@ internal static partial class Home
     // ---------------------------------------------------------------- text helpers
 
     /// <summary>Columns a character takes in a console: Korean and other wide characters take two.</summary>
-    private static int Cells(char c) =>
+    internal static int Cells(char c) =>
         char.IsLowSurrogate(c) ? 0
         : char.IsHighSurrogate(c) ? 2
         : c >= 0x1100 && (c <= 0x115F || (c >= 0x2E80 && c <= 0xA4CF) || (c >= 0xAC00 && c <= 0xD7A3) || (c >= 0xF900 && c <= 0xFAFF) || (c >= 0xFE30 && c <= 0xFE4F) || (c >= 0xFF00 && c <= 0xFF60) || (c >= 0xFFE0 && c <= 0xFFE6)) ? 2
         : 1;
 
-    private static int Cells(string text)
+    internal static int Cells(string text)
     {
         var n = 0;
         foreach (var c in text) n += Cells(c);
@@ -796,7 +1032,7 @@ internal static partial class Home
     }
 
     /// <summary>The longest beginning of the text that fits into this many columns.</summary>
-    private static string Clip(string text, int cells)
+    internal static string Clip(string text, int cells)
     {
         var used = 0;
         for (var i = 0; i < text.Length; i++)
@@ -928,21 +1164,21 @@ internal static partial class Home
     }
 
     [LibraryImport("kernel32.dll")]
-    private static partial nint GetStdHandle(int handle);
+    internal static partial nint GetStdHandle(int handle);
 
     [LibraryImport("kernel32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool GetConsoleMode(nint handle, out uint mode);
+    internal static partial bool GetConsoleMode(nint handle, out uint mode);
 
     [LibraryImport("kernel32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool SetConsoleMode(nint handle, uint mode);
+    internal static partial bool SetConsoleMode(nint handle, uint mode);
 
     [LibraryImport("kernel32.dll")]
-    private static unsafe partial int GetNumberOfConsoleInputEvents(nint handle, uint* count);
+    internal static unsafe partial int GetNumberOfConsoleInputEvents(nint handle, uint* count);
 
     [LibraryImport("kernel32.dll")]
-    private static unsafe partial int ReadConsoleInputW(nint handle, byte* records, uint capacity, uint* read);
+    internal static unsafe partial int ReadConsoleInputW(nint handle, byte* records, uint capacity, uint* read);
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

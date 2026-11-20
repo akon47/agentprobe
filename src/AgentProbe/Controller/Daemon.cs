@@ -46,7 +46,7 @@ internal sealed class TargetRecord
 /// Background process on the developer PC. Targets dial in to it and stay connected; each short-lived CLI call
 /// (<c>agentprobe exec ...</c>) talks to it over a per-user named pipe. Started automatically by the first CLI call.
 /// </summary>
-internal sealed class Daemon
+internal sealed partial class Daemon
 {
     private readonly ConcurrentDictionary<string, TargetRecord> _targets = new();
     private readonly CancellationTokenSource _stop = new();
@@ -58,14 +58,24 @@ internal sealed class Daemon
 
     private static string LogPath => Path.Combine(AppInfo.StateDir, "daemon.log");
 
-    public string DashboardToken { get; } = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(12));
+    public string DashboardToken { get; private set; } = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(12));
 
     public int DashboardPort { get; private set; }
 
+    private long _dashboardSeenTicks;
+    private int _pipeRequests; // agentprobe commands being served right now
+
+    /// <summary>Called for every request an open dashboard page makes (it polls every few seconds).</summary>
+    public void DashboardSeen() => Interlocked.Exchange(ref _dashboardSeenTicks, DateTime.UtcNow.Ticks);
+
     public IEnumerable<TargetRecord> Records => _targets.Values;
 
-    public static async Task<int> RunAsync()
+    public static async Task<int> RunAsync(string[] args)
     {
+        // Started by a background process that has just updated the exe and is about to leave: wait for it to go.
+        var after = ArgParser.Parse(args).GetInt("after", 0);
+        if (after > 0) WaitForExit(after, 20000);
+
         using var single = new Mutex(true, $"Local\\{AppInfo.PipeName}-daemon", out var created);
         if (!created) return 0; // already running
 
@@ -88,6 +98,8 @@ internal sealed class Daemon
         Directory.CreateDirectory(AppInfo.StateDir);
         _identity = Identity.LoadOrCreate(Path.Combine(AppInfo.StateDir, "controller.key"));
         LoadLabels();
+        Updater.CleanupOld();
+        TakeOverFromUpdate();
 
         var listener = new TcpListener(IPAddress.Any, AppInfo.Port);
         listener.Start();
@@ -95,6 +107,7 @@ internal sealed class Daemon
 
         var dashboard = new Dashboard(this);
         DashboardPort = dashboard.Start(_stop.Token);
+        _ = Task.Run(WatchForUpdatesAsync);
 
         var tasks = new[]
         {
@@ -235,9 +248,15 @@ internal sealed class Daemon
             // Normally one record per machine id. If a live connection with a DIFFERENT key already holds that id,
             // this is another PC reporting the same id (cloned disk image): give it its own record instead of
             // letting it take the first one's place.
+            // A PC that comes back with the key it had before (after a reboot, or after restarting for an update)
+            // keeps the record it had, whichever of the clones reconnects first.
             var key = machineId;
-            if (_targets.TryGetValue(machineId, out var holder) && holder.Connection is { Alive: true } current
-                && current.Fingerprint != conn.Fingerprint && DateTime.UtcNow - current.LastFrameUtc < TimeSpan.FromSeconds(15))
+            if (_targets.Values.FirstOrDefault(r => r.MachineId == machineId && r.Connection?.Fingerprint == conn.Fingerprint) is { } mine)
+            {
+                key = mine.Key;
+            }
+            else if (_targets.TryGetValue(machineId, out var holder) && holder.Connection is { Alive: true } current
+                     && current.Fingerprint != conn.Fingerprint && DateTime.UtcNow - current.LastFrameUtc < TimeSpan.FromSeconds(15))
             {
                 key = machineId + ":" + conn.Fingerprint;
             }
@@ -312,21 +331,28 @@ internal sealed class Daemon
     }
 
     /// <summary>Resolves -t: nothing (the only target), a name, a comma list, a * wildcard, or "all".</summary>
-    private List<TargetConnection> Resolve(string? spec, out string error)
+    /// <param name="ko">A person on a Korean Windows asked (see <see cref="PipeMsg.Lang"/>): the error is in Korean.</param>
+    private List<TargetConnection> Resolve(string? spec, out string error, bool ko = false)
     {
+        string L(string english, string korean) => ko ? korean : english;
         error = "";
         var online = _targets.Values.Where(r => r.Online).OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase).ToList();
         if (online.Count == 0)
         {
-            error = "No target PC is connected. Run agentprobe.exe on the PC to test (same network) and approve this PC there.\n" +
-                    "If it cannot find this PC, run `agentprobe setup` here once (opens the firewall port), or start it as: agentprobe share <this-pc-address>";
+            error = L(
+                "No target PC is connected. Run agentprobe.exe on the PC to test (same network or VPN) and approve this PC there.\n" +
+                "If it cannot find this PC, run `agentprobe setup` here once (opens the firewall port), or start it as: agentprobe share <this-pc-address>",
+                "연결된 대상 PC가 없습니다. 테스트할 PC(같은 네트워크 또는 VPN)에서 agentprobe.exe를 실행하고 거기서 이 PC를 승인하세요.\n" +
+                "대상이 이 PC를 찾지 못하면 여기서 `agentprobe setup`을 한 번 실행하거나(방화벽 포트), 대상에서: agentprobe share <이 PC의 주소>");
             return [];
         }
 
         if (string.IsNullOrEmpty(spec))
         {
             if (online.Count == 1) return [online[0].Connection!];
-            error = $"{online.Count} targets are connected; pick one with -t <name> (or -t all):\n  " + string.Join(", ", online.Select(r => r.Name));
+            error = L(
+                $"{online.Count} targets are connected; pick one with -t <name> (or -t all):\n  ",
+                $"대상 PC {online.Count}대가 연결되어 있습니다. -t <이름>으로 하나를 고르세요 (또는 -t all):\n  ") + string.Join(", ", online.Select(r => r.Name));
             return [];
         }
 
@@ -352,8 +378,10 @@ internal sealed class Daemon
             {
                 var offline = _targets.Values.FirstOrDefault(r => !r.Online && r.Name.Equals(part, StringComparison.OrdinalIgnoreCase));
                 error = offline != null
-                    ? $"{offline.Name} is offline (last seen {Format.Duration(DateTime.UtcNow - offline.LastSeenUtc)} ago; last command: {Format.Clip(offline.LastCommand, 80)})."
-                    : $"No connected target matches '{part}'. Connected: " + string.Join(", ", online.Select(r => r.Name));
+                    ? L(
+                        $"{offline.Name} is offline (last seen {Format.Duration(DateTime.UtcNow - offline.LastSeenUtc)} ago; last command: {Format.Clip(offline.LastCommand, 80)}).",
+                        $"{offline.Name}은(는) 연결이 끊겨 있습니다 ({Format.Duration(DateTime.UtcNow - offline.LastSeenUtc)} 전에 마지막으로 연결됨, 마지막 명령: {Format.Clip(offline.LastCommand, 80)}).")
+                    : L($"No connected target matches '{part}'. Connected: ", $"'{part}'에 해당하는 연결된 대상 PC가 없습니다. 연결된 PC: ") + string.Join(", ", online.Select(r => r.Name));
                 return [];
             }
 
@@ -435,7 +463,17 @@ internal sealed class Daemon
                 cts.Cancel();
             });
 
-            var code = await HandleAsync(req, Emit, cts.Token);
+            Interlocked.Increment(ref _pipeRequests);
+            int code;
+            try
+            {
+                code = await HandleAsync(req, Emit, cts.Token);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _pipeRequests);
+            }
+
             await Emit(new PipeMsg { Ev = "exit", Code = code });
         }
         catch (Exception ex) when (ex is IOException or OperationCanceledException or JsonException)
@@ -455,6 +493,10 @@ internal sealed class Daemon
         Task Out(string text) => emit(new PipeMsg { Ev = "out", Text = text });
         Task Err(string text) => emit(new PipeMsg { Ev = "err", Text = text.EndsWith('\n') ? text : text + "\n" });
 
+        // What this process says itself is in Korean for a person on a Korean Windows; an agent always gets English.
+        var ko = req.Lang == "ko";
+        string L(string english, string korean) => ko ? korean : english;
+
         switch (req.Op)
         {
             case "ping":
@@ -462,7 +504,7 @@ internal sealed class Daemon
                 return 0;
 
             case "stop":
-                await Out("daemon stopped\n");
+                await Out(L("daemon stopped\n", "백그라운드 프로세스를 종료했습니다\n"));
                 _ = Task.Run(async () =>
                 {
                     await Task.Delay(200);
@@ -470,8 +512,33 @@ internal sealed class Daemon
                 });
                 return 0;
 
+            case "stop-idle":
+            {
+                // Closing the start screen's window ends this process too, unless that would cut someone off:
+                // a connected PC, another agentprobe command that is being served (one that waits for a PC to come
+                // back from a reboot or an update, for instance), or a dashboard page that asked for something
+                // recently (a page in a background tab is slowed down by the browser, hence the generous window).
+                var now = DateTime.UtcNow;
+                var online = _targets.Values.Count(r => r.Online);
+                var others = Volatile.Read(ref _pipeRequests) - 1; // this request is one of them
+                var viewed = now - new DateTime(Interlocked.Read(ref _dashboardSeenTicks), DateTimeKind.Utc) < TimeSpan.FromSeconds(90);
+                if (online > 0 || others > 0 || viewed)
+                {
+                    await Out(L(
+                        "daemon kept running: " + (online > 0 ? $"{online} target PC{(online == 1 ? " is" : "s are")} connected"
+                            : others > 0 ? "another agentprobe command is in progress"
+                            : "the dashboard was used in a browser within the last 90 s") + "\n",
+                        "백그라운드 프로세스를 그대로 둡니다: " + (online > 0 ? $"대상 PC {online}대가 연결되어 있습니다"
+                            : others > 0 ? "다른 agentprobe 명령이 실행 중입니다"
+                            : "최근 90초 안에 브라우저에서 대시보드를 사용했습니다") + "\n"));
+                    return 0;
+                }
+
+                goto case "stop";
+            }
+
             case "list":
-                await Out(ListText(req.Args?.Contains("--all") == true));
+                await Out(ListText(req.Args?.Contains("--all") == true, ko));
                 return 0;
 
             case "dashboard":
@@ -480,15 +547,30 @@ internal sealed class Daemon
 
             case "home": // what the start screen needs, as key=value lines
                 await Out($"url=http://127.0.0.1:{DashboardPort}/?k={DashboardToken}\nkey={_identity.Fingerprint}\naddr={string.Join(", ", LocalAddresses().Select(a => a.Split(' ')[0]))}" +
-                          $"\ntargets={string.Join(", ", _targets.Values.Where(r => r.Online).Select(r => r.Name).Order(StringComparer.OrdinalIgnoreCase))}\n");
+                          $"\ntargets={string.Join(", ", _targets.Values.Where(r => r.Online).Select(r => r.Name).Order(StringComparer.OrdinalIgnoreCase))}" +
+                          $"\nupdate={NewerVersion}\nother={string.Join(", ", OtherVersions())}\n");
                 return 0;
+
+            case "update":
+            {
+                var options = req.Args ?? [];
+                if (options.FirstOrDefault(o => o is not ("--check" or "--force")) is { } unknown)
+                {
+                    await Err(L($"update: unknown option '{unknown}'. It takes --check and --force.", $"update: 알 수 없는 옵션 '{unknown}'. --check와 --force만 받습니다."));
+                    return 2;
+                }
+
+                return req.Target != null
+                    ? await UpdateTargetsAsync(req.Target, options.Contains("--check"), options.Contains("--force"), ko, Out, Err, ct)
+                    : await UpdateSelfAsync(options.Contains("--check"), options.Contains("--force"), ko, Out, Err, ct);
+            }
 
             case "name":
             {
-                var targets = Resolve(req.Target, out var error);
+                var targets = Resolve(req.Target, out var error, ko);
                 if (targets.Count != 1)
                 {
-                    await Err(error.Length > 0 ? error : "name: pick exactly one target with -t.");
+                    await Err(error.Length > 0 ? error : L("name: pick exactly one target with -t.", "name: -t로 대상 PC를 정확히 하나 고르세요."));
                     return 2;
                 }
 
@@ -499,13 +581,13 @@ internal sealed class Daemon
                     return 2;
                 }
 
-                await Out($"{targets[0].Machine} is now called {targets[0].DisplayName}\n");
+                await Out(L($"{targets[0].Machine} is now called {targets[0].DisplayName}\n", $"{targets[0].Machine}의 이름을 {targets[0].DisplayName}(으)로 바꿨습니다\n"));
                 return 0;
             }
 
             case "run" or "push":
             {
-                var targets = Resolve(req.Target, out var error);
+                var targets = Resolve(req.Target, out var error, ko);
                 if (targets.Count == 0)
                 {
                     await Err(error);
@@ -538,18 +620,28 @@ internal sealed class Daemon
         }
     }
 
-    private string ListText(bool includeOffline)
+    private string ListText(bool includeOffline, bool ko = false)
     {
         var records = _targets.Values.Where(r => includeOffline || r.Online)
             .OrderByDescending(r => r.Online).ThenBy(r => r.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        if (records.Count == 0 && ko)
+        {
+            return "연결된 대상 PC가 없습니다.\n" +
+                   "  1. 테스트할 PC에 agentprobe.exe를 복사해 실행하고 \"이 PC 공유\"를 고릅니다 (같은 네트워크 또는 VPN).\n" +
+                   "  2. 거기서 이 PC를 승인합니다 (" + Environment.MachineName + ", 키 " + _identity.Fingerprint + ").\n" +
+                   "대상이 이 PC를 찾지 못하면: 여기서 `agentprobe setup`을 한 번 실행하거나(방화벽), 대상에서\n" +
+                   "  agentprobe share <이 PC의 주소>     (대상에서 `agentprobe share --dry-run`을 실행하면 어디를 찾는지 보여 줍니다)\n" +
+                   "이 PC의 주소: " + string.Join(", ", LocalAddresses()) + "\n" + UpdateNotes(ko);
+        }
+
         if (records.Count == 0)
         {
             return "No target PC is connected.\n" +
-                   "  1. Copy agentprobe.exe to the PC you want to test and run it (same network).\n" +
+                   "  1. Copy agentprobe.exe to the PC you want to test and run it (same network or VPN).\n" +
                    "  2. Approve this PC there (" + Environment.MachineName + ", key " + _identity.Fingerprint + ").\n" +
                    "If the target cannot find this PC: run `agentprobe setup` here once (firewall), or on the target run\n" +
-                   "  agentprobe share <address-of-this-pc>\n" +
-                   "This PC's addresses: " + string.Join(", ", LocalAddresses()) + "\n";
+                   "  agentprobe share <address-of-this-pc>     (`agentprobe share --dry-run` there shows where it looks)\n" +
+                   "This PC's addresses: " + string.Join(", ", LocalAddresses()) + "\n" + UpdateNotes(ko);
         }
 
         var t = new Table("NAME", "MACHINE", "USER", "ADDRESS", "RIGHTS", "STATE", "OS", "LAST COMMAND");
@@ -563,7 +655,28 @@ internal sealed class Daemon
             t.Add(r.Name, r.Machine == r.Name ? "=" : r.Machine, r.User, r.Address, r.Admin ? "admin" : "user", state, r.Os, Format.Clip(last, 50));
         }
 
-        return t.ToString();
+        return t.ToString() + UpdateNotes(ko);
+    }
+
+    /// <summary>One line per thing that can be updated: this PC from a newer release, a connected PC from this PC.</summary>
+    private string UpdateNotes(bool ko)
+    {
+        var sb = new StringBuilder();
+        if (NewerVersion.Length > 0)
+        {
+            sb.Append(ko
+                ? $"agentprobe {NewerVersion}이(가) 나왔습니다 (이 PC는 {AppInfo.Version}): agentprobe update\n"
+                : $"agentprobe {NewerVersion} is available (this PC has {AppInfo.Version}): agentprobe update\n");
+        }
+
+        foreach (var r in _targets.Values.Where(r => r.Online && r.Version != AppInfo.Version).OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            sb.Append(ko
+                ? $"{r.Name}은(는) agentprobe {r.Version}입니다 (이 PC는 {AppInfo.Version}): agentprobe -t {r.Name} update\n"
+                : $"{r.Name} runs agentprobe {r.Version} (this PC has {AppInfo.Version}): agentprobe -t {r.Name} update\n");
+        }
+
+        return sb.ToString();
     }
 
     private sealed record RunSink(Func<string, Task> Out, Func<string, Task> Err, Func<int, Task> Started, Func<string, Task> Saved);
@@ -904,8 +1017,10 @@ internal sealed class Daemon
             foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
             {
                 if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up || nic.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+                // A tunnel adapter is a VPN: say so, because that address is the one a PC across the VPN has to use.
+                var kind = Discovery.CarriesBroadcast(nic) ? "" : ", VPN";
                 foreach (var ua in nic.GetIPProperties().UnicastAddresses.Where(u => u.Address.AddressFamily == AddressFamily.InterNetwork))
-                    list.Add($"{ua.Address} ({nic.Name})");
+                    list.Add($"{ua.Address} ({nic.Name}{kind})");
             }
         }
         catch (System.Net.NetworkInformation.NetworkInformationException)

@@ -67,11 +67,39 @@ internal static class Cli
                 return result;
             }
             case "stop":
-                return await TryConnectAsync() is { } p ? await RequestAsync(p, new PipeMsg { Op = "stop" }, "stop", true) : Say("daemon is not running");
+                return await TryConnectAsync() is { } p
+                    ? await RequestAsync(p, new PipeMsg { Op = args.Contains("--if-idle") ? "stop-idle" : "stop" }, "stop", true)
+                    : Say(Util.Lang.P("daemon is not running", "백그라운드 프로세스가 실행 중이 아닙니다"));
+            case "update":
+            {
+                // With -t: bring connected PCs to this PC's version. Without: update this PC from the newest release.
+                var remote = string.Equals(target, "local", StringComparison.OrdinalIgnoreCase) ? null : target;
+                var request = new PipeMsg { Op = "update", Target = remote, Args = args };
+                if (remote != null) return await DaemonAsync(request, "update", true);
+
+                // The background process does it when there is one, because it has to restart itself afterwards.
+                if (await TryConnectAsync(1500) is { } running) return await RequestAsync(running, request, "update", true);
+                if (Mutex.TryOpenExisting($"Local\\{AppInfo.PipeName}-daemon", out var alive))
+                {
+                    // It is running but could not be reached: replacing the exe now would leave it serving the old version unnoticed.
+                    alive.Dispose();
+                    return Fail(_otherRights
+                        ? Util.Lang.P(
+                            "agentprobe's background process is running with different rights (started from an administrator terminal, or the other way round). Run `agentprobe update` from that kind of terminal.",
+                            "agentprobe의 백그라운드 프로세스가 다른 권한으로 실행 중입니다 (관리자 터미널에서 시작했거나 그 반대). 그쪽 종류의 터미널에서 `agentprobe update`를 실행하세요.")
+                        : Util.Lang.P(
+                            "agentprobe's background process is running but did not answer, so nothing was changed. Try again, or `agentprobe stop` first.",
+                            "agentprobe의 백그라운드 프로세스가 실행 중이지만 응답하지 않아 아무것도 바꾸지 않았습니다. 다시 시도하거나 먼저 `agentprobe stop`을 실행하세요."));
+                }
+
+                if (args.FirstOrDefault(o => o is not ("--check" or "--force")) is { } unknown)
+                    return Fail(Util.Lang.P($"update: unknown option '{unknown}'. It takes --check and --force.", $"update: 알 수 없는 옵션 '{unknown}'. --check와 --force만 받습니다."));
+                return await UpdateWithoutDaemonAsync(args.Contains("--check"));
+            }
             case "list" or "targets":
                 return await DaemonAsync(new PipeMsg { Op = "list", Args = args }, "list", true);
             case "dashboard" or "home":
-                return await Home.ShowAsync(openBrowser: command == "dashboard", interactive: command == "home");
+                return await Home.ShowAsync(openBrowser: command == "dashboard", interactive: command == "home", ownWindow: args.Contains("--own-window"));
             case "name":
                 if (args.Length == 0) return Fail("usage: agentprobe name [-t target] <new-name>   (use \"\" to clear)");
                 return await DaemonAsync(new PipeMsg { Op = "name", Target = target, Text = args[0] }, "name", true);
@@ -95,7 +123,7 @@ internal static class Cli
             return 0;
         }
 
-        var toolArgs = ExecLikeTools.Contains(tool.Name) ? BuildExecArgs(args) : args;
+        var toolArgs = ExecLikeTools.Contains(tool.Name) ? BuildExecArgs(tool.Name, args) : args;
         if (toolArgs == null) return 2;
 
         // `pull` takes the local destination as its optional second argument.
@@ -134,9 +162,9 @@ internal static class Cli
         for (var i = 0; i < args.Length; i++)
         {
             var a = args[i];
-            if (execLike && !a.StartsWith('-'))
+            if (execLike && (!a.StartsWith('-') || a is "-" or "--"))
             {
-                result.AddRange(args[i..]); // the command text starts here: leave it untouched
+                result.AddRange(args[i..]); // the command text (or a script's own arguments) starts here: leave it untouched
                 break;
             }
 
@@ -154,10 +182,11 @@ internal static class Cli
     /// exec/start: options are only read up to the first word of the command, so
     /// <c>exec Get-Process -Name foo</c> reaches PowerShell intact. -f and - (stdin) are read here, on the developer PC.
     /// </summary>
-    private static string[]? BuildExecArgs(string[] args)
+    private static string[]? BuildExecArgs(string tool, string[] args)
     {
         var options = new List<string>();
         string? script = null;
+        var wholeScript = false; // -f or stdin: a script of its own, with its own arguments after it
         var i = 0;
         for (; i < args.Length; i++)
         {
@@ -165,6 +194,7 @@ internal static class Cli
             if (a == "-")
             {
                 script = Console.In.ReadToEnd();
+                wholeScript = true;
                 i++;
                 break;
             }
@@ -174,13 +204,28 @@ internal static class Cli
             {
                 if (++i >= args.Length || !File.Exists(args[i]))
                 {
-                    Console.Error.WriteLine($"exec: script file not found: {(i < args.Length ? args[i] : "(missing)")}");
+                    Console.Error.WriteLine($"{tool}: script file not found: {(i < args.Length ? args[i] : "(missing)")}");
                     return null;
                 }
 
                 script = File.ReadAllText(args[i]);
+                wholeScript = true;
                 continue;
             }
+
+            if (a == "--exe" && tool == "start")
+            {
+                // start --exe <path> [args]: the program itself, no shell; everything after the path is for the program.
+                if (++i >= args.Length)
+                {
+                    Console.Error.WriteLine("--exe needs the path of a program on the target.");
+                    return null;
+                }
+
+                return [.. options, "--exe", args[i], "--", .. args[(i + 1)..]];
+            }
+
+            if (wholeScript && a == "--") break; // the script's arguments start here
 
             if (a is "--shell" or "--cwd" or "--timeout" or "--name")
             {
@@ -198,7 +243,21 @@ internal static class Cli
             break; // unknown dash-word: part of the command itself
         }
 
-        script ??= string.Join(' ', args[i..]);
+        if (wholeScript)
+        {
+            if (string.IsNullOrWhiteSpace(script))
+            {
+                Console.Error.WriteLine($"{tool}: the script is empty.");
+                return null;
+            }
+
+            // What follows the file name goes to the script as its arguments (a leading -- only separates).
+            var rest = args[i..];
+            if (rest.Length > 0 && rest[0] == "--") rest = rest[1..];
+            return [.. options, "--as-file", "--script", script!, "--", .. rest];
+        }
+
+        script = string.Join(' ', args[i..]);
         if (string.IsNullOrWhiteSpace(script))
         {
             Console.Error.WriteLine("No command given. Example: agentprobe exec 'Get-Process | Select-Object -First 5'");
@@ -211,6 +270,70 @@ internal static class Cli
     }
 
     // ---------------------------------------------------------------- daemon plumbing
+
+    /// <summary>
+    /// Ends the background process unless it is serving a connected PC or an open dashboard (`stop --if-idle`).
+    /// Never starts one. Used when the start screen's own window is closed, so that closing it leaves nothing running.
+    /// </summary>
+    public static async Task StopIfIdleAsync()
+    {
+        try
+        {
+            if (await TryConnectAsync() is { } pipe) await RequestAsync(pipe, new PipeMsg { Op = "stop-idle" }, "stop", true, TextWriter.Null);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or System.Text.Json.JsonException)
+        {
+            // it went away by itself
+        }
+    }
+
+    /// <summary>`agentprobe update` on a PC where no background process runs (a PC that is only ever shared, for one).</summary>
+    private static async Task<int> UpdateWithoutDaemonAsync(bool checkOnly)
+    {
+        static string L(string english, string korean) => Util.Lang.P(english, korean);
+        try
+        {
+            var latest = await Updater.LatestAsync(CancellationToken.None);
+            if (!Updater.IsNewer(latest.Version, AppInfo.Version))
+                return Say(L($"agentprobe {AppInfo.Version} is the newest version.", $"agentprobe {AppInfo.Version}이(가) 최신 버전입니다."));
+            if (checkOnly)
+            {
+                return Say(L(
+                    $"agentprobe {latest.Version} is available (this PC has {AppInfo.Version}). Install it with: agentprobe update",
+                    $"agentprobe {latest.Version}이(가) 나왔습니다 (이 PC는 {AppInfo.Version}). 설치: agentprobe update") + (latest.PageUrl.Length > 0 ? "\n" + latest.PageUrl : ""));
+            }
+
+            Console.WriteLine(L($"downloading agentprobe {latest.Version}...", $"agentprobe {latest.Version} 내려받는 중..."));
+            await Updater.InstallAsync(latest, AppInfo.ExePath, CancellationToken.None);
+            Console.WriteLine(L(
+                $"updated {AppInfo.ExePath} from {AppInfo.Version} to {latest.Version}. The next start uses it.",
+                $"{AppInfo.ExePath}을(를) {AppInfo.Version}에서 {latest.Version}(으)로 업데이트했습니다. 다음 실행부터 새 버전입니다."));
+            if (Mutex.TryOpenExisting($"Local\\{AppInfo.Name}-share{AppInfo.Instance}", out var sharing))
+            {
+                sharing.Dispose();
+                Console.WriteLine(L(
+                    "This PC is being shared right now, by the old version: that session goes on untouched. It uses the new version when sharing is started again.",
+                    "이 PC는 지금 이전 버전으로 공유되고 있습니다. 그 세션은 그대로 이어지고, 공유를 다시 시작하면 새 버전을 씁니다."));
+            }
+
+            return 0;
+        }
+        catch (UpdateFailedException ex)
+        {
+            Console.Error.WriteLine(ex.Changed
+                ? L($"The update failed: {ex.Message}", $"업데이트에 실패했습니다: {ex.Message}")
+                : L($"The update failed and nothing was changed: {ex.Message}", $"업데이트에 실패했고 아무것도 바뀌지 않았습니다: {ex.Message}"));
+            return 1;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or InvalidDataException or System.Text.Json.JsonException or IOException or TaskCanceledException)
+        {
+            // Reading the release feed failed: the check itself, before anything was downloaded.
+            Console.Error.WriteLine(L(
+                $"Could not check for a new version: {(ex is TaskCanceledException ? "no answer in time" : ex.GetBaseException().Message)}",
+                $"새 버전을 확인하지 못했습니다: {(ex is TaskCanceledException ? "제때 응답이 없었습니다" : ex.GetBaseException().Message)}"));
+            return 1;
+        }
+    }
 
     public static async Task<int> DaemonAsync(PipeMsg req, string tool, bool full, TextWriter? capture = null)
     {
@@ -227,6 +350,7 @@ internal static class Cli
     private static async Task<int> RequestAsync(NamedPipeClientStream pipe, PipeMsg req, string tool, bool full, TextWriter? capture = null)
     {
         await using var _ = pipe;
+        if (Util.Lang.Korean && Util.Lang.Person) req.Lang = "ko";
         var line = JsonSerializer.SerializeToUtf8Bytes(req, JsonCtx.Default.PipeMsg);
         await pipe.WriteAsync(line);
         pipe.WriteByte((byte)'\n');
@@ -324,13 +448,46 @@ internal static class Cli
                 return 0;
             }
 
-            return Fail($"No command '{args[0]}'.");
+            return Fail(Util.Lang.P($"No command '{args[0]}'.", $"'{args[0]}' 명령은 없습니다."));
+        }
+
+        if (Util.Lang.Korean && Util.Lang.Person)
+        {
+            Console.Write($"""
+                agentprobe {AppInfo.Version} - AI 에이전트가 같은 네트워크의 다른 Windows PC를 디버깅하고 테스트하게 합니다
+
+                테스트할 PC    agentprobe.exe를 복사해 더블클릭하고 1을 누릅니다 (또는: agentprobe share). 한 번 승인합니다.
+                개발 PC        아래 명령을 실행합니다. 에이전트도 같은 명령을 씁니다. 처음 한 번: agentprobe setup
+
+                세션:
+                  list [--all]       연결된 대상 PC (--all: 연결이 끊긴 PC와 그 마지막 명령도 표시)
+                  dashboard          같은 내용을 실시간 웹 페이지로 엽니다. AI 에이전트에게 줄 문구도 출력합니다
+                  home               시작 화면: 그 문구를 숫자 키나 클릭으로 복사하고, 명령도 입력할 수 있습니다
+                  name <새 이름>     대상 PC에 짧은 이름을 붙입니다. 그 뒤로 -t에 그 이름을 씁니다
+                  setup [--remove]   개발 PC 설정(한 번): 이 폴더를 PATH에 추가하고 방화벽 포트를 엽니다
+                                     (관리자 권한을 한 번 묻습니다)
+                  guide              AI 에이전트용 사용 안내 (영어)
+                  mcp                MCP 서버(stdio)로 실행: claude mcp add agentprobe -- "<경로>\agentprobe.exe" mcp
+                  stop [--if-idle]   이 PC의 백그라운드 프로세스 종료 (--if-idle: 연결된 PC와 열린 대시보드가 없을 때만)
+                  update [--check]   이 PC의 agentprobe를 최신 릴리스로 교체하고 백그라운드 프로세스를 다시 시작 (--check: 확인만)
+                                     -t <이름> update: 연결된 PC를 이 PC와 같은 버전으로 (세션과 승인은 유지)
+
+                대상 지정:  -t <이름>  |  -t a,b  |  -t "LAB-*"  |  -t all  |  -t local (이 PC)
+                            연결된 대상이 하나면 -t를 생략할 수 있습니다. 여러 대상의 같은 결과는 묶어서 보여 줍니다.
+                출력:       긴 출력은 앞뒤만 보여 주고 전체를 이 PC의 파일로 저장합니다. --full은 전부 출력합니다.
+                            -o <경로>는 받아 온 파일(screenshot, dump, pull)을 저장할 위치입니다.
+
+                아래 명령들의 설명과 출력은 에이전트가 읽는 글이라 영어입니다. 자세히: agentprobe help <명령>
+
+                {ToolRegistry.HelpList()}
+                """.Replace("\r\n", "\n"));
+            return 0;
         }
 
         Console.Write($"""
             agentprobe {AppInfo.Version} - let an AI agent debug and test another Windows PC on your network
 
-            ON THE PC TO TEST      copy agentprobe.exe there and double-click it (or: agentprobe share). Approve once.
+            ON THE PC TO TEST      copy agentprobe.exe there, double-click it, press 1 (or: agentprobe share). Approve once.
             ON THE DEVELOPER PC    run the commands below; the agent does the same. First time: agentprobe setup
 
             Session:
@@ -345,7 +502,12 @@ internal static class Cli
               guide              how an AI agent should use this tool (workflow + cheap ways to look)
               mcp                run as an MCP server (stdio), for agents that are set up through MCP:
                                  claude mcp add agentprobe -- "<path>\agentprobe.exe" mcp
-              stop               stop the background process on this PC
+              stop [--if-idle]   stop the background process on this PC (--if-idle: only when no PC is connected and
+                                 no dashboard is open; closing the start screen's own window does the same)
+              update [--check]   replace this PC's agentprobe with the newest release (checksum verified) and restart
+                                 its background process; --check only says whether there is one; --force also while
+                                 commands are running. With -t <name>: bring a connected PC to this PC's version;
+                                 its session, approval and workspace carry over.
 
             Targets:  -t <name>  |  -t a,b  |  -t "LAB-*"  |  -t all  |  -t local (this PC)
                       With one connected target, -t can be omitted. Several targets: identical results are grouped.

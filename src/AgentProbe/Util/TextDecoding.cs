@@ -23,6 +23,9 @@ internal sealed class LineDecoder
         }
     });
 
+    /// <summary>The console's OEM code page: what cmd.exe reads a batch file in.</summary>
+    public static Encoding OemEncoding => Oem.Value;
+
     private readonly List<byte> _pending = [];
 
     /// <summary>Feeds bytes, returns the complete lines (with trailing newline) decoded so far.</summary>

@@ -15,6 +15,18 @@ internal static class Lang
 
     public static string T(string english, string korean) => Korean ? korean : english;
 
+    /// <summary>
+    /// True when a person reads this process's output: it goes to a console, or the start screen runs the command
+    /// for the person at it (AGENTPROBE_PERSON). An agent reads through a pipe.
+    /// </summary>
+    public static bool Person { get; } = Environment.GetEnvironmentVariable("AGENTPROBE_PERSON") == "1" || !Console.IsOutputRedirected;
+
+    /// <summary>
+    /// For what the command line itself says (guidance, errors, help): Korean when a person reads it on a Korean
+    /// Windows, English for agents always. What a tool reports from the target stays English either way.
+    /// </summary>
+    public static string P(string english, string korean) => Korean && Person ? korean : english;
+
     private static bool Detect(string? requested)
     {
         var name = requested ?? Environment.GetEnvironmentVariable("AGENTPROBE_LANG") ?? CultureInfo.CurrentUICulture.TwoLetterISOLanguageName;

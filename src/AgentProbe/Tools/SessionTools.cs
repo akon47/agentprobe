@@ -26,6 +26,14 @@ internal static class SessionTools
               Unattended PCs need Windows auto-logon, otherwise someone has to log on after the reboot.
               Background jobs do not survive a reboot; the session workspace and trust do.
             """, RebootAsync),
+        new("selfupdate", "Session", "Replace agentprobe on the target with a pushed exe and resume (run by `-t <name> update`)",
+            """
+            selfupdate <pushed-exe> [--force]
+              Not normally called by hand: `agentprobe -t <name> update` pushes this PC's exe and runs this.
+              The target restarts agentprobe from the new exe in a new window. Approval and the workspace carry over;
+              settings that tools changed are reverted; commands and background jobs that are running are no longer
+              followed, which is why --force is needed while there are any.
+            """, SelfUpdateAsync),
         new("end", "Session", "End the session: stop jobs, delete the workspace, close agentprobe on the target",
             """
             end [--remove-exe]
@@ -112,6 +120,38 @@ internal static class SessionTools
         ctx.Runtime.Audit.Write($"reboot requested; resume via {how}");
         ctx.Out.WriteLine($"rebooting in {delay}s; resume registered as a {how}");
         return Task.FromResult(0);
+    }
+
+    private static async Task<int> SelfUpdateAsync(ToolContext ctx, string[] args)
+    {
+        var a = ArgParser.Parse(args, "force");
+        if (ctx.Runtime.UpdateTo == null) return ctx.Fail("selfupdate: not available here (only inside a shared session).");
+        if (a.Positionals.Count == 0) return ctx.Fail("selfupdate: which exe? This is normally run by `agentprobe -t <name> update`.");
+        var path = ctx.Runtime.ResolvePath(a.Positionals[0]);
+        if (!File.Exists(path)) return ctx.Fail($"selfupdate: {path} does not exist on the target.");
+        var version = await Controller.Updater.ReportedVersionAsync(path, ctx.Ct);
+        if (version == null) return ctx.Fail($"selfupdate: {path} does not run as agentprobe on this PC. Nothing was changed.");
+
+        // Whatever runs in this session is tied to this process and cannot move to the new one.
+        var jobs = ctx.Runtime.Jobs.List().Count(j => j.ExitCode == null);
+        var runs = ctx.Runtime.History().Count(r => r.ExitCode == null && !r.BeforeReboot && r.Tool != "selfupdate");
+        if ((jobs > 0 || runs > 0) && !a.Flag("force"))
+        {
+            ctx.Err.WriteLine($"selfupdate: {runs} command(s) and {jobs} background job(s) are running in this session. After the restart they are no longer followed " +
+                              "(they keep running, but their output and exit codes are lost). Wait for them or stop them, or pass --force. Nothing was changed.");
+            return 4; // held back: --force goes ahead
+        }
+
+        try
+        {
+            var how = ctx.Runtime.UpdateTo(path, version);
+            ctx.Out.WriteLine(how + (jobs > 0 || runs > 0 ? $" NO LONGER FOLLOWED: {runs} command(s) and {jobs} background job(s) that were running; they run on, without their output or exit codes." : ""));
+            return 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            return ctx.Fail("selfupdate: " + ex.Message);
+        }
     }
 
     private static Task<int> EndAsync(ToolContext ctx, string[] args)

@@ -14,8 +14,27 @@ internal static class Shell
 
     private const string PsSuffix = "\nif (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }";
 
-    public static ProcessStartInfo Build(string shell, string command, string cwd, TargetRuntime runtime)
+    /// <param name="fileArgs">
+    /// Not null when <paramref name="command"/> is a whole script file (<c>exec -f</c>): it is then saved and run as a
+    /// file with these arguments, so its <c>param(...)</c> block, <c>$PSScriptRoot</c> and line numbers are its own.
+    /// </param>
+    public static ProcessStartInfo Build(string shell, string command, string cwd, TargetRuntime runtime, IReadOnlyList<string>? fileArgs = null)
     {
+        if (fileArgs != null)
+        {
+            var cmd = shell.Equals("cmd", StringComparison.OrdinalIgnoreCase);
+            var file = Path.Combine(runtime.WorkDir, $"script-{Guid.NewGuid():N}.{(cmd ? "cmd" : "ps1")}");
+
+            // A PowerShell script ends with the same exit-code rule an inline command gets, so a script whose last
+            // step failed does not come back as 0 (it follows the script's own text: the param block stays first and
+            // its line numbers stay its own). cmd reads a batch file in the console's OEM code page.
+            if (cmd) File.WriteAllText(file, command, LineDecoder.OemEncoding);
+            else File.WriteAllText(file, command.TrimEnd() + "\n" + PsSuffix + "\n", new UTF8Encoding(true));
+            command = cmd
+                ? "\"" + file + "\"" + string.Concat(fileArgs.Select(x => " \"" + x.Replace("\"", "\"\"") + "\""))
+                : "& '" + file.Replace("'", "''") + "'" + string.Concat(fileArgs.Select(x => " " + PsArgument(x)));
+        }
+
         var psi = new ProcessStartInfo
         {
             WorkingDirectory = cwd,
@@ -60,6 +79,23 @@ internal static class Shell
         }
 
         return psi;
+    }
+
+    /// <summary>
+    /// One argument for a script, as PowerShell source: parameter names (-Port), numbers and $true/$false/$null go in
+    /// as they are, everything else as a literal string, so spaces and quotes in a value cannot change the command.
+    /// </summary>
+    private static string PsArgument(string value)
+    {
+        const System.Text.RegularExpressions.RegexOptions options = System.Text.RegularExpressions.RegexOptions.IgnoreCase;
+        const string literal = @"(-?\d+(\.\d+)?|\$(true|false|null))"; // \A..\z: "$" would also match before a trailing newline
+
+        // -Name:value and -Switch:$false: the name as it is, the value by the same rule.
+        var named = System.Text.RegularExpressions.Regex.Match(value, @"\A(-[A-Za-z_][\w-]*:)(.+)\z", options | System.Text.RegularExpressions.RegexOptions.Singleline);
+        if (named.Success) return named.Groups[1].Value + PsArgument(named.Groups[2].Value);
+        return System.Text.RegularExpressions.Regex.IsMatch(value, @"\A(-[A-Za-z_][\w-]*:?|" + literal + @")\z", options)
+            ? value
+            : "'" + value.Replace("'", "''") + "'";
     }
 
     /// <summary>Runs to completion, streaming decoded lines. Returns the exit code, or 124 on timeout, 130 when cancelled.</summary>
@@ -197,9 +233,30 @@ internal sealed class JobManager(TargetRuntime runtime)
     private readonly List<Job> _jobs = [];
     private int _nextId;
 
-    public Job Start(string shell, string command, string cwd, string? name)
+    public Job Start(string shell, string command, string cwd, string? name, IReadOnlyList<string>? fileArgs = null) =>
+        Track(Shell.Build(shell, command, cwd, runtime, fileArgs), command, name);
+
+    /// <summary>
+    /// Starts a program itself, without a shell in between, so the job IS that program: its pid, its exit code,
+    /// and <c>kill</c> ends it. A GUI app started through a shell is not waited for, and the job would end at once.
+    /// </summary>
+    public Job StartExe(string exe, IReadOnlyList<string> args, string? cwd, string? name)
     {
-        var psi = Shell.Build(shell, command, cwd, runtime);
+        var psi = new ProcessStartInfo(exe)
+        {
+            WorkingDirectory = cwd ?? Path.GetDirectoryName(exe) ?? runtime.WorkDir,
+            UseShellExecute = false,
+            CreateNoWindow = true, // no console window for a console program; a GUI program shows its windows as usual
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        return Track(psi, (exe + " " + string.Join(' ', args)).TrimEnd(), name);
+    }
+
+    private Job Track(ProcessStartInfo psi, string command, string? name)
+    {
         var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
         p.Start();
         p.StandardInput.Close();
@@ -248,8 +305,11 @@ internal static class ExecTools
         new("exec", "Run", "Run a command (PowerShell by default) and wait for it",
             """
             exec [--shell powershell|pwsh|ps32|cmd] [--cwd DIR] [--timeout 60s] <command>
-            exec -f local-script.ps1        send a local script file and run it
-            exec -                          read the command from stdin
+            exec -f local-script.ps1 [args] send a local script file and run it; what follows the file name goes
+                                            to the script (its param block works): exec -f t.ps1 -Port 8080 -Fast
+                                            Put --shell/--cwd/--timeout before -f; write -- before script arguments
+                                            that look like those: exec --timeout 5m -f t.ps1 -- --timeout 3
+            exec - [args]                   read the script from stdin
               Output is UTF-8, stdin is closed (prompts fail fast), the exit code is the remote exit code.
               Default folder is the session workspace (where relative `push` paths land).
               Runs as the logged-on user in their desktop session, so GUI apps you launch are visible.
@@ -259,7 +319,12 @@ internal static class ExecTools
         new("start", "Run", "Start a long-running command in the background",
             """
             start [--name NAME] [--shell ..] [--cwd DIR] <command>
+            start [--name NAME] [--cwd DIR] --exe <path> [args]
               Returns a job id. The job keeps running if the connection drops. Read it with `logs`, stop it with `kill`.
+              --exe starts the program itself, with no shell in between: use it for an app with a window. The job
+              is then that app (its pid, its exit code with crash codes named, `kill <job>` closes it, `wait --job`
+              waits for it), and it starts in its own folder unless --cwd says otherwise. Started as a <command>
+              instead, a GUI app is not waited for and the job ends at once while the app runs on untracked.
             """, StartAsync),
         new("jobs", "Run", "List background jobs", "jobs", JobsAsync) { Quiet = true },
         new("logs", "Run", "Output of a background job (only what is new since the last call)",
@@ -277,20 +342,21 @@ internal static class ExecTools
 
     private static async Task<int> ExecAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args);
-        var command = string.Join(' ', a.Positionals);
-        if (a.Get("script") is { } script) command = script; // filled in by the CLI for -f / stdin
+        // The CLI puts the command text in --script. With --as-file it is a whole script file (-f or stdin) and the
+        // words after -- are that script's arguments.
+        var a = ArgParser.Parse(args, "as-file");
+        var command = a.Get("script") ?? string.Join(' ', a.Positionals);
         if (string.IsNullOrWhiteSpace(command)) return ctx.Fail("exec: no command given.");
 
         var cwd = a.Get("cwd") is { } c ? ctx.Runtime.ResolvePath(c) : ctx.Runtime.WorkDir;
         ProcessStartInfo psi;
         try
         {
-            psi = Shell.Build(a.Get("shell") ?? "powershell", command, cwd, ctx.Runtime);
+            psi = Shell.Build(a.Get("shell") ?? "powershell", command, cwd, ctx.Runtime, a.Flag("as-file") ? a.Positionals : null);
         }
-        catch (ArgumentException ex)
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
         {
-            return ctx.Fail(ex.Message);
+            return ctx.Fail("exec: " + ex.Message);
         }
 
         try
@@ -313,6 +379,7 @@ internal static class ExecTools
 
             // A crash exit code reads better with its meaning next to it.
             if ((uint)code >= 0xC0000000) ctx.Err.WriteLine($"[exit code {Native.ProcessDetails.ExitCodeName((uint)code)}]");
+            SystemPrompts.Warn(ctx.Err);
             return code;
         }
         catch (System.ComponentModel.Win32Exception ex)
@@ -323,19 +390,48 @@ internal static class ExecTools
 
     private static Task<int> StartAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args);
-        var command = a.Get("script") ?? string.Join(' ', a.Positionals);
-        if (string.IsNullOrWhiteSpace(command)) return Task.FromResult(ctx.Fail("start: no command given."));
-        var cwd = a.Get("cwd") is { } c ? ctx.Runtime.ResolvePath(c) : ctx.Runtime.WorkDir;
+        return StartCoreAsync(ctx, args);
+    }
+
+    private static async Task<int> StartCoreAsync(ToolContext ctx, string[] args)
+    {
+        var a = ArgParser.Parse(args, "as-file");
+        var cwd = a.Get("cwd") is { } c ? ctx.Runtime.ResolvePath(c) : null;
         try
         {
-            var job = ctx.Runtime.Jobs.Start(a.Get("shell") ?? "powershell", command, cwd, a.Get("name"));
-            ctx.Out.WriteLine($"job {job.Id} started (pid {job.Pid})");
-            return Task.FromResult(0);
+            Job job;
+            if (a.Get("exe") is { } exe)
+            {
+                var path = ctx.Runtime.ResolvePath(exe);
+                if (!File.Exists(path)) return ctx.Fail($"start: {path} does not exist on the target.");
+                job = ctx.Runtime.Jobs.StartExe(path, a.Positionals, cwd, a.Get("name"));
+                ctx.Out.WriteLine($"job {job.Id} started (pid {job.Pid}): {Path.GetFileName(path)}");
+            }
+            else
+            {
+                var command = a.Get("script") ?? string.Join(' ', a.Positionals);
+                if (string.IsNullOrWhiteSpace(command)) return ctx.Fail("start: no command given.");
+                job = ctx.Runtime.Jobs.Start(a.Get("shell") ?? "powershell", command, cwd ?? ctx.Runtime.WorkDir, a.Get("name"), a.Flag("as-file") ? a.Positionals : null);
+                ctx.Out.WriteLine($"job {job.Id} started (pid {job.Pid})");
+            }
+
+            // A shell that only launched something is done within moments: say so now, instead of leaving a job
+            // that looks like the app but is not.
+            // (The process is asked directly: the job's own exit code is set only after its output has been read,
+            // and an app the shell launched keeps that output open.)
+            if (!a.Has("exe")) await Task.WhenAny(job.Process.WaitForExitAsync(ctx.Ct), Task.Delay(2500, ctx.Ct));
+            if (!a.Has("exe") && job.Process.HasExited)
+            {
+                ctx.Err.WriteLine($"[job {job.Id} already ended with exit {Native.ProcessDetails.ExitCodeName((uint)job.Process.ExitCode)}. If it launched an app with a window, the app is NOT this job: " +
+                                  "start it with `start --exe <path> [args]` to track the app itself.]");
+            }
+
+            SystemPrompts.Warn(ctx.Err);
+            return 0;
         }
-        catch (Exception ex) when (ex is ArgumentException or System.ComponentModel.Win32Exception)
+        catch (Exception ex) when (ex is ArgumentException or System.ComponentModel.Win32Exception or IOException or UnauthorizedAccessException)
         {
-            return Task.FromResult(ctx.Fail("start: " + ex.Message));
+            return ctx.Fail("start: " + ex.Message);
         }
     }
 

@@ -359,6 +359,12 @@ internal static partial class SystemTools
         }
 
         if (hung.Count > 0) findings.Add("a window is not responding: `threads <pid>` (busy vs blocked), then `dump <pid>`");
+
+        var prompts = SystemPrompts.Find();
+        foreach (var p in prompts) o.WriteLine($"prompt   a system dialog is waiting for the person at this PC: {p.Describe()}");
+        var secure = SystemPrompts.SecureDesktopShowing();
+        if (secure) o.WriteLine("prompt   the secure desktop is showing (a UAC prompt, the lock screen or Ctrl+Alt+Del)");
+        if (prompts.Count > 0 || secure) findings.Add("a system dialog is waiting on the screen (firewall, UAC, credentials, a file picker): the person at the PC has to answer it before what caused it continues");
         if (PendingReboot())
         {
             o.WriteLine("reboot   a restart is pending (updates/installers)");

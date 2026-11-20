@@ -308,10 +308,17 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
             {
                 if (_zip)
                 {
+                    // Say how many files were SENT. When the folder already had content the two are merged, and the
+                    // folder's total is a different number: give both, each with its name.
+                    var merged = Directory.Exists(_dest) && Directory.EnumerateFileSystemEntries(_dest).Any();
+                    int sent;
+                    using (var zip = ZipFile.OpenRead(_temp)) sent = zip.Entries.Count(e => !e.FullName.EndsWith('/') && !e.FullName.EndsWith('\\'));
                     Directory.CreateDirectory(_dest);
                     ZipFile.ExtractToDirectory(_temp, _dest, overwriteFiles: true);
-                    var count = Directory.EnumerateFiles(_dest, "*", SearchOption.AllDirectories).Count();
-                    return (true, $"pushed folder -> {_dest} ({count} files, {Format.Bytes(_bytes)} zipped)");
+                    var files = sent == 1 ? "1 file" : $"{sent} files";
+                    if (!merged) return (true, $"pushed folder -> {_dest} ({files}, {Format.Bytes(_bytes)} zipped)");
+                    var total = Directory.EnumerateFiles(_dest, "*", SearchOption.AllDirectories).Count();
+                    return (true, $"pushed folder -> {_dest} ({files} sent, {Format.Bytes(_bytes)} zipped; merged into the existing folder, which now holds {total} files)");
                 }
 
                 // Pushing a file onto an existing folder (or a path ending in a slash) drops it inside.

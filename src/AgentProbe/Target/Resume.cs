@@ -17,18 +17,24 @@ namespace AgentProbe.Target;
 internal static class Resume
 {
     private const string RunOnceKey = @"Software\Microsoft\Windows\CurrentVersion\RunOnce";
-    private const string ValueName = "agentprobe-resume";
-    private const string TaskName = "agentprobe-resume";
+    // Per instance (AGENTPROBE_INSTANCE), so a test instance ending its session cannot remove a real one's entry.
+    private static readonly string ValueName = "agentprobe-resume" + AppInfo.Instance;
+    private static readonly string TaskName = "agentprobe-resume" + AppInfo.Instance;
 
     private static string StatePath => Path.Combine(AppInfo.StateDir, "resume.bin");
 
-    public static string Register(ResumeState state)
+    /// <param name="autostart">
+    /// False when the next instance is started directly (an update, not a reboot): only the state file is written,
+    /// and nothing is registered to run at logon.
+    /// </param>
+    public static string Register(ResumeState state, bool autostart = true)
     {
         var elevated = Environment.IsPrivilegedProcess;
-        state.ScheduledTask = elevated;
+        state.ScheduledTask = elevated && autostart;
         Directory.CreateDirectory(AppInfo.StateDir);
         var json = JsonSerializer.SerializeToUtf8Bytes(state, JsonCtx.Default.ResumeState);
         File.WriteAllBytes(StatePath, Dpapi.Protect(json));
+        if (!autostart) return "state file only";
 
         var command = $"\"{AppInfo.ExePath}\" share --resume";
         if (elevated && RegisterTask())

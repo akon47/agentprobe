@@ -30,6 +30,13 @@ internal static class CommandLine
             }
 
             if (i >= tokens.Count) return (tool, [], $"{tool.Name}: no command given.");
+            if (tool.Name == "start" && tokens[i].text == "--exe")
+            {
+                // start --exe <path> [args]: the program itself, with the words after its path as its arguments.
+                if (i + 1 >= tokens.Count) return (tool, [], "start: --exe needs the path of a program on the target.");
+                return (tool, [.. options, "--exe", tokens[i + 1].text, "--", .. tokens.Skip(i + 2).Select(t => t.text)], null);
+            }
+
             options.Add("--script");
             options.Add(line[tokens[i].start..].Trim());
             return (tool, [.. options], null);

@@ -70,3 +70,9 @@ in `ToolRegistry`). The CLI forwards any registered name, so nothing else change
 The version comes from the tag, not from the csproj. Either push a tag (`git tag v0.2.0; git push origin v0.2.0`)
 or run the `build` workflow by hand with a version: it builds the exe with that version, runs the test suite, and
 creates the tag and the release with `agentprobe.exe` and its SHA-256.
+
+Released exes update themselves from that release (`Controller/Updater.cs`): they read `releases/latest` and expect
+the assets `agentprobe.exe` and `agentprobe.exe.sha256` under exactly those names. Keep the csproj version equal to
+the last release, or a local build offers to "update" itself to it. Anything that touches a running agentprobe is
+tried in a separate instance (`AGENTPROBE_INSTANCE`, `AGENTPROBE_PORT`, and `AGENTPROBE_UPDATE_URL` for a local feed),
+as `tests\verify.ps1` does.

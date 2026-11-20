@@ -24,6 +24,8 @@ internal static partial class UiTools
             """
             windows [filter] [--all]
               Visible titled windows by default (--all includes hidden/untitled). "NOT RESPONDING" marks a hung UI thread.
+              "SYSTEM PROMPT" marks a dialog of Windows itself (firewall, UAC, credentials, SmartScreen, a packaged
+              app's file picker) that the person at the PC has to answer; those are listed whatever the filter.
               Much cheaper than a screenshot for "did the dialog appear?" / "is the app frozen?".
             """, WindowsAsync) { Quiet = true },
         new("screenshot", "Desktop", "Capture the screen (or one display/window) to a PNG on the developer PC",
@@ -94,9 +96,22 @@ internal static partial class UiTools
         var names = ProcessSnapshot.Take().ToDictionary(p => p.Pid, p => p.Name);
         var foreground = Win32.GetForegroundWindow();
         var t = new Table("HWND", ">PID", "PROCESS", "POSITION", "STATE", "TITLE");
-        foreach (var w in EnumerateWindows())
+        var windows = EnumerateWindows();
+
+        // Prompts Windows shows in windows of its own (firewall, UAC, credentials) are listed whatever the filter:
+        // their top-level windows are often untitled or empty, and they are exactly what an agent must not miss.
+        var prompts = SystemPrompts.Find(windows, names);
+        var promptPids = prompts.Select(p => p.Pid).ToHashSet();
+        foreach (var p in prompts)
+        {
+            var where = p.Rect.Width > 1 ? $"{p.Rect.Left},{p.Rect.Top} {p.Rect.Width}x{p.Rect.Height}" : "";
+            t.Add(p.Hwnd != 0 ? "0x" + ((long)p.Hwnd).ToString("X") : "-", p.Pid, p.Process, where, "SYSTEM PROMPT", Format.Clip(p.Title, 90));
+        }
+
+        foreach (var w in windows)
         {
             if (w.Pid == Environment.ProcessId) continue; // our own "remote control active" banner
+            if (promptPids.Contains(w.Pid) && !a.Flag("all")) continue; // shown above as one line
             if (!a.Flag("all") && (!w.Visible || w.Title.Length == 0 || (w.Rect.Width <= 1 && !w.Minimized))) continue;
             var process = names.GetValueOrDefault(w.Pid, "?");
             if (a.Positionals.Count > 0 && !w.Title.Contains(a.Positionals[0], StringComparison.OrdinalIgnoreCase) && !process.Contains(a.Positionals[0], StringComparison.OrdinalIgnoreCase)) continue;
@@ -106,6 +121,9 @@ internal static partial class UiTools
         }
 
         ctx.Out.Write(t.Count > 0 ? t.ToString() : "no matching windows\n");
+        if (prompts.Count > 0) ctx.Out.WriteLine("SYSTEM PROMPT = a dialog of Windows itself (see its title) is waiting for the person at this PC; whatever caused it waits until they answer.");
+        if (SystemPrompts.SecureDesktopShowing())
+            ctx.Out.WriteLine("The secure desktop is showing (a UAC prompt, the lock screen or Ctrl+Alt+Del): the windows above cannot be seen or clicked until the person there answers.");
         return Task.FromResult(0);
     }
 

@@ -64,6 +64,9 @@ internal sealed class PipeMsg
 
     public int TimeoutSec { get; set; }
 
+    /// <summary>"ko" when a person on a Korean Windows asked: the daemon's own guidance and errors are then in Korean.</summary>
+    public string? Lang { get; set; }
+
     // events: out | err | exit | saved | error | info
     public string? Ev { get; set; }
 
@@ -75,6 +78,12 @@ internal sealed class PipeMsg
 /// <summary>What a target writes to disk before a reboot so it can come back without asking again.</summary>
 internal sealed class ResumeState
 {
+    /// <summary>"" for a reboot; "update" when agentprobe restarted itself from a new exe (no reboot happened).</summary>
+    public string Reason { get; set; } = "";
+
+    /// <summary>The number of the newest run when the state was written; the next instance counts on from it.</summary>
+    public int LastRun { get; set; }
+
     public string ControllerKey { get; set; } = "";
 
     public string ControllerHost { get; set; } = "";

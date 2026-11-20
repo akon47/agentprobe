@@ -50,14 +50,27 @@ If `agentprobe` is not found, it is not on PATH yet: call the exe by its full pa
 agentprobe exec 'Get-ChildItem C:\App | Select-Object -First 5'     # PowerShell; exit code is the remote exit code
 agentprobe exec --shell cmd 'dir /b C:\App'
 agentprobe exec --shell ps32 '...'                                   # 32-bit PowerShell (what a 32-bit app sees)
-agentprobe exec -f .\repro.ps1 --timeout 10m                         # send a local script and run it
-agentprobe start --name app 'C:\App\MyApp.exe --verbose'             # background job; survives disconnects
-agentprobe logs app            # only output that is new since the last call
+agentprobe exec --timeout 10m -f .\repro.ps1 -Port 8080 -Fast       # send a local script and run it; what follows
+                                                                     # the file name goes to its param() block
+agentprobe start --name build 'msbuild App.sln'                      # background job (a command); survives disconnects
+agentprobe start --name app --exe 'C:\App\MyApp.exe' --verbose       # an app with a window: the job IS the app
+agentprobe logs build          # only output that is new since the last call
 agentprobe wait --window "MyApp" --timeout 30s
+agentprobe wait --idle MyApp --below 25                              # "finished starting" for an app that never idles
 agentprobe kill app
 ```
 
 - Quote the command with single quotes so your local shell leaves `$` and `|` alone.
+- Start a GUI app with `start --exe`, not as a command: a shell does not wait for a windowed program, so that job
+  would end at once while the app runs on untracked. With `--exe` the job has the app's pid and its exit code
+  (crash codes are named), and `kill <job>` / `wait --job <job>` act on the app.
+- A program that opens a network port from a new path (anything you `push` and run) makes Windows Firewall ask
+  the person at the target to allow it. `windows`, `triage` and the end of `exec`/`start` output report such a
+  SYSTEM PROMPT with its title (also UAC, credentials, SmartScreen, a packaged app's file picker); you cannot answer
+  it remotely, so tell the user. This is found by the system process that shows the dialog, as Windows 11 does it:
+  on a Windows that shows the firewall question another way it is not reported, so a silent stall after starting
+  a server still deserves a `screenshot`. Connections to 127.0.0.1 work without an answer; once answered, the rule
+  stays for that path.
 - stdin is closed: anything that prompts fails immediately instead of hanging. Pass `-Force`/`-Confirm:$false`/`/quiet`.
 - Commands run as the logged-on user **in their desktop session**: a GUI app you start is visible there.
 - The default folder is the session workspace. `agentprobe push .\bin\Release build` puts a folder there;
@@ -111,9 +124,20 @@ with the list of targets that produced them. `agentprobe name -t LAB-PC07 gpu-ri
 `agentprobe list --all` also shows targets that went offline, with their last command.
 `-t local` runs a tool on the developer PC itself.
 
+## Versions and updates
+
+`agentprobe list` adds a line when a newer release exists (`agentprobe update`) or when a target runs another
+version than this PC (`agentprobe -t <name> update`: sends this PC's exe; the target restarts agentprobe and its
+session, approval and workspace carry over). Tell the user instead of updating on your own: an update restarts
+agentprobe's background process, and a command you are waiting for ends with exit 75 (fetch it with `result <#>`).
+Both commands hold back with exit 4 and an explanation while commands are running; `--force` is the user's call.
+`update --check` (with or without `-t`) only reports. If your shell is a pseudo-terminal on a Korean Windows and
+agentprobe's own messages come out in Korean, set `AGENTPROBE_LANG=en`.
+
 ## Exit codes
 
-The remote command's own exit code for `exec`; `0` success; `2` usage; `3` no such target; `75` connection lost
+The remote command's own exit code for `exec`; `0` success; `2` usage; `3` no such target; `4` an update held back
+because something is running (`--force` goes ahead); `75` connection lost
 (the command may still be running: see `history`); `124` timeout; `130` cancelled. Crash codes are decoded, e.g.
 `0xC0000005 access violation`, `0xC0000135 DLL not found`, `0xC000007B x86/x64 mismatch`, `0xE0434352 .NET exception`.
 

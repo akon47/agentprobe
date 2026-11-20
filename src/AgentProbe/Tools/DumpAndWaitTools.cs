@@ -86,6 +86,8 @@ internal static class WaitTool
               --file <path> --grep RE  ...and a line matches the pattern
               --job <id>               a background job finished
               --idle <pid|name>        the process uses < 2% of a core for 3s (finished starting up / working)
+              --below <percent>        with --idle: that limit instead of 2, in % of one core, for an app that is
+                                       never quite idle (a video app at rest may sit at 15%: --idle app --below 25)
               Exit code 0 when met (prints how long it took), 124 on timeout (prints what was still missing).
             """, WaitAsync),
     ];
@@ -95,6 +97,7 @@ internal static class WaitTool
         var a = ArgParser.Parse(args);
         var timeout = a.GetDuration("timeout") ?? TimeSpan.FromSeconds(60);
         var checks = new List<(string name, Func<bool> met)>();
+        Func<string>? idleNote = null; // what --idle last measured, for the timeout message
 
         if (a.Get("exit") is { } exit) checks.Add(($"exit of {exit}", () => ProcessTools.Find(ProcessSnapshot.Take(), exit).Count == 0));
         if (a.Get("start") is { } start) checks.Add(($"start of {start}", () => ProcessTools.Find(ProcessSnapshot.Take(), start).Count > 0));
@@ -129,22 +132,37 @@ internal static class WaitTool
             }
         }
 
+        if (a.Has("below") && !a.Has("idle")) return ctx.Fail("wait: --below goes with --idle <pid|name>.");
         if (a.Get("idle") is { } idle)
         {
+            var limit = a.GetDouble("below", 2);
+            if (limit is <= 0 or > 6400) return ctx.Fail("wait: --below needs a percentage of one core, for example 25.");
             var quietSince = (DateTime?)null;
             long lastCpu = -1;
             var lastAt = Stopwatch.GetTimestamp();
-            checks.Add(($"{idle} to go idle", () =>
+            var lastBusy = -1.0; // only ever a measured figure
+            var running = true;
+            idleNote = () => !running ? $" ({idle} is not running)"
+                : lastBusy >= 0 ? $" ({idle} last used {Format.Pct(lastBusy)}% of a core; --below sets the limit)" : "";
+            checks.Add(($"{idle} to stay below {Format.Pct(limit)}% of a core for 3s", () =>
             {
                 var procs = ProcessTools.Find(ProcessSnapshot.Take(), idle);
-                if (procs.Count == 0) return false;
+                running = procs.Count > 0;
+                if (!running)
+                {
+                    (lastCpu, lastBusy, quietSince) = (-1, -1, null); // gone: nothing measured counts any more
+                    return false;
+                }
+
                 var cpu = procs.Sum(p => p.CpuTime);
                 var now = Stopwatch.GetTimestamp();
                 var elapsed = Stopwatch.GetElapsedTime(lastAt, now);
-                var busy = lastCpu >= 0 && elapsed.Ticks > 0 ? 100.0 * (cpu - lastCpu) / elapsed.Ticks : 100;
+                var measured = lastCpu >= 0 && elapsed.Ticks > 0 && cpu >= lastCpu; // the first look has nothing to compare with
+                var busy = measured ? 100.0 * (cpu - lastCpu) / elapsed.Ticks : 100;
                 lastCpu = cpu;
                 lastAt = now;
-                if (busy >= 2) quietSince = null;
+                if (measured) lastBusy = busy;
+                if (busy >= limit) quietSince = null;
                 else quietSince ??= DateTime.UtcNow;
                 return quietSince != null && DateTime.UtcNow - quietSince >= TimeSpan.FromSeconds(3);
             }));
@@ -165,7 +183,8 @@ internal static class WaitTool
 
             if (sw.Elapsed >= timeout)
             {
-                ctx.Out.WriteLine($"timed out after {Format.Duration(timeout)}; still waiting for: {string.Join(", ", pending.Select(c => c.name))}");
+                var note = idleNote != null && pending.Any(c => c.name.Contains("% of a core", StringComparison.Ordinal)) ? idleNote() : "";
+                ctx.Out.WriteLine($"timed out after {Format.Duration(timeout)}; still waiting for: {string.Join(", ", pending.Select(c => c.name))}{note}");
                 return 124;
             }
 

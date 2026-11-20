@@ -22,6 +22,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# A separate agentprobe instance (own background process, state folder and port) for everything below, so the suite
+# never stops or talks to an agentprobe someone is working with on this PC.
+$env:AGENTPROBE_INSTANCE = 'verify'
+$env:AGENTPROBE_PORT = '48652'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false   # agentprobe writes UTF-8; decode it as such on any code page
 $Exe = (Resolve-Path $Exe).Path
 $work = Join-Path $env:TEMP ("agentprobe-verify-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -208,6 +212,66 @@ try {
     $r = AP share --trust 3F9A
     Check 'share --trust refuses a shortened key' ($r.Code -eq 2) "$($r.Code) $($r.Out)"
 
+    # An app that never goes fully idle: the limit can be raised, and a timeout says what was measured.
+    $r = AP -t local wait --idle $helper.Id --below 50 --timeout 15s
+    Check 'wait --idle --below: an idle process is below the given limit' ($r.Code -eq 0 -and $r.Out -match 'below 50% of a core') "$($r.Code) $($r.Out)"
+    $spin = Start-Process powershell -ArgumentList '-NoProfile', '-Command', 'while ($true) { }' -WindowStyle Hidden -PassThru
+    $r = AP -t local wait --idle $spin.Id --below 20 --timeout 5s
+    Stop-Process -Id $spin.Id -Force
+    Check 'wait --idle --below: a busy process times out, and the message says what it used' ($r.Code -eq 124 -and $r.Out -match 'last used (\d+)(\.\d+)?% of a core' -and [double]$Matches[1] -gt 50) "$($r.Code) $($r.Out)"
+    Check 'wait --below without --idle is an error' ((AP -t local wait --below 5 --timeout 1s).Code -notin 0, 124) ''
+
+    # A question from Windows itself (here: a credential prompt) must show up in `windows`, `triage` and after `exec`.
+    # It appears on the screen for a few seconds, so it is left out on a PC someone is using.
+    if (-not $SkipInput) {
+        $promptScript = Join-Path $work 'prompt.ps1'
+        @'
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public static class CredPrompt {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct INFO { public int cbSize; public IntPtr hwndParent; public string message; public string caption; public IntPtr banner; }
+  [DllImport("credui.dll", CharSet=CharSet.Unicode)] static extern int CredUIPromptForWindowsCredentials(ref INFO info, int authError, ref uint package, IntPtr inAuth, uint inSize, out IntPtr outAuth, out uint outSize, ref bool save, int flags);
+  public static int Show() { var i = new INFO(); i.cbSize = Marshal.SizeOf(typeof(INFO)); i.caption = "agentprobe verify"; i.message = "A test prompt. It closes by itself.";
+    uint pkg = 0; IntPtr o; uint n; bool save = false; return CredUIPromptForWindowsCredentials(ref i, 0, ref pkg, IntPtr.Zero, 0, out o, out n, ref save, 0x1); }
+}
+"@
+[CredPrompt]::Show()
+'@ | Set-Content $promptScript -Encoding UTF8
+        $prompter = Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$promptScript`"" -WindowStyle Hidden -PassThru
+        $broker = $null; 1..20 | ForEach-Object { if (-not $broker) { Start-Sleep -Milliseconds 500; $broker = Get-Process CredentialUIBroker -ErrorAction SilentlyContinue | Select-Object -First 1 } }
+        if (-not $broker) {
+            Write-Host '  skipped: this session cannot show a Windows credential prompt, so there is no system prompt to detect.' -ForegroundColor Yellow
+        } else {
+            Start-Sleep 1
+            $w = (AP -t local windows).Out; $tr = (AP -t local triage).Out; $ex = (AP -t local exec 'Write-Output ran').Out
+            Check 'windows marks a prompt from Windows itself as SYSTEM PROMPT' ($w -match "(?m)\s$($broker.Id)\s+CredentialUIBroker\.exe\s.*SYSTEM PROMPT") $w
+            Check 'triage and exec report the waiting system prompt' ($tr -match "(?m)^prompt\s.*CredentialUIBroker\.exe pid $($broker.Id)" -and $ex -match 'ran' -and $ex -match 'a system prompt is waiting') "$tr`n$ex"
+        }
+        Stop-Process -Id $prompter.Id -Force -ErrorAction SilentlyContinue; Start-Sleep 1
+        Get-Process CredentialUIBroker -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep 1
+        Check 'windows: no SYSTEM PROMPT once it is gone' ((AP -t local windows).Out -notmatch 'SYSTEM PROMPT') ''
+    }
+
+    # A VPN tunnel carries no broadcast, so a developer PC across one is only found by probing each address.
+    # Every subnet of up to /22 that Windows reports on a connected adapter must be searched that way, with the right count.
+    $r = AP share --dry-run --lang en
+    $connected = @(Get-NetIPInterface -AddressFamily IPv4 -ConnectionState Connected | ForEach-Object { $_.ifIndex })
+    $expect = @{}
+    Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $connected -contains $_.InterfaceIndex -and $_.IPAddress -notlike '127.*' -and $_.PrefixLength -ge 22 -and $_.PrefixLength -le 31 } | ForEach-Object {
+        $o = $_.IPAddress.Split('.') | ForEach-Object { [uint64]$_ }
+        $size = [uint64][Math]::Pow(2, 32 - $_.PrefixLength)
+        $net = [uint64]([Math]::Floor((($o[0] * 16777216) + ($o[1] * 65536) + ($o[2] * 256) + $o[3]) / $size) * $size)
+        $cidr = "$([Math]::Floor($net / 16777216)).$([Math]::Floor($net / 65536) % 256).$([Math]::Floor($net / 256) % 256).$($net % 256)/$($_.PrefixLength)"
+        $expect[$cidr] = if ($_.PrefixLength -eq 31) { 2 } else { $size - 2 }
+    }
+    $got = @{}
+    $r.Out -split "`n" | ForEach-Object { if ($_ -match '^\s+each address\s+(\S+)\s+(\d+) addresses') { $got[$Matches[1]] = [int]$Matches[2] } }
+    $wrong = @($got.Keys | Where-Object { $expect[$_] -ne $got[$_] })
+    $total = ($expect.Values | Measure-Object -Sum).Sum
+    $missing = if ($total -le 4096) { @($expect.Keys | Where-Object { -not $got.ContainsKey($_) }) } else { @() }   # above the cap some are left out, by design
+    Check 'share --dry-run: each small subnet Windows reports is searched address by address' ($r.Code -eq 0 -and $wrong.Count -eq 0 -and $missing.Count -eq 0 -and ($got.Values | Measure-Object -Sum).Sum -le 4096) "wrong: $($wrong -join ' ')  missing: $($missing -join ' ')`n$($r.Out)"
+    Check 'share --dry-run: a name that does not resolve is reported, not dropped' ((AP share --dry-run --lang en name.invalid 192.0.2.7).Out -match '(?m)^\s+NOT SEARCHED\s+name\.invalid' -and (AP share --dry-run --lang en name.invalid 192.0.2.7).Out -match '(?m)^\s+address\s+192\.0\.2\.7:\d+') ''
+
     $fake = Join-Path $work 'dotnetapp'; New-Item -ItemType Directory $fake | Out-Null
     Copy-Item "$env:WINDIR\System32\where.exe" (Join-Path $fake 'App.exe')
     '{"runtimeOptions":{"framework":{"name":"Microsoft.NETCore.App","version":"99.0.0"}}}' | Set-Content (Join-Path $fake 'App.runtimeconfig.json')
@@ -324,10 +388,25 @@ Add-Type -AssemblyName System.Windows.Forms
         if ($existing -notmatch 'No target PC is connected') {
             Write-Host '  skipped: targets are already connected to this PC; not touching a live session.' -ForegroundColor Yellow
         } else {
-            $share = Start-Process $Exe -ArgumentList 'share', '--yes', '--name', 'verify' -WindowStyle Minimized -PassThru
+            # What the command line says itself is Korean for a person on a Korean Windows, and English for an agent
+            # (piped output) whatever the language of the PC.
+            $env:AGENTPROBE_LANG = 'ko'
+            $piped = (AP list).Out
+            $env:AGENTPROBE_PERSON = '1'
+            $person = (AP list).Out
+            Remove-Item Env:AGENTPROBE_PERSON, Env:AGENTPROBE_LANG
+            Check 'list: English for an agent on a Korean PC, Korean for a person' ($piped -match '^No target PC is connected' -and $person -match '^연결된 대상 PC가 없습니다' -and $person -match [regex]::Escape($env:COMPUTERNAME)) "piped: $(($piped -split "`n")[0])  person: $(($person -split "`n")[0])"
+
+            # --trust with this PC's own key, not --yes: another developer PC may be in reach (same LAN, a VPN),
+            # and the local target must connect to this one.
+            $myKey = [regex]::Match($existing, 'key ([0-9A-F]{4}(-[0-9A-F]{4}){3})').Groups[1].Value
+            $share = Start-Process $Exe -ArgumentList 'share', '--trust', $myKey, '--name', 'verify' -WindowStyle Minimized -PassThru
             $up = $false; 1..30 | ForEach-Object { if (-not $up) { Start-Sleep -Milliseconds 700; if ((AP list).Out -match '(?m)^verify\s') { $up = $true } } }
             Check 'a local target connects by discovery' $up (AP list).Out
             if ($up) {
+                $dry = AP share --dry-run --lang en
+                Check 'share --dry-run: the developer PC that answers is listed with its key, and nothing is shared' ($dry.Code -eq 0 -and $dry.Out -match "(?m)^\s+$([regex]::Escape($env:COMPUTERNAME))\s+\(user .+\)\s+key $myKey\s+at [\d., ]+$" -and @((AP list).Out -split "`n" | Where-Object { $_ -match '\sidle\s|\sbusy' }).Count -eq 1) $dry.Out
+
                 # The start screen as text (piped): the link, the MCP command with this exe's path, the connected PC.
                 $homeText = (AP home).Out
                 Check 'home: prints the dashboard link, the MCP command for this exe and the connected PC' ($homeText -match 'http://127\.0\.0\.1:\d+/\?k=[0-9A-F]{16,}' -and $homeText.Contains("claude mcp add agentprobe -- `"$Exe`" mcp") -and $homeText -match '(?m):\s.*\bverify\b.*$') $homeText
@@ -370,8 +449,36 @@ Add-Type -AssemblyName System.Windows.Forms
                 $back = Join-Path $work 'back.bin'; [void](AP -t verify pull 'roundtrip.bin' $back)
                 Check 'push + pull returns identical bytes' ((Test-Path $back) -and (Get-FileHash $back).Hash -eq (Get-FileHash $bin).Hash) ''
                 $tree = Join-Path $work 'tree'; New-Item -ItemType Directory "$tree\sub\deep" -Force | Out-Null; 'a' | Set-Content "$tree\a.txt"; '한글' | Set-Content "$tree\sub\deep\k.txt" -Encoding UTF8
-                [void](AP -t verify push $tree 'treecopy'); $treeBack = Join-Path $work 'treeback'; [void](AP -t verify pull 'treecopy' $treeBack)
+                $p1 = AP -t verify push $tree 'treecopy'; $treeBack = Join-Path $work 'treeback'; [void](AP -t verify pull 'treecopy' $treeBack)
                 Check 'folder push + pull keeps the structure' ((Test-Path "$treeBack\sub\deep\k.txt") -and (Get-Content "$treeBack\sub\deep\k.txt" -Encoding UTF8) -eq '한글') ''
+                $more = Join-Path $work 'more'; New-Item -ItemType Directory $more | Out-Null; 'b' | Set-Content "$more\b.txt"
+                $p2 = AP -t verify push $more 'treecopy'
+                Check 'folder push says how many files were sent, and separately what a merged folder now holds' ($p1.Out -match '\(2 files, ' -and $p2.Out -match '\(1 file sent, .*merged into the existing folder, which now holds 3 files\)') "$($p1.Out) / $($p2.Out)"
+
+                # A script sent with -f is run as a file: its param block works and what follows the file name reaches it.
+                $ps = Join-Path $work 'params.ps1'
+                "param([int]`$Port = 1, [string]`$Name = 'none', [switch]`$Fast)`r`n`"port=`$Port name=`$Name fast=`$Fast file=`$(`$PSScriptRoot.Length -gt 0)`"`r`nexit 9" | Set-Content $ps -Encoding UTF8
+                $r = AP -t verify exec -f $ps -Port 8080 -Name "two words, it's" -Fast
+                Check 'exec -f: the script keeps its param block and receives its arguments' ($r.Out -match "port=8080 name=two words, it's fast=True file=True" -and $r.Code -eq 9) "$($r.Code) $($r.Out)"
+                $r = AP -t verify exec --timeout 30s -f $ps
+                Check 'exec -f without arguments: the defaults of the param block' ($r.Out -match 'port=1 name=none fast=False' -and $r.Code -eq 9) "$($r.Code) $($r.Out)"
+                $r = AP -t verify exec -f $ps -Port:7 '-Fast:$false' -Name:x
+                Check 'exec -f: -Name:value and -Switch:$false are passed as such' ($r.Out -match 'port=7 name=x fast=False') "$($r.Code) $($r.Out)"
+                $ps2 = Join-Path $work 'laststep.ps1'; "Write-Output started`r`ncmd /c exit 5" | Set-Content $ps2 -Encoding UTF8
+                $r = AP -t verify exec -f $ps2
+                Check 'exec -f: a script whose last step fails returns that exit code, not 0' ($r.Code -eq 5 -and $r.Out -match 'started') "$($r.Code) $($r.Out)"
+
+                # A GUI app is tracked as a job only when it is started itself, not through a shell.
+                $gui = "$env:WINDIR\System32\winver.exe"   # a plain GUI program that every Windows has, server editions included
+                $r = AP -t verify start --name gui --exe $gui
+                $guiPid = if ($r.Out -match 'job \d+ started \(pid (\d+)\)') { [int]$Matches[1] } else { 0 }
+                $guiProc = if ($guiPid) { Get-Process -Id $guiPid -ErrorAction SilentlyContinue }
+                Check 'start --exe: the job is the app itself (its pid, still running)' ($guiProc -and $guiProc.ProcessName -eq 'winver' -and (AP -t verify jobs).Out -match "(?m)^\s*\d+\s+gui\s+$guiPid\s+running") "$($r.Out)`n$((AP -t verify jobs).Out)"
+                [void](AP -t verify kill gui); Start-Sleep 1
+                Check 'kill <job> closes an app started with --exe, and jobs shows its exit' (-not (Get-Process -Id $guiPid -ErrorAction SilentlyContinue) -and (AP -t verify jobs).Out -match "(?m)^\s*\d+\s+gui\s+$guiPid\s+exit ") (AP -t verify jobs).Out
+                $r = AP -t verify start --name viashell "& '$gui'"
+                Check 'start <command> that only launches a GUI app says the job is not the app' ($r.Out -match 'already ended' -and $r.Out -match 'start --exe') $r.Out
+                [void](AP -t verify kill --name winver.exe)
 
                 $grow = Join-Path $work 'grow.log'; 'first' | Set-Content $grow
                 [void](AP -t verify read $grow --new)
@@ -406,11 +513,102 @@ Add-Type -AssemblyName System.Windows.Forms
                 Check 'history lists what was run, with exit codes' ($h -match 'exit 7\s+exec Write-Output' -and $h -match 'exit 124') $h
                 $shotR = Join-Path $work 'remote.png'; [void](AP -t verify screenshot --scale 0.25 -o $shotR)
                 Check 'screenshot arrives over the session' ((Test-Path $shotR) -and (Get-Item $shotR).Length -gt 1000) ''
+                # Closing the start screen's window asks for this: it must never cut off a connected PC,
+                # and with nothing connected it must leave no process behind (the exe stays locked otherwise).
+                $k = AP stop --if-idle
+                Check 'stop --if-idle keeps the background process while a PC is connected' ($k.Out -match 'kept running: 1 target PC is connected' -and (AP list).Out -match '(?m)^verify\s') $k.Out
                 $e = AP -t verify end
                 Check 'end closes the session and removes the workspace' ($e.Code -eq 0 -and $share.WaitForExit(8000)) $e.Out
+                Start-Sleep 1
+                $k = AP stop --if-idle
+                Start-Sleep 2
+                # Asked of this instance's own port: an agentprobe someone uses on this PC may run from the same exe.
+                $left = @(Get-NetTCPConnection -LocalPort ([int]$env:AGENTPROBE_PORT) -State Listen -ErrorAction SilentlyContinue)
+                Check 'stop --if-idle ends the background process once nothing is connected' ($k.Out -match 'daemon stopped' -and $left.Count -eq 0) "$($k.Out)  still listening: $($left.Count)"
             }
             if (-not $share.HasExited) { Stop-Process -Id $share.Id -Force }
             [void](AP stop)
+        }
+
+        # ------------------------------------------------------------------ updates
+        # A local "release feed" offers a newer exe. A developer-PC copy and a target-PC copy of the exe run as a
+        # third instance; neither the exe under test nor a real release is touched.
+        Write-Host "`nupdates (a local release feed, copies of the exe)"
+        $mainExe = $Exe; $mainInstance = $env:AGENTPROBE_INSTANCE; $mainPort = $env:AGENTPROBE_PORT
+        $feedPort = 48673; $u = Join-Path $work 'upd'
+        New-Item -ItemType Directory "$u\dev", "$u\target", "$u\feed" | Out-Null
+        Copy-Item $mainExe "$u\dev\agentprobe.exe"; Copy-Item $mainExe "$u\target\agentprobe.exe"
+        # "The release": the same program with a few bytes appended, so it is another file that still runs.
+        $bytes = [IO.File]::ReadAllBytes($mainExe) + [byte[]](1..32)
+        [IO.File]::WriteAllBytes("$u\feed\agentprobe.exe", $bytes)
+        $released = (Get-FileHash "$u\feed\agentprobe.exe" -Algorithm SHA256).Hash
+        $before = (Get-FileHash "$u\dev\agentprobe.exe" -Algorithm SHA256).Hash
+        '{"tag_name":"v99.0.0","html_url":"https://example.invalid/notes","assets":[{"name":"agentprobe.exe","browser_download_url":"http://127.0.0.1:' + $feedPort + '/agentprobe.exe"},{"name":"agentprobe.exe.sha256","browser_download_url":"http://127.0.0.1:' + $feedPort + '/agentprobe.exe.sha256"}]}' | Set-Content "$u\feed\latest" -Encoding ascii
+        $feed = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-Command', "`$l = New-Object System.Net.HttpListener; `$l.Prefixes.Add('http://127.0.0.1:$feedPort/'); `$l.Start(); while (`$true) { `$c = `$l.GetContext(); `$f = Join-Path '$u\feed' (`$c.Request.Url.AbsolutePath.TrimStart('/')); if (Test-Path `$f -PathType Leaf) { `$b = [IO.File]::ReadAllBytes(`$f); `$c.Response.ContentLength64 = `$b.Length; `$c.Response.OutputStream.Write(`$b, 0, `$b.Length) } else { `$c.Response.StatusCode = 404 }; `$c.Response.Close() }"
+        $share2 = $null
+        try {
+            $Exe = "$u\dev\agentprobe.exe"
+            $env:AGENTPROBE_INSTANCE = 'verifyupd'; $env:AGENTPROBE_PORT = '48654'; $env:AGENTPROBE_UPDATE_URL = "http://127.0.0.1:$feedPort/latest"
+            $feedUp = $false; 1..40 | ForEach-Object { if (-not $feedUp) { try { $feedUp = (Invoke-WebRequest "http://127.0.0.1:$feedPort/latest" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch { Start-Sleep -Milliseconds 250 } } }
+            if (-not $feedUp) { throw 'the local release feed for the update checks did not start' }
+            $key2 = [regex]::Match((AP list).Out, 'key ([0-9A-F]{4}(-[0-9A-F]{4}){3})').Groups[1].Value
+
+            # Before anything asks for a check: the background process must find the release by itself.
+            $noted = $false; 1..40 | ForEach-Object { if (-not $noted) { Start-Sleep -Milliseconds 500; $noted = (AP list).Out -match 'agentprobe 99\.0\.0 is available' } }
+            Check 'the background process finds a newer release by itself, and list says so' $noted (AP list).Out
+            $r = AP update --check
+            Check 'update --check names the newer release and changes nothing' ($r.Code -eq 0 -and $r.Out -match 'agentprobe 99\.0\.0 is available' -and (Get-FileHash $Exe -Algorithm SHA256).Hash -eq $before) $r.Out
+            Check 'update refuses an option it does not know' ((AP update --chek).Code -eq 2 -and (Get-FileHash $Exe -Algorithm SHA256).Hash -eq $before) ''
+
+            # A download that does not match the published checksum must be refused, with the exe left as it was.
+            ('0' * 64) + '  agentprobe.exe' | Set-Content "$u\feed\agentprobe.exe.sha256" -Encoding ascii
+            $r = AP update
+            Check 'update refuses a download that does not match the release checksum' ($r.Code -eq 1 -and $r.Out -match 'does not match' -and (Get-FileHash $Exe -Algorithm SHA256).Hash -eq $before -and @(Get-ChildItem "$u\dev").Count -eq 1) "$($r.Code) $($r.Out)"
+            "$($released.ToLower())  agentprobe.exe" | Set-Content "$u\feed\agentprobe.exe.sha256" -Encoding ascii
+
+            $share2 = Start-Process "$u\target\agentprobe.exe" -ArgumentList 'share', '--trust', $key2, '--name', 'updtgt' -WindowStyle Minimized -PassThru
+            $up = $false; 1..30 | ForEach-Object { if (-not $up) { Start-Sleep -Milliseconds 700; if ((AP list).Out -match '(?m)^updtgt\s') { $up = $true } } }
+            if (-not $up) { Check 'update test: the target copy connects' $false (AP list).Out }
+            else {
+                [void](AP -t updtgt exec "'kept' | Set-Content kept.txt")
+                $psi = New-Object System.Diagnostics.ProcessStartInfo $Exe, '-t updtgt exec --timeout 90s "Start-Sleep 25; Write-Output slept"'
+                $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+                $waiting = [System.Diagnostics.Process]::Start($psi); $waitErr = $waiting.StandardError.ReadToEndAsync(); $waitOut = $waiting.StandardOutput.ReadToEndAsync()
+                Start-Sleep 3
+                $r = AP update
+                Check 'update while a command runs: explained and held back (exit 4), nothing changed' ($r.Code -eq 4 -and $r.Out -match 'Commands are running right now: updtgt' -and $r.Out -match 'update --force' -and (Get-FileHash $Exe -Algorithm SHA256).Hash -eq $before) "$($r.Code) $($r.Out)"
+
+                $daemonBefore = @(Get-CimInstance Win32_Process -Filter "Name='agentprobe.exe'" | Where-Object { $_.ExecutablePath -eq $Exe -and $_.CommandLine -match '\sdaemon' })[0].ProcessId
+                $r = AP update --force
+                Check 'update --force installs the release: the exe is now the released file' ($r.Code -eq 0 -and (Get-FileHash $Exe -Algorithm SHA256).Hash -eq $released) "$($r.Code) $($r.Out)"
+                [void]$waiting.WaitForExit(30000)
+                Check 'a command that was waiting is told the run number to fetch its result with' ($waitErr.Result -match 'connection to updtgt lost\. The command keeps running there as run #(\d+)') $waitErr.Result
+                $back = $false; 1..40 | ForEach-Object { if (-not $back) { Start-Sleep -Milliseconds 700; $back = (AP list).Out -match '(?m)^updtgt\s' } }
+                $daemonAfter = @(Get-CimInstance Win32_Process -Filter "Name='agentprobe.exe'" | Where-Object { $_.ExecutablePath -eq $Exe -and $_.CommandLine -match '\sdaemon' })[0].ProcessId
+                Check 'the background process restarted from the new exe and the PC reconnected by itself' ($back -and $daemonAfter -and $daemonAfter -ne $daemonBefore) "before $daemonBefore after $daemonAfter`n$((AP list).Out)"
+                $r = AP -t updtgt update --check
+                Check 'target update --check only compares versions' ($r.Code -eq 0 -and $r.Out -match 'updtgt: agentprobe \S+, the same as this PC' -and (Get-FileHash "$u\target\agentprobe.exe" -Algorithm SHA256).Hash -eq $before) $r.Out
+                $h = ''; 1..60 | ForEach-Object { if ($h -notmatch 'orphaned exit 0') { Start-Sleep 1; $h = (AP -t updtgt history --last 5).Out } }
+                Check 'the command kept running on the target and its result is still there' ($h -match 'orphaned exit 0' -and (AP -t updtgt result 2).Out -match 'slept') $h
+                Check 'nothing is left next to the exe after the update' (@(Get-ChildItem "$u\dev").Count -eq 1) ((Get-ChildItem "$u\dev").Name -join ', ')
+
+                # The connected PC is brought to this PC's exe; its session, approval and workspace carry over.
+                $r = AP -t updtgt update
+                Check 'target update: the same version is not sent again without --force' ($r.Code -eq 0 -and $r.Out -match 'already runs' -and (Get-FileHash "$u\target\agentprobe.exe" -Algorithm SHA256).Hash -eq $before) $r.Out
+                $r = AP -t updtgt update --force
+                Check 'target update: the PC restarts from this PC''s exe and reconnects' ($r.Code -eq 0 -and $r.Out -match 'updtgt is back on agentprobe' -and (Get-FileHash "$u\target\agentprobe.exe" -Algorithm SHA256).Hash -eq $released) "$($r.Code) $($r.Out)"
+                $r = AP -t updtgt exec 'Get-Content kept.txt; Write-Output after'
+                Check 'target update: no new approval, and the workspace is still there' ($r.Code -eq 0 -and $r.Out -match 'kept' -and $r.Out -match 'after') "$($r.Code) $($r.Out)"
+                Start-Sleep 2
+                Check 'target update: nothing is left next to the target''s exe' (@(Get-ChildItem "$u\target" -Filter 'agentprobe.exe*').Count -eq 1) ((Get-ChildItem "$u\target").Name -join ', ')
+                [void](AP -t updtgt end); Start-Sleep 2
+            }
+        }
+        finally {
+            [void](AP stop)
+            Stop-Process -Id $feed.Id -Force -ErrorAction SilentlyContinue
+            Get-CimInstance Win32_Process -Filter "Name='agentprobe.exe'" | Where-Object { $_.ExecutablePath -like "$u\*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            $Exe = $mainExe; $env:AGENTPROBE_INSTANCE = $mainInstance; $env:AGENTPROBE_PORT = $mainPort; Remove-Item Env:AGENTPROBE_UPDATE_URL -ErrorAction SilentlyContinue
         }
     }
 }

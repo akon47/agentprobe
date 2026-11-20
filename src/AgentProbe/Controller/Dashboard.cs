@@ -95,6 +95,7 @@ internal sealed class Dashboard(Daemon daemon)
                 return;
             }
 
+            daemon.DashboardSeen();
             var id = query.GetValueOrDefault("id") ?? "";
             switch (uri.AbsolutePath)
             {
@@ -109,8 +110,46 @@ internal sealed class Dashboard(Daemon daemon)
                         ["exe"] = AppInfo.ExePath,
                         ["onPath"] = UserPath.Contains(Path.GetDirectoryName(AppInfo.ExePath)!) ? "1" : "0",
                         ["version"] = AppInfo.Version,
+                        ["latest"] = daemon.NewerVersion, // "" unless a newer release is out
+                        ["page"] = daemon.ReleasePage,
                     };
+                    var (online, busy) = daemon.Load();
+                    info["online"] = online.ToString();
+                    info["busy"] = busy.ToString();
+                    if (busy > 0) info["busyNotice"] = daemon.BusyNotice(query.GetValueOrDefault("lang") == "ko");
                     await RespondAsync(stream, 200, "application/json", JsonSerializer.SerializeToUtf8Bytes(info, JsonCtx.Default.DictionaryStringString));
+                    break;
+                }
+
+                // Update this PC's agentprobe (the page reloads itself once the new version answers), or bring one
+                // connected PC to this PC's version. 409 = commands are running and nobody said "anyway" yet.
+                case "/api/update" or "/api/update-target" when method == "POST":
+                {
+                    var ko = query.GetValueOrDefault("lang") == "ko";
+                    var force = query.ContainsKey("force");
+                    var said = new StringBuilder();
+                    Task Collect(string s)
+                    {
+                        lock (said) said.Append(s.EndsWith('\n') ? s : s + "\n");
+                        return Task.CompletedTask;
+                    }
+
+                    int code;
+                    if (uri.AbsolutePath == "/api/update") code = await daemon.UpdateSelfAsync(false, force, ko, Collect, Collect, ct);
+                    else if (daemon.Records.FirstOrDefault(r => r.Key == id) is { Connection: { Alive: true } connection })
+                    {
+                        (code, var text) = await daemon.UpdateTargetAsync(connection, force, ko, ct);
+                        await Collect(text);
+                    }
+                    else
+                    {
+                        code = 1;
+                        await Collect(ko ? "그 PC는 연결되어 있지 않습니다." : "That PC is not connected.");
+                    }
+
+                    // 202: this PC was updated and its background process is restarting (the page waits for the new one).
+                    var status = code == Daemon.HeldBack ? 409 : code != 0 ? 500 : uri.AbsolutePath == "/api/update" && daemon.Leaving ? 202 : 200;
+                    await RespondAsync(stream, status, "text/plain; charset=utf-8", Encoding.UTF8.GetBytes(said.ToString().Trim()));
                     break;
                 }
 
@@ -227,7 +266,7 @@ internal sealed class Dashboard(Daemon daemon)
 
     private static async Task RespondAsync(NetworkStream stream, int status, string contentType, byte[] body)
     {
-        var head = $"HTTP/1.1 {status} {(status == 200 ? "OK" : "Error")}\r\nContent-Type: {contentType}\r\nContent-Length: {body.Length}\r\n" +
+        var head = $"HTTP/1.1 {status} {(status is 200 or 202 ? "OK" : "Error")}\r\nContent-Type: {contentType}\r\nContent-Length: {body.Length}\r\n" +
                    "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n";
         await stream.WriteAsync(Encoding.ASCII.GetBytes(head));
         await stream.WriteAsync(body);
