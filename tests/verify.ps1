@@ -30,6 +30,7 @@ $env:AGENTPROBE_PORT = '48652'
 $Exe = (Resolve-Path $Exe).Path
 $work = Join-Path $env:TEMP ("agentprobe-verify-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $work | Out-Null
+Push-Location $work   # agentprobe -t local writes into the current folder (dump --keep-remote): never the caller's
 # The long form of the folder's path: %TEMP% can be a short (8.3) name, which Windows Firewall does not accept for a
 # program and which would not match the long path agentprobe reports.
 Add-Type -Namespace ApVerify -Name Paths -MemberDefinition '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetLongPathName(string path, System.Text.StringBuilder longPath, uint size);'
@@ -56,6 +57,7 @@ function AP {
     $psi.Arguments = ($args | ForEach-Object { Quote "$_" }) -join ' '
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    $psi.WorkingDirectory = (Get-Location).Path   # .NET starts processes in the process's folder, which Push-Location does not change
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
     $p = [System.Diagnostics.Process]::Start($psi)
     $err = $p.StandardError.ReadToEndAsync()
@@ -261,6 +263,11 @@ try {
     $r = AP -t local dump $helper.Id --keep-remote
     $kept = if ($r.Out -match 'kept on the target: (.+\.dmp)') { $Matches[1].Trim() } else { $null }
     Check 'dump --keep-remote leaves the dump on the target and prints where' ($r.Code -eq 0 -and $kept -and (Test-Path $kept) -and (Get-Item $kept).Length -gt 10000) $r.Out
+    Push-Location "$env:WINDIR\System32"
+    $r = AP -t local dump $helper.Id --keep-remote
+    Pop-Location
+    if ($r.Code -eq 0) { Write-Host '  skipped: this account may write into System32, so there is no refused folder to test with.' -ForegroundColor Yellow; if ($r.Out -match 'kept on the target: (.+\.dmp)') { Remove-Item $Matches[1].Trim() -Force -ErrorAction SilentlyContinue } }
+    else { Check 'dump into a folder that cannot be written to: a plain reason, nothing dumped' ($r.Out -match '^dump: could not write .+Nothing was dumped' -and $r.Out -notmatch 'Exception') "$($r.Code) $($r.Out)" }
     if ($kept) { Remove-Item $kept -Force -ErrorAction SilentlyContinue }
     $r = AP -t local windows --class
     Check 'windows --class adds the class of each window' ($r.Out -match '(?m)^HWND\s+PID\s+PROCESS\s+POSITION\s+STATE\s+CLASS\s+TITLE') ($r.Out -split "`n" | Select-Object -First 1)
@@ -369,19 +376,53 @@ public static class CredPrompt {
     Write-Host "`ndesktop and UI automation (a small test window appears)"
     $clickFile = Join-Path $work 'clicked.txt'
     $formScript = @"
-Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Windows.Forms, PresentationFramework, PresentationCore, WindowsBase
+Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { public class EditorForm : System.Windows.Forms.Form { } public class Cache<T> { public class Node { } } public static class Holder { public static object[] Nodes = new object[] { new Cache<int>.Node(), new Cache<int>.Node(), new Cache<int>.Node(), new Cache<int>.Node(), new Cache<int>.Node() }; } }'
+`$nodes = [ApVerify.Views.Holder]::Nodes.Length
 [Windows.Forms.Application]::EnableVisualStyles()
+`$neverShown = 1..3 | ForEach-Object { New-Object ApVerify.Views.EditorForm }
+`$wpfNeverShown = 1..2 | ForEach-Object { New-Object System.Windows.Window }
+`$wpfShown = New-Object System.Windows.Window; `$wpfShown.Title = 'ApWpf'; `$wpfShown.Width = 160; `$wpfShown.Height = 80; `$wpfShown.Left = 700; `$wpfShown.Top = 520; `$wpfShown.ShowInTaskbar = `$false; `$wpfShown.ShowActivated = `$false; `$wpfShown.Show()
+`$formClosed = New-Object ApVerify.Views.EditorForm; `$formClosed.ShowInTaskbar = `$false; `$formClosed.StartPosition = 'Manual'; `$formClosed.Left = 700; `$formClosed.Top = 620; `$formClosed.Width = 120; `$formClosed.Height = 60; `$formClosed.Show(); `$formClosed.Close()
+`$wpfClosed = New-Object System.Windows.Window; `$wpfClosed.Width = 120; `$wpfClosed.Height = 60; `$wpfClosed.Left = 700; `$wpfClosed.Top = 620; `$wpfClosed.ShowInTaskbar = `$false; `$wpfClosed.ShowActivated = `$false; `$wpfClosed.Show(); `$wpfClosed.Close()
 `$f = New-Object Windows.Forms.Form; `$f.Text = 'AP Verify Window'; `$f.Width = 440; `$f.Height = 190; `$f.StartPosition = 'Manual'; `$f.Left = 160; `$f.Top = 160; `$f.TopMost = `$true
 `$t = New-Object Windows.Forms.TextBox; `$t.Name = 'inputBox'; `$t.Left = 20; `$t.Top = 20; `$t.Width = 300
 `$b = New-Object Windows.Forms.Button; `$b.Name = 'pressButton'; `$b.Text = 'Press me'; `$b.Left = 20; `$b.Top = 60; `$b.Width = 120
 `$b.Add_Click({ [IO.File]::WriteAllText('$clickFile', 'clicked:' + `$t.Text) })
-`$f.Controls.Add(`$t); `$f.Controls.Add(`$b); [Windows.Forms.Application]::Run(`$f)
+`$d = New-Object Windows.Forms.Form; `$d.Text = 'AP Verify Dialog'; `$d.Width = 260; `$d.Height = 120; `$d.StartPosition = 'Manual'; `$d.Left = 660; `$d.Top = 160
+`$c = New-Object Windows.Forms.Button; `$c.Name = 'closeDialog'; `$c.Text = 'Close dialog'; `$c.Left = 20; `$c.Top = 20; `$c.Width = 120; `$c.DialogResult = 'OK'; `$d.Controls.Add(`$c)
+`$o = New-Object Windows.Forms.Button; `$o.Name = 'openDialog'; `$o.Text = 'Open dialog'; `$o.Left = 160; `$o.Top = 60; `$o.Width = 120
+`$o.Add_Click({ [void]`$f.BeginInvoke([Action]{ [void]`$d.ShowDialog(`$f) }) })
+`$f.Controls.Add(`$t); `$f.Controls.Add(`$b); `$f.Controls.Add(`$o); [Windows.Forms.Application]::Run(`$f)
 "@
     $form = Start-Process powershell -ArgumentList '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-EncodedCommand', ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($formScript))) -PassThru
     $w = AP -t local wait --window 'AP Verify Window' --timeout 20s
     Check 'wait --window sees the test window' ($w.Code -eq 0) $w.Out
     $win = AP -t local windows 'AP Verify'
     Check 'windows lists it with its pid' ($win.Out -match "\s$($form.Id)\s+powershell\.exe") $win.Out
+
+    # Window objects on the managed heap. That process holds, per type (count / on screen / closed):
+    #   EditorForm (derived from Form)  4 / 0 / 1   three never shown, one shown and closed again
+    #   Form                            2 / 1 / 0   the form on screen, and its dialog that is not open
+    #   WPF Window                      4 / 1 / 1   two never shown, one on screen, one shown and closed again
+    $r = AP -t local heap $form.Id --windows
+    Check 'heap --windows: window objects per type, how many are shown and how many were closed' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s*4\s+0\s+1\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match '(?m)^\s*2\s+1\s+0\s+System\.Windows\.Forms\.Form\s*$' -and $r.Out -match '(?m)^\s*4\s+1\s+1\s+System\.Windows\.Window\s*$' -and $r.Out -match '(?m)^CLOSED: ') $r.Out
+    $r = AP -t local heap $form.Id --type Form --live --top 300
+    Check 'heap --type looks at the type''s own name, not at its namespace' ($r.Out -match '(?m)^\s*4\s+\S+\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match '(?m)^\s*2\s+\S+\s+System\.Windows\.Forms\.Form\s*$' -and $r.Out -notmatch '(?m)System\.Windows\.Forms\.(Button|TextBox)\s*$') $r.Out
+    $r = AP -t local heap $form.Id --type Node --ns ApVerify --live
+    Check 'heap --type finds a type nested in a generic type by its own name' ($r.Out -match '(?m)^\s*5\s+\S+\s+ApVerify\.Views\.Cache<System\.Int32>\+Node\s*$' -and @($r.Out -split "`n").Count -eq 3) $r.Out
+    $r = AP -t local heap $form.Id --type DisplayClass --live --top 1
+    Check 'heap --type finds compiler-made types (their names begin with <)' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s*[\d,]+\s+\S+\s+\S*<>c__DisplayClass') $r.Out
+    $r = AP -t local heap $form.Id --type Forms.Button --live
+    Check 'heap --type with a dot looks in the full name' ($r.Out -match '(?m)^\s*3\s+\S+\s+System\.Windows\.Forms\.Button\s*$') $r.Out
+    $r = AP -t local heap $form.Id --ns ApVerify.Views --live
+    Check 'heap --ns keeps the types of one namespace' ($r.Out -match '(?m)^\s*4\s+\S+\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match 'Cache<System\.Int32>\+Node' -and $r.Out -notmatch '(?m)\sSystem\.') $r.Out
+    $r = AP -t local heap $form.Id --type 'ApVerify.*Form' --live
+    Check 'heap --type with * is a pattern for the whole name' ($r.Out -match '(?m)^\s*4\s+\S+\s+ApVerify\.Views\.EditorForm\s*$' -and @($r.Out -split "`n").Count -eq 3) $r.Out
+    $r = AP -t local heap $form.Id --type ApVerify --live
+    Check 'heap --type that is only in a namespace: says so and names --ns' ($r.Out -match 'no reachable object of a type matching --type ApVerify' -and $r.Out -match "'ApVerify' is in \d+ type names, but not in the type's own name" -and $r.Out -match '--ns ApVerify') $r.Out
+    $hinted = (AP -t local heap $form.Id --type '*ApVerify*' --live).Out
+    Check 'heap: the pattern that hint suggests does list those types' ($hinted -match 'ApVerify\.Views\.EditorForm' -and $hinted -match 'Cache<System\.Int32>\+Node') $hinted
 
     $tree = AP -t local ui 'AP Verify Window'
     Check 'ui: tree shows the button by name' ($tree.Out -match 'Button "Press me" #pressButton') $tree.Out
@@ -412,6 +453,25 @@ Add-Type -AssemblyName System.Windows.Forms
         Check 'key presses reached the app (button pressed with the keyboard)' ((Test-Path $clickFile) -and ((Get-Content $clickFile -Raw -Encoding UTF8) -eq 'clicked:typed 한글 a\nb')) "file: $(if (Test-Path $clickFile) { Get-Content $clickFile -Raw -Encoding UTF8 })"
     } else { Check 'ui: edit field position' $false $edit }
     }
+
+    # A modal dialog disables the window it belongs to: `windows` says so, and a click on that window names it.
+    Remove-Item $clickFile -ErrorAction SilentlyContinue
+    [void](AP -t local ui click 'Open dialog' --window 'AP Verify Window')
+    $dw = AP -t local wait --window 'AP Verify Dialog' --timeout 15s
+    $win = (AP -t local windows 'AP Verify').Out
+    Check 'windows: the owner of an open modal dialog is marked disabled, the dialog is not' ($dw.Code -eq 0 -and $win -match '(?m)\sdisabled\s+AP Verify Window\s*$' -and $win -notmatch '(?m)disabled\s+AP Verify Dialog' -and $win -match '(?m)^disabled = ') $win
+    if (-not $SkipInput) {
+        $press = (AP -t local ui 'AP Verify Window' --grep pressButton).Out
+        if ($press -match '@(\d+),(\d+)') {
+            $r = AP -t local click "@$($Matches[1]),$($Matches[2])"
+            Start-Sleep -Milliseconds 400
+            Check 'click on a disabled window: says that it is disabled, and the app did not get the click' ($r.Out -match 'note: that point is on "AP Verify Window" \(powershell\.exe pid \d+\), which is disabled' -and -not (Test-Path $clickFile)) "$($r.Out) / clicked: $(Test-Path $clickFile)"
+        } else { Check 'ui: button position while the dialog is open' $false $press }
+    }
+    [void](AP -t local ui click 'Close dialog' --window 'AP Verify Dialog')
+    Start-Sleep -Milliseconds 700
+    $win = (AP -t local windows 'AP Verify').Out
+    Check 'windows: no longer disabled once the dialog is closed' ($win -match 'AP Verify Window' -and $win -notmatch 'disabled' -and $win -notmatch 'AP Verify Dialog') $win
 
     $shot = Join-Path $work 'shot.png'
     $sr = AP -t local screenshot --window 'AP Verify Window' -o $shot
@@ -460,8 +520,13 @@ Add-Type -AssemblyName System.Windows.Forms
                 # The leak verdict needs two minutes of evidence: start watching now and judge at the end of this section.
                 $leak2 = Start-Process powershell -ArgumentList '-NoProfile', '-Command', $leakScript -WindowStyle Hidden -PassThru
                 Start-Sleep 2
-                [void](AP -t verify watch start $leak2.Id $helper.Id --interval 1s)
+                # A watched process that starts a child later, and an unrelated process that ends with a crash code.
+                $watchParent = Start-Process powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 8; cmd /c ''ping -n 3 127.0.0.1 >nul & exit 3''; Start-Sleep 900' -WindowStyle Hidden -PassThru
+                Start-Sleep 1
+                [void](AP -t verify watch start $leak2.Id $helper.Id $watchParent.Id --interval 1s)
                 $watchStarted = Get-Date
+                Start-Sleep 2
+                Start-Process cmd -ArgumentList '/c', 'ping -n 3 127.0.0.1 >nul & exit -1073741819' -WindowStyle Hidden
 
                 $r = AP -t verify exec '[Console]::Out.Write("first`r`r`nsecond`r`nthird`n")'
                 Check 'exec: lines ending in CR CR LF are kept' (($r.Out -split "`n") -join '|' -eq 'first|second|third') ($r.Out -replace "`n", '|')
@@ -537,6 +602,11 @@ Add-Type -AssemblyName System.Windows.Forms
                 Check 'kill stops the job' ((AP -t verify kill napper).Code -eq 0 -and (AP -t verify wait --job napper --timeout 10s).Code -eq 0) ''
 
                 $rep = (AP -t verify watch).Out
+                Check 'watch: lists what a watched process started, and how that ended' ($rep -match "start cmd\.exe\(\d+\) by powershell\.exe\($($watchParent.Id)\)" -and $rep -match '(?m)exit\s+cmd\.exe\(\d+\) code 3\b') $rep
+                Check 'watch: lists an unrelated process that ended with a crash code' ($rep -match '(?m)exit\s+cmd\.exe\(\d+\) code 0xC0000005') $rep
+                Check 'watch: counts the starts and exits of unrelated processes instead of listing them' ($rep -match '\d+ start/exit events of unrelated processes left out: `watch --all-events` lists them' -and $rep -notmatch 'start agentprobe\.exe') $rep
+                $all = (AP -t verify watch --all-events).Out
+                Check 'watch --all-events: lists those too, from the same point in time' ($all -match '(?m)^all events since ' -and $all -match 'start agentprobe\.exe' -and $all -match "by powershell\.exe\($($watchParent.Id)\)" -and $all -notmatch 'left out') $all
                 $leakLine = ($rep -split "`n" | Where-Object { $_ -match "powershell\.exe\($($leak2.Id)\)" } | Select-Object -First 1)
                 if (((Get-Date) - $watchStarted).TotalSeconds -lt 110) {
                     Check 'watch: growth seen early is NOT called a leak yet' ("$leakLine" -match 'private .*\(\+\d.*?/min, growing; too early' -and $rep -notmatch 'LIKELY LEAK') $rep
@@ -684,7 +754,8 @@ Add-Type -AssemblyName System.Windows.Forms
     }
 }
 finally {
-    foreach ($p in @($helper, $leak, $form, $leak2)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
+    foreach ($p in @($helper, $leak, $form, $leak2, $watchParent)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
+    Pop-Location
     Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 

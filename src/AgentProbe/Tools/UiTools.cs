@@ -5,7 +5,8 @@ using AgentProbe.Util;
 
 namespace AgentProbe.Tools;
 
-internal sealed record WindowInfo(nint Hwnd, int Pid, string Title, string Class, bool Visible, bool Hung, bool Minimized, RECT Rect);
+/// <param name="Disabled">The window takes no mouse or keyboard input (Windows disables the owner of an open modal dialog).</param>
+internal sealed record WindowInfo(nint Hwnd, int Pid, string Title, string Class, bool Visible, bool Hung, bool Minimized, RECT Rect, bool Disabled = false);
 
 /// <summary>Seeing and driving the desktop: windows, screenshots, mouse and keyboard.</summary>
 internal static partial class UiTools
@@ -72,7 +73,7 @@ internal static partial class UiTools
             len = Win32.GetClassName(hwnd, buf, 256);
             var cls = new string(buf, 0, Math.Max(0, len));
             Win32.GetWindowRect(hwnd, out var rect);
-            result.Add(new WindowInfo(hwnd, pid, title, cls, Win32.IsWindowVisible(hwnd), Win32.IsHungAppWindow(hwnd), Win32.IsIconic(hwnd), rect));
+            result.Add(new WindowInfo(hwnd, pid, title, cls, Win32.IsWindowVisible(hwnd), Win32.IsHungAppWindow(hwnd), Win32.IsIconic(hwnd), rect, !Win32.IsWindowEnabled(hwnd)));
         }
 
         return result;
@@ -109,6 +110,7 @@ internal static partial class UiTools
         }
 
         var windows = EnumerateWindows();
+        var anyDisabled = false;
 
         // Prompts Windows shows in windows of its own (firewall, UAC, credentials) are listed whatever the filter:
         // their top-level windows are often untitled or empty, and they are exactly what an agent must not miss.
@@ -130,12 +132,19 @@ internal static partial class UiTools
             if (a.Positionals.Count > 0 && !w.Title.Contains(a.Positionals[0], StringComparison.OrdinalIgnoreCase) && !process.Contains(a.Positionals[0], StringComparison.OrdinalIgnoreCase)) continue;
             var state = w.Hung ? "NOT RESPONDING" : !w.Visible ? "hidden" : w.Minimized ? "minimized" : popup ? "popup" : w.Hwnd == foreground ? "foreground" : "";
             if (w.Class is "ConsoleWindowClass" or "CASCADIA_HOSTING_WINDOW_CLASS" or "PseudoConsoleWindow") state = (state + " console").TrimStart();
+            if (w.Disabled && w.Visible && !popup)
+            {
+                state = (state + " disabled").TrimStart();
+                anyDisabled = true;
+            }
+
             var pos = w.Minimized ? "" : $"{w.Rect.Left},{w.Rect.Top} {w.Rect.Width}x{w.Rect.Height}";
             Row("0x" + ((long)w.Hwnd).ToString("X"), w.Pid, process, pos, state, w.Class, Format.Clip(w.Title.Length > 0 ? w.Title : $"[{w.Class}]", 90));
         }
 
         ctx.Out.Write(t.Count > 0 ? t.ToString() : "no matching windows\n");
-        if (prompts.Count > 0) ctx.Out.WriteLine("SYSTEM PROMPT = a dialog of Windows itself (see its title) is waiting for the person at this PC; whatever caused it waits until they answer.");
+        if (prompts.Count > 0) ctx.Out.WriteLine("SYSTEM PROMPT = a dialog of Windows itself (see its title) is waiting for the person at this PC; whatever caused it waits until they answer. " + SystemPrompts.Effect);
+        if (anyDisabled) ctx.Out.WriteLine("disabled = that window takes no mouse or keyboard input now, usually because a dialog that belongs to it is open: close the dialog first; `ui click` goes through UI Automation instead of the mouse where the control allows it, and may still work.");
         if (SystemPrompts.SecureDesktopShowing())
             ctx.Out.WriteLine("The secure desktop is showing (a UAC prompt, the lock screen or Ctrl+Alt+Del): the windows above cannot be seen or clicked until the person there answers.");
         return Task.FromResult(0);
@@ -364,6 +373,7 @@ internal static partial class UiTools
             "middle" => (0x0020u, 0x0040u),
             _ => (0x0002u, 0x0004u),
         };
+        var blocked = DisabledWindowAt(x, y); // looked at before the click: the click itself may change what is open
         Mouse(x, y, 0x0001); // move
         await Task.Delay(40, ctx.Ct);
         for (var i = 0; i < (a.Flag("double") ? 2 : 1); i++)
@@ -375,7 +385,57 @@ internal static partial class UiTools
 
         ctx.Runtime.Audit.Write($"click at {x},{y}");
         ctx.Out.WriteLine($"clicked at screen {x},{y}");
+        if (blocked != null) ctx.Out.WriteLine(blocked);
+        SystemPrompts.Warn(ctx.Err);
         return 0;
+    }
+
+    /// <summary>
+    /// A click on a disabled window does nothing, and nothing says so: the app just "does not react". When the
+    /// point is on such a window, name it. The disabled window is either the one Windows names for that point
+    /// (a control inside it is not disabled itself) or one that lies in front of it (Windows skips a disabled
+    /// window when the point is on its bare surface). Nothing is said when that cannot be told: when the window
+    /// that gets the click is not in the list of top-level windows (Start, shell flyouts), or when the window in
+    /// front lets clicks through at that point.
+    /// </summary>
+    internal static string? DisabledWindowAt(int x, int y)
+    {
+        var windows = EnumerateWindows(); // front to back
+        var target = Win32.GetAncestor(Win32.WindowFromPoint((uint)x | ((long)y << 32)), 2); // GA_ROOT
+        var targetAt = target == 0 ? -1 : windows.FindIndex(w => w.Hwnd == target);
+        if (targetAt < 0) return null;
+        for (var i = 0; i <= targetAt; i++)
+        {
+            var w = windows[i];
+            if (!w.Visible || !w.Disabled || w.Minimized || w.Title.Length == 0) continue;
+            if (x < w.Rect.Left || x >= w.Rect.Right || y < w.Rect.Top || y >= w.Rect.Bottom) continue;
+            if (Win32.DwmGetWindowAttribute(w.Hwnd, 14, out var cloaked, 4) == 0 && cloaked != 0) continue; // DWMWA_CLOAKED: not on screen
+            if (i < targetAt)
+            {
+                // In front of what gets the click: was it skipped because it is disabled, or because it is
+                // see-through there? Ask the window itself what is at that point.
+                if (((long)Win32.GetWindowLongPtrW(w.Hwnd, -20) & 0x20) != 0) continue; // WS_EX_TRANSPARENT
+                var point = (nint)(((y & 0xFFFF) << 16) | (x & 0xFFFF));
+                if (Win32.SendMessageTimeoutW(w.Hwnd, 0x0084, 0, point, 0x0002, 200, out var hit) == 0) continue; // WM_NCHITTEST, abort if hung
+                if (hit is 0 or -1) continue; // HTNOWHERE, HTTRANSPARENT
+            }
+
+            string process;
+            try
+            {
+                using var p = System.Diagnostics.Process.GetProcessById(w.Pid);
+                process = p.ProcessName + ".exe";
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+            {
+                process = "?";
+            }
+
+            return $"note: that point is on \"{Format.Clip(w.Title, 60)}\" ({process} pid {w.Pid}), which is disabled: it takes no mouse or keyboard input, " +
+                   "usually because a dialog that belongs to it is open (`windows` shows what is). The click did nothing there; `ui click` goes through UI Automation instead of the mouse where the control allows it, and may still work.";
+        }
+
+        return null;
     }
 
     private static async Task<int> DragAsync(ToolContext ctx, string[] args)

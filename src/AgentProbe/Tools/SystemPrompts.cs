@@ -29,6 +29,12 @@ internal static partial class SystemPrompts
         "smartscreen.exe",         // "Windows protected your PC"
     };
 
+    /// <summary>
+    /// What such a prompt can do to the program it is about. This is an observation from the field (the firewall
+    /// prompt, a WPF app), not something Windows documents, so it is worded as a possibility.
+    /// </summary>
+    public const string Effect = "Until it is answered, the program it is about may not react to mouse input or to requests to close its windows (seen with the firewall prompt); `ui click` goes through UI Automation instead of the mouse where the control allows it, and may still work.";
+
     public static List<SystemPrompt> Find() => Find(UiTools.EnumerateWindows(), ProcessSnapshot.Take().ToDictionary(p => p.Pid, p => p.Name));
 
     public static List<SystemPrompt> Find(List<WindowInfo> windows, Dictionary<int, string> names)
@@ -84,8 +90,22 @@ internal static partial class SystemPrompts
     {
         try
         {
-            foreach (var p in Find())
-                err.WriteLine($"[a system dialog is waiting on the target's screen: {p.Describe()}. The person there has to answer it; `windows` shows it.]");
+            var windows = UiTools.EnumerateWindows();
+            var names = ProcessSnapshot.Take().ToDictionary(p => p.Pid, p => p.Name);
+            var prompts = Find(windows, names);
+            foreach (var p in prompts)
+                err.WriteLine($"[a system dialog is waiting on the target's screen: {p.Describe()}. The person there has to answer it; `windows` shows it. {Effect}]");
+
+            // A fact rather than a possibility: which windows take no input at this moment.
+            if (prompts.Count > 0)
+            {
+                var promptPids = prompts.Select(p => p.Pid).ToHashSet();
+                var disabled = windows.Where(w => w.Visible && w.Disabled && !w.Minimized && w.Title.Length > 0 && w.Rect.Width > 1 && !promptPids.Contains(w.Pid))
+                    .Select(w => $"\"{Format.Clip(w.Title, 50)}\" ({names.GetValueOrDefault(w.Pid, "?")} pid {w.Pid})").ToList();
+                if (disabled.Count > 0)
+                    err.WriteLine($"[disabled right now, i.e. taking no mouse or keyboard input: {string.Join(", ", disabled.Take(4))}{(disabled.Count > 4 ? $" and {disabled.Count - 4} more (`windows` lists them)" : "")}]");
+            }
+
             if (SecureDesktopShowing())
                 err.WriteLine("[the target shows its secure desktop (a UAC prompt, the lock screen or Ctrl+Alt+Del): the normal desktop cannot be seen or clicked until the person there answers.]");
         }

@@ -361,6 +361,7 @@ internal static unsafe partial class UiaTools
                 var x = (node.Rect.Left + node.Rect.Right) / 2;
                 var y = (node.Rect.Top + node.Rect.Bottom) / 2;
                 ctx.Runtime.Audit.Write($"ui {verb} {label} at {x},{y}");
+                var blocked = UiTools.DisabledWindowAt(x, y); // these two go through the mouse, which a disabled window ignores
                 UiTools.Mouse(x, y, 0x0001);
                 Thread.Sleep(40);
                 var (down, up, times) = verb == "rclick" ? (0x0008u, 0x0010u, 1) : (0x0002u, 0x0004u, 2);
@@ -371,7 +372,7 @@ internal static unsafe partial class UiaTools
                     Thread.Sleep(60);
                 }
 
-                return (0, $"{(verb == "rclick" ? "right-clicked" : "double-clicked")} {label} at {x},{y}");
+                return (0, $"{(verb == "rclick" ? "right-clicked" : "double-clicked")} {label} at {x},{y}" + (blocked != null ? "\n" + blocked : ""));
             }
 
             default:
@@ -390,13 +391,15 @@ internal static unsafe partial class UiaTools
                 }
 
                 if (node.Offscreen || node.Rect.Width <= 0) return (1, $"ui click: {label} has no action of its own and is not visible on screen.");
+                // No action of its own: the mouse does it, and a disabled window ignores the mouse.
                 var x = (node.Rect.Left + node.Rect.Right) / 2;
                 var y = (node.Rect.Top + node.Rect.Bottom) / 2;
+                var blocked = UiTools.DisabledWindowAt(x, y);
                 UiTools.Mouse(x, y, 0x0001);
                 Thread.Sleep(40);
                 UiTools.Mouse(x, y, 0x0002);
                 UiTools.Mouse(x, y, 0x0004);
-                return (0, $"clicked {label} at {x},{y}");
+                return (0, $"clicked {label} at {x},{y} with the mouse (the control has no action of its own)" + (blocked != null ? "\n" + blocked : ""));
             }
         }
     }

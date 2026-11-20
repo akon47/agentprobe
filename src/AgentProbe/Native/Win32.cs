@@ -197,6 +197,27 @@ internal static unsafe partial class Win32
     [LibraryImport("user32.dll")]
     public static partial nint GetWindow(nint hwnd, uint cmd);
 
+    /// <summary>False for a window that takes no mouse or keyboard input, as the owner of an open modal dialog does.</summary>
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool IsWindowEnabled(nint hwnd);
+
+    /// <summary>The window that would get a click at this point (x in the low half, y in the high half). Skips disabled windows.</summary>
+    [LibraryImport("user32.dll")]
+    public static partial nint WindowFromPoint(long point);
+
+    [LibraryImport("user32.dll")]
+    public static partial nint GetAncestor(nint hwnd, uint flags);
+
+    [LibraryImport("dwmapi.dll")]
+    public static partial int DwmGetWindowAttribute(nint hwnd, uint attribute, out int value, uint size);
+
+    [LibraryImport("user32.dll")]
+    public static partial nint SendMessageTimeoutW(nint hwnd, uint message, nint wParam, nint lParam, uint flags, uint timeoutMs, out nint result);
+
+    [LibraryImport("user32.dll")]
+    public static partial nint GetWindowLongPtrW(nint hwnd, int index);
+
     [LibraryImport("user32.dll")]
     public static partial nint GetForegroundWindow();
 

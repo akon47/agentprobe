@@ -33,7 +33,7 @@ If `agentprobe` is not found, it is not on PATH yet: call the exe by its full pa
 | What is using the CPU? Which thread? | `top`, `threads <pid>` |
 | Is it frozen? Where is it stuck? | `windows` (NOT RESPONDING), `threads <pid>`, `stacks <pid>`, then `dump <pid>` |
 | Is it leaking memory / handles / GDI objects? | `watch start <name>` ... run scenario for 2+ minutes ... `watch`; `handles <pid> --interval 30s`; `vmmap <pid> --interval 30s` (which kind of memory) |
-| .NET app: how many objects of a type are alive, and what holds them? | `heap <name> --live --type <Type>` (count before and after a fix), `heap <name> --why <Type>` (the chain of references from its root). Read on the target from a snapshot: no dump to carry |
+| .NET app: how many objects of a type are alive, and what holds them? | `heap <name> --windows` (window objects per type: how many are SHOWN and how many are CLOSED but still referenced, the usual window leak), `heap <name> --live --type <Type>` (count before and after a fix), `heap <name> --why <Type>` (the chain of references from its root). Read on the target from a snapshot: no dump to carry |
 | Which file or registry access fails? (missing config, DLL, key; access denied) | `trace start <name>` ... reproduce ... `trace` (needs an elevated target) |
 | Did it crash? Why? | `crashes`, `events --level error`, `watch` (exit codes), `crashdumps on` before reproducing |
 | What does the app log? | `read <file> --new` / `--grep`, `dbg` (OutputDebugString), `logs <job>` |
@@ -75,7 +75,13 @@ agentprobe kill app
   it remotely, so tell the user. This is found by the system process that shows the dialog, as Windows 11 does it:
   on a Windows that shows the firewall question another way it is not reported, so a silent stall after starting
   a server still deserves a `screenshot`. Connections to 127.0.0.1 work without an answer; once answered, the rule
-  stays for that path.
+  stays for that path. While such a prompt is up, the program it is about may not react to mouse input or to
+  requests to close its windows (seen with the firewall prompt; `ui click` still worked), so answer or dismiss it
+  before concluding that the app is broken.
+- A window that `windows` marks `disabled` takes no mouse or keyboard input: a dialog that belongs to it is open
+  (its own, or one of Windows). `click` on such a window says so instead of silently doing nothing. Close the
+  dialog first; `ui click` goes through UI Automation instead of the mouse where the control allows it, and may
+  still work.
 - stdin is closed: anything that prompts fails immediately instead of hanging. Pass `-Force`/`-Confirm:$false`/`/quiet`.
 - Commands run as the logged-on user **in their desktop session**: a GUI app you start is visible there.
 - The default folder is the session workspace. `agentprobe push .\bin\Release build` puts a folder there;
@@ -92,6 +98,7 @@ agentprobe watch start MyApp --interval 2s
 agentprobe exec -f .\run-scenario.ps1
 agentprobe watch                 # private bytes / handles / GDI / USER with growth per minute and a leak verdict
 agentprobe handles MyApp --interval 30s    # which handle type grows
+agentprobe heap MyApp --windows                    # .NET: window objects per type: COUNT, SHOWN, CLOSED (closed but still referenced)
 agentprobe heap MyApp --live --type EditorWindow   # .NET: how many are still referenced (closed 20, expect 0)
 agentprobe heap MyApp --why EditorWindow           # .NET: what keeps one alive, root first
 agentprobe dump MyApp --full --keep-remote # native heap, or a 32-bit .NET app: the dump stays on the target
@@ -122,7 +129,12 @@ tooltips and hover states). The `@x,y` that `ui` prints are SCREEN coordinates, 
 and `wait --window` over screenshots when you only need to know that something appeared.
 
 How far to trust an answer: counters (`ps`, `mem`, `handles`) are what Windows reports. `watch` calls a leak only
-after two minutes of steady growth and says "too early" before that. `stacks` names internal functions as
+after two minutes of steady growth and says "too early" before that. With named processes its event list holds
+those processes, what they started, any other process that ended with a crash code and any hang; starts and exits
+of unrelated processes are counted, and `watch --all-events` lists them. A crash shows by the exit code, which can
+only be read for processes the target may open: the report says how many exits it could not judge. `heap --type` looks at a type's own name (`--type Window` finds
+MyApp.SettingsWindow, not all of System.Windows); `--ns` filters by namespace, and `--type "MyApp.*Window"` is a
+pattern for the whole name. `stacks` names internal functions as
 module+offset unless a PDB is present, and cannot walk managed/JIT frames. `trace` says so if events were dropped.
 `kill --pid` ends that one process; add `--tree` to include what it started.
 

@@ -45,13 +45,19 @@ internal static class DumpTool
             var type = full ? 0x2u | 0x4 | 0x20 | 0x800 | 0x1000 : 0x1u | 0x4 | 0x20 | 0x100 | 0x1000;
             bool ok;
             int error;
-            await using (var fs = new FileStream(file, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+            try
             {
+                await using var fs = new FileStream(file, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
                 lock (InspectTools.DbgHelpLock) // dbghelp is single-threaded; `stacks` uses it too
                 {
                     ok = Win32.MiniDumpWriteDump(h, p.Pid, fs.SafeFileHandle.DangerousGetHandle(), type, 0, 0, 0);
                     error = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
                 }
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+            {
+                return ctx.Fail($"dump: could not write {file}: {ex.Message} Nothing was dumped." +
+                                (keep ? " --keep-remote writes into the work folder (with -t local that is the current folder): use one you may write to." : ""));
             }
 
             if (!ok)
