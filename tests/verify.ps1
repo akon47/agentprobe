@@ -30,6 +30,11 @@ $env:AGENTPROBE_PORT = '48652'
 $Exe = (Resolve-Path $Exe).Path
 $work = Join-Path $env:TEMP ("agentprobe-verify-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $work | Out-Null
+# The long form of the folder's path: %TEMP% can be a short (8.3) name, which Windows Firewall does not accept for a
+# program and which would not match the long path agentprobe reports.
+Add-Type -Namespace ApVerify -Name Paths -MemberDefinition '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetLongPathName(string path, System.Text.StringBuilder longPath, uint size);'
+$longWork = New-Object System.Text.StringBuilder 1024
+if ([ApVerify.Paths]::GetLongPathName($work, $longWork, 1024) -gt 0) { $work = $longWork.ToString() }
 $script:pass = 0; $script:fail = 0; $script:failed = @()
 
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
