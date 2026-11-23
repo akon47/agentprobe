@@ -75,6 +75,8 @@ agentprobe wait --idle MyApp --below 25                              # "finished
 agentprobe kill app
 ```
 
+- agentprobe's own options go BEFORE the command (`exec --full '<command>'`, `exec --timeout 5m '<command>'`):
+  after it they would be sent to the target as part of the command, so that form is refused.
 - Quote the command with single quotes so your local shell leaves `$` and `|` alone. When the command itself
   needs both kinds of quotes, or holds C# for `Add-Type`, do not fight the quoting: save it as a file and send
   it with `exec -f` (nested quotes on one line arrive broken).
@@ -94,7 +96,11 @@ agentprobe kill app
   the prompt's "Allow" as a rule for this session, and the prompt never appears. If one is already up,
   `firewall dismiss <pid>` closes it like "Cancel" (its buttons cannot be pressed remotely); the pid is the
   PROMPT's (the warning line gives the exact command), and `firewall dismiss` alone closes every such prompt.
-  Where the target is not elevated, `start --dismiss-firewall --exe <app>` closes the prompt by itself when it appears. `windows`, `triage` and the end of `exec`/`start` output report such a
+  Where the target is not elevated, `firewall allow` is not possible and the prompt comes back at every start:
+  `firewall dismiss --auto` closes every such prompt for the rest of the session (also the ones a script causes),
+  `start --dismiss-firewall --exe <app>` does it for one start. A closed prompt allows nothing, and Windows may keep
+  block rules for that program's path: `firewall leftovers` lists them, `end` says how many stay, and removing them
+  takes an elevated target (`firewall cleanup`). `windows`, `triage` and the end of `exec`/`start` output report such a
   SYSTEM PROMPT with its title (also UAC, credentials, SmartScreen, a packaged app's file picker); you cannot answer
   it remotely, so tell the user. This is found by the system process that shows the dialog, as Windows 11 does it:
   on a Windows that shows the firewall question another way it is not reported, so a silent stall after starting
@@ -111,6 +117,10 @@ agentprobe kill app
   written (a target without administrator rights), copy the installed folder into the workspace on the target and
   push only what changed over it: `exec 'Copy-Item -Recurse "C:\Program Files\MyApp" app'`, then
   `push .\fixed app` (a push into an existing folder merges), then `start --exe app\MyApp.exe`.
+- The script files `exec -f` runs from are removed from the workspace when the command has ended.
+- A test window that a script opens from a process started hidden (`Start-Process -WindowStyle Hidden`) stays
+  hidden: Windows applies "hidden" to the first window that process shows. Start the helper with `start --exe`, or
+  call `Show()` on the window a second time.
 - An app that a script launches with `exec` keeps writing into that command's output for as long as it runs. `exec`
   stops listening when the script itself has ended and says so; start the app with `start --exe` to get its output
   apart (`logs <job>`).
@@ -161,6 +171,10 @@ Driving the UI: prefer names over pixels. `ui "<window title>"` lists the contro
 `(checked)`/`(unchecked)`, `(expanded)`/`(collapsed)`, and `(maximized)`/`(minimized)`/`(normal)` on the window's
 line; `ui get <name>` before and after an action shows whether it took effect. `ui --grep` searches the whole
 tree. When several controls have the same name the first is taken and the answer says so: `--nth 2` picks.
+`ui click` uses the control's own action where there is one and the mouse otherwise; a button that can only be
+toggled (a WPF ToggleButton) is clicked with the mouse, because toggling it would flip its state without running the
+app's click handler, and `--mouse` forces the mouse for any control. `ui set` reads the value back: it fails when
+the control kept its old value, and for a combo box it writes into the edit field inside.
 Fall back to `screenshot` → `click <x> <y>` (coordinates of that image; `--hover` only moves the pointer, for
 tooltips and hover states). The `@x,y` that `ui` prints are SCREEN coordinates, not screenshot pixels: pass them as
 `click @x,y`, never as two plain numbers after a scaled screenshot (a point outside the desktop is refused), `type <text>` (typed literally; use
@@ -175,6 +189,12 @@ first; `focus <title>` does the same on its own). `ui rclick`, `ui dblclick` and
 No input tool acts on agentprobe's own window: a click, touch, drag or scroll at a point on it is refused, and so are
 `type` and `key` while it is the foreground window. The answer says so; `focus` the app and repeat. A bug that only shows with a finger needs `touch`, not `click`: the mouse does
 not reproduce it. `windows --hwnd <title>` gives a window's handle for a script that needs one.
+
+`screenshot` without `--window` is the screen as it is: whatever lies in front is in the picture, agentprobe's own
+window included (`share --minimized` on the target keeps that one out of the way). `screenshot --window <title>`
+asks the window to draw itself, with the dialogs and message boxes it owns, so it comes out whole even when it is
+covered; the answer says when it is covered on the screen, because a click there would go to what is in front.
+`windows` marks a window that is mostly behind others as `covered`.
 
 A screenshot is not always what the person at the PC sees. A window can keep itself out of screen captures
 (players of protected video, password managers, meeting apps): `windows` marks it `no-capture`, and `screenshot`

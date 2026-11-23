@@ -39,7 +39,7 @@ internal static unsafe partial class UiaTools
                  --grep searches the WHOLE tree, off-screen controls included (to depth 40 unless --depth says
                  otherwise), and prints the matching lines; --max then limits how many of them are printed, and
                  the total is stated. A search that could not cover everything says INCOMPLETE.
-            ui click <name|#id> [--window W] [--nth N]   press a button / select an item (falls back to a mouse click on it)
+            ui click <name|#id> [--window W] [--nth N] [--mouse]   press a button / select an item (falls back to a mouse click on it)
             ui rclick <name|#id> [--window W]    right-click it (opens its context menu; `windows` then shows a popup)
             ui dblclick <name|#id> [--window W]  double-click it
             ui tap <name|#id> [--window W]       tap it by touch, as a finger on a touch screen would (see `touch`)
@@ -48,6 +48,15 @@ internal static unsafe partial class UiaTools
             ui get <name|#id> [--window W]       one control's line: value and state (compare before and after an action)
               Works with WPF, WinForms, Win32, UWP/WinUI and most browsers/Electron apps. Read the tree once, then act
               by name; take a screenshot only when you need to judge how something looks.
+              ui click uses the control's own action where it has one (it works even when the control is
+              covered or scrolled away) and the mouse otherwise; --mouse makes it the mouse in any case. A button
+              that can only be toggled (a WPF ToggleButton) is clicked with the mouse: its own action would flip
+              its state without the app's click handler running (when the mouse cannot reach it, it is toggled
+              and the answer says so). After toggling, the answer gives the new state.
+              ui set puts the text into the edit field of a combo box when the name is the combo box's, reads
+              the value back, and fails when the control still reads as before; --nth counts the edit fields,
+              combo boxes, documents and spinners of that name when there are any. An action that finds no such
+              control names the window it looked in.
               When several controls have that name the first is taken and the answer says how many there are:
               --nth 2 takes the second. They count in the order `ui` lists them, panes and groups after the
               controls (a tab and the page it shows have the same name: the tab is the first). --nth works
@@ -111,13 +120,16 @@ internal static unsafe partial class UiaTools
         return result;
     }
 
-    /// <summary>The control's current text (ValuePattern), e.g. what is typed in an edit box.</summary>
-    private static string ValueOf(nint element)
+    /// <summary>The control's current text (ValuePattern), e.g. what is typed in an edit box; "" also when it cannot be read.</summary>
+    private static string ValueOf(nint element) => ReadValue(element) ?? "";
+
+    /// <summary>The control's current text, or null when the control did not give one (which is not the same as an empty text).</summary>
+    private static string? ReadValue(nint element)
     {
         var variant = stackalloc byte[24];
         new Span<byte>(variant, 24).Clear();
-        if (((delegate* unmanaged[Stdcall]<nint, int, byte*, int>)(*(void***)element)[10])(element, 30045, variant) < 0) return ""; // GetCurrentPropertyValue(Value.Value)
-        var text = *(ushort*)variant == 8 && *(nint*)(variant + 8) != 0 ? new string((char*)*(nint*)(variant + 8)) : "";
+        if (((delegate* unmanaged[Stdcall]<nint, int, int, byte*, int>)(*(void***)element)[11])(element, 30045, 1, variant) < 0) return null; // GetCurrentPropertyValueEx(Value.Value), "not supported" told apart
+        var text = *(ushort*)variant == 8 ? (*(nint*)(variant + 8) != 0 ? new string((char*)*(nint*)(variant + 8)) : "") : null; // VT_BSTR
         VariantClear(variant);
         return text;
     }
@@ -171,6 +183,9 @@ internal static unsafe partial class UiaTools
 
     [ThreadStatic]
     private static bool _withClass; // --class, --at and `ui get`: lines carry the control's class name
+
+    [ThreadStatic]
+    private static bool _mouseOnly; // ui click --mouse: not the control's own action
 
     /// <summary>" (selected)", " (checked)", " (expanded)"... as the control reports them; "" for one that reports none.</summary>
     private static string StateOf(Node n)
@@ -388,7 +403,7 @@ internal static unsafe partial class UiaTools
 
     private static Task<int> UiAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "all", "class");
+        var a = ArgParser.Parse(args, "all", "class", "mouse");
         var verb = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "";
         var isAction = verb is "click" or "rclick" or "dblclick" or "tap" or "dtap" or "set" or "get";
         var withClass = a.Flag("class") || verb == "get" || a.Has("at");
@@ -436,6 +451,7 @@ internal static unsafe partial class UiaTools
             var nodes = Walk(automation, root, a.GetInt("depth", isAction || grep != null ? 40 : 12), walkLimit, a.Flag("all") || isAction || grep != null, out var deeper);
             try
             {
+                _mouseOnly = a.Flag("mouse");
                 return isAction ? Act(ctx, verb, a.Positionals, nodes, nth, hwnd, title, nodes.Count >= walkLimit ? walkLimit : 0) : (0, Render(nodes, title, grep, a.Flag("all"), Math.Max(1, a.GetInt("max", 300)), walkLimit, deeper));
             }
             finally
@@ -568,10 +584,32 @@ internal static unsafe partial class UiaTools
         var (code, text, node, several) = (0, "", (Node?)null, 0);
         var spec = positionals[1];
         var all = FindAll(nodes, spec);
+
+        // The window that was looked in is part of the answer: without --window it is whatever was in front,
+        // which after a command that started something can be the desktop itself.
+        var where = title.Length > 0 ? $"window \"{Format.Clip(title, 60)}\"" : "that window (it has no title)";
+        if (nodes.Count > 0 && Bstr(nodes[0].Element, 30) is "Progman" or "WorkerW") where += ", which is the desktop itself";
+        if (all.Count == 0)
+            return (1, $"ui {verb}: no control named '{spec}' in {where}. `ui --grep {spec}` shows what is there; name another window with --window <title> (see `windows`).", null, 0);
+
+        // Text goes into a control that takes text: a label of the same name is not a choice for `set`.
+        if (verb == "set" && all.Where(n => n.Type is 50004 or 50003 or 50030 or 50016).ToList() is { Count: > 0 } takeText) all = takeText; // Edit, ComboBox, Document, Spinner
         several = all.Count;
-        if (all.Count == 0) return (1, $"ui {verb}: no control named '{spec}' in that window. Run `ui --grep {spec}` to see what is there.", null, 0);
-        if (nth > all.Count) return (1, $"ui {verb}: --nth {nth}, but only {all.Count} control{(all.Count == 1 ? " has" : "s have")} the name '{spec}' in that window.", null, all.Count);
+        if (nth > all.Count) return (1, $"ui {verb}: --nth {nth}, but only {all.Count} control{(all.Count == 1 ? " has" : "s have")} the name '{spec}' in {where}{(verb == "set" ? " (counting edit fields and combo boxes)" : "")}.", null, all.Count);
         node = all[(nth ?? 1) - 1];
+
+        // The text of a combo box lives in the edit field inside it.
+        if (verb == "set" && node.Type == 50003)
+        {
+            var at = nodes.IndexOf(node);
+            for (var i = at + 1; at >= 0 && i < nodes.Count && nodes[i].Depth > node.Depth; i++)
+            {
+                if (nodes[i].Type != 50004) continue;
+                node = nodes[i];
+                break;
+            }
+        }
+
         (code, text) = Do(ctx, verb, positionals, node, hwnd, title);
         return (code, text, node, several);
     }
@@ -612,6 +650,7 @@ internal static unsafe partial class UiaTools
                 var text = string.Join(' ', positionals.Skip(2));
                 var value = Pattern(node.Element, 10002, IidValue);
                 if (value == 0) return (1, $"ui set: {label} does not accept text. Click it and use `type` instead.");
+                var before = ReadValue(node.Element);
                 int hr;
                 fixed (char* p = text)
                 {
@@ -623,7 +662,24 @@ internal static unsafe partial class UiaTools
                 Release(value);
                 if (hr < 0) return (1, $"ui set: {label} refused the text (0x{hr:X8}; read-only?).");
                 ctx.Runtime.Audit.Write($"ui set {label} ({text.Length} characters)");
-                return (0, $"set {label} to \"{Format.Clip(text, 60)}\"");
+
+                // A control can accept the call and keep its value (a combo box that only takes entries of its
+                // list does). What it holds now is read back, for up to a second: some programs take the text in
+                // a moment later. A password field does not give its value away, and some controls give none.
+                if (Int(node.Element, 35) != 0) return (0, $"set {label} ({text.Length} characters; not checked: a password field does not show what it holds)"); // get_CurrentIsPassword
+                static string Plain(string v) => v.Replace("\r", "").TrimEnd();
+                var now = ReadValue(node.Element);
+                for (var i = 0; i < 5 && now != null && Plain(now) != Plain(text) && now == before; i++)
+                {
+                    Thread.Sleep(200);
+                    now = ReadValue(node.Element);
+                }
+
+                if (now == null) return (0, $"set {label} ({text.Length} characters); the control does not give its value back, so that it took the text is not checked");
+                if (Plain(now) == Plain(text)) return (0, $"set {label}: now =\"{Format.Clip(now, 60)}\"");
+                return now == before
+                    ? (1, $"ui set: {label} took the call and still reads =\"{Format.Clip(now, 60)}\", as before: the text does not seem to have been taken (a control that only accepts its own entries? the wrong one of several with that name: --nth? or it shows the same value in another form). `ui get` shows it; if the text is not in, click the control and use `type`.")
+                    : (0, $"set {label}; it now reads =\"{Format.Clip(now, 60)}\", which is not exactly the text given (the control changes what it is given)");
             }
 
             case "rclick" or "dblclick":
@@ -653,32 +709,84 @@ internal static unsafe partial class UiaTools
                 if (!node.Enabled) return (1, $"ui click: {label} is disabled.");
                 var logged = false;
                 var refused = "";
+                var why = _mouseOnly ? "--mouse" : "the control has no action of its own that worked";
+                var hadInvoke = false;
+                var toggleOnly = false; // a button whose only action is "toggle": the mouse is tried first
+
+                // Toggle, and say which way it went ("toggled" alone does not).
+                (int, string)? Toggle(string note)
+                {
+                    var t = Pattern(node.Element, 10015, IidToggle);
+                    if (t == 0) return null;
+                    if (!logged) ctx.Runtime.Audit.Write($"ui click {label}");
+                    logged = true;
+                    var result = ((delegate* unmanaged[Stdcall]<nint, int>)(*(void***)t)[3])(t);
+                    Release(t);
+                    if (result < 0)
+                    {
+                        refused = $" (its own action answered 0x{result:X8} first, and may have had an effect)";
+                        return null;
+                    }
+
+                    var state = StateProperty(node.Element, 30086) switch { 0 => ": now unchecked", 1 => ": now checked", 2 => ": now indeterminate", _ => "" };
+                    return (0, $"toggled {label}{state}{note}");
+                }
 
                 // Prefer the control's own action; it works even when the window is covered or scrolled.
                 foreach (var (patternId, iid, what) in new[] { (10000, IidInvoke, "invoked"), (10010, IidSelectionItem, "selected"), (10015, IidToggle, "toggled") })
                 {
+                    if (_mouseOnly) break;
+                    if (patternId == 10015)
+                    {
+                        // A button that offers "toggle" and no "invoke" (a WPF ToggleButton): toggling flips its
+                        // checked state and does NOT run the click handler the app hangs on it. A click with the
+                        // mouse does both, so that comes first; toggling is what is left when the mouse cannot reach.
+                        if (node.Type is 50000 or 50031 && !hadInvoke)
+                        {
+                            var only = Pattern(node.Element, patternId, iid);
+                            if (only == 0) break;
+                            Release(only);
+                            toggleOnly = true;
+                            why = "a button that can only be toggled: its own action would flip its state without the app's click handler running";
+                            break;
+                        }
+
+                        if (Toggle("") is { } toggled) return toggled;
+                        continue;
+                    }
+
                     var p = Pattern(node.Element, patternId, iid);
                     if (p == 0) continue;
+                    if (patternId == 10000) hadInvoke = true;
                     if (!logged) ctx.Runtime.Audit.Write($"ui click {label}"); // before the call: a button that opens a dialog may not return for a while
                     logged = true;
-                    var hr = ((delegate* unmanaged[Stdcall]<nint, int>)(*(void***)p)[3])(p); // Invoke / Select / Toggle
+                    var hr = ((delegate* unmanaged[Stdcall]<nint, int>)(*(void***)p)[3])(p); // Invoke / Select
                     Release(p);
                     if (hr >= 0) return (0, $"{what} {label}");
                     refused = $" (its own action answered 0x{hr:X8} first, and may have had an effect)";
                 }
 
-                if (node.Offscreen || node.Rect.Width <= 0) return (1, $"ui click: {label} has no action of its own that worked and is not visible on screen{refused}.");
-                // No action of its own: the mouse does it, and a disabled window ignores the mouse.
                 var x = (node.Rect.Left + node.Rect.Right) / 2;
                 var y = (node.Rect.Top + node.Rect.Bottom) / 2;
-                if (Covered(verb, label, x, y, hwnd, title) is { } covered) return (1, covered + refused);
+                var unreachable = node.Offscreen || node.Rect.Width <= 0 ? $"ui click: {label} is not visible on screen, and the mouse is the only way here ({why}){refused}."
+                    : Covered(verb, label, x, y, hwnd, title) is { } covered ? covered + refused
+                    : null;
+                if (unreachable != null)
+                {
+                    // The mouse cannot get to it. A toggle-only button can still be toggled, and the answer says
+                    // what that does not do.
+                    if (toggleOnly && !_mouseOnly && Toggle(" (the mouse could not reach it, so it was only toggled: the app's click handler may not have run)") is { } instead) return instead;
+                    return (1, unreachable);
+                }
+
+                // No action of its own: the mouse does it, and a disabled window ignores the mouse.
                 ctx.Runtime.Audit.Write($"ui click {label} at {x},{y} (mouse)");
                 var blocked = UiTools.DisabledWindowAt(x, y);
                 UiTools.Mouse(x, y, 0x0001);
                 Thread.Sleep(40);
                 UiTools.Mouse(x, y, 0x0002);
                 UiTools.Mouse(x, y, 0x0004);
-                return (0, $"clicked {label} at {x},{y} with the mouse (the control has no action of its own that worked){refused}" + (blocked != null ? "\n" + blocked : ""));
+                return (0, $"clicked {label} at {x},{y} with the mouse ({why}){refused}" + (blocked != null ? "\n" + blocked : ""));
             }
         }
     }

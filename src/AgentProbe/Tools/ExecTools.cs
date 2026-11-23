@@ -18,12 +18,14 @@ internal static class Shell
     /// Not null when <paramref name="command"/> is a whole script file (<c>exec -f</c>): it is then saved and run as a
     /// file with these arguments, so its <c>param(...)</c> block, <c>$PSScriptRoot</c> and line numbers are its own.
     /// </param>
-    public static ProcessStartInfo Build(string shell, string command, string cwd, TargetRuntime runtime, IReadOnlyList<string>? fileArgs = null)
+    /// <param name="onTempFile">Told about a script file this call wrote into the workspace, to be deleted when the command has ended.</param>
+    public static ProcessStartInfo Build(string shell, string command, string cwd, TargetRuntime runtime, IReadOnlyList<string>? fileArgs = null, Action<string>? onTempFile = null)
     {
         if (fileArgs != null)
         {
             var cmd = shell.Equals("cmd", StringComparison.OrdinalIgnoreCase);
             var file = Path.Combine(runtime.WorkDir, $"script-{Guid.NewGuid():N}.{(cmd ? "cmd" : "ps1")}");
+            onTempFile?.Invoke(file);
 
             // A PowerShell script ends with the same exit-code rule an inline command gets, so a script whose last
             // step failed does not come back as 0 (it follows the script's own text: the param block stays first and
@@ -69,6 +71,7 @@ internal static class Shell
                 {
                     // Too long for a command line: run it from a script file in the session workspace.
                     var file = Path.Combine(runtime.WorkDir, $"script-{Guid.NewGuid():N}.ps1");
+                    onTempFile?.Invoke(file);
                     File.WriteAllText(file, script, new UTF8Encoding(true));
                     psi.Arguments = common + "-File \"" + file + "\"";
                 }
@@ -167,7 +170,7 @@ internal static class Shell
     }
 
     /// <summary>"name.exe(pid)" of the processes that a process which has just ended started and left running (the console host is not one).</summary>
-    private static List<string> LeftRunning(int parentPid, long startedAfter)
+    internal static List<string> LeftRunning(int parentPid, long startedAfter)
     {
         try
         {
@@ -178,6 +181,22 @@ internal static class Shell
         catch (InvalidOperationException)
         {
             return [];
+        }
+    }
+
+    /// <summary>Removes the script files a command was run from: the workspace is the agent's, not a pile of these.</summary>
+    public static void DeleteScripts(IReadOnlyList<string>? files)
+    {
+        foreach (var file in files ?? [])
+        {
+            try
+            {
+                File.Delete(file);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // still held by something the command left running: it goes with the workspace at the end
+            }
         }
     }
 
@@ -278,9 +297,18 @@ internal sealed class JobManager(TargetRuntime runtime)
 
     public Job Start(string shell, string command, string cwd, string? name, IReadOnlyList<string>? fileArgs = null, IReadOnlyList<(string name, string value)>? env = null)
     {
-        var psi = Shell.Build(shell, command, cwd, runtime, fileArgs);
-        Apply(psi, env);
-        return Track(psi, command, name);
+        var scripts = new List<string>();
+        try
+        {
+            var psi = Shell.Build(shell, command, cwd, runtime, fileArgs, scripts.Add);
+            Apply(psi, env);
+            return Track(psi, command, name, scripts);
+        }
+        catch
+        {
+            Shell.DeleteScripts(scripts); // nothing runs from them
+            throw;
+        }
     }
 
     /// <summary>
@@ -343,7 +371,8 @@ internal sealed class JobManager(TargetRuntime runtime)
         return sb.Append(backslash, slashes * 2).Append(quote).ToString();
     }
 
-    private Job Track(ProcessStartInfo psi, string command, string? name)
+    /// <param name="scripts">Script files written for this job, deleted when it has ended.</param>
+    private Job Track(ProcessStartInfo psi, string command, string? name, IReadOnlyList<string>? scripts = null)
     {
         var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
         p.Start();
@@ -360,6 +389,7 @@ internal sealed class JobManager(TargetRuntime runtime)
             await Task.WhenAny(pumps, Task.Delay(2000));
             job.ExitCode = p.ExitCode;
             job.EndUtc = DateTime.UtcNow;
+            if (Shell.LeftRunning(p.Id, 0).Count == 0) Shell.DeleteScripts(scripts); // not while something it started may still read them
             runtime.Audit.Write($"job {job.Id} exited: {Native.ProcessDetails.ExitCodeName((uint)p.ExitCode)}  ({Format.Clip(job.Command, 80)})");
         });
         return job;
@@ -457,9 +487,11 @@ internal static class ExecTools
 
         var cwd = a.Get("cwd") is { } c ? ctx.Runtime.ResolvePath(c) : ctx.Runtime.WorkDir;
         ProcessStartInfo psi;
+        var scripts = new List<string>();
+        var started = 0; // the shell's pid, once it runs
         try
         {
-            psi = Shell.Build(a.Get("shell") ?? "powershell", command, cwd, ctx.Runtime, a.Flag("as-file") ? a.Positionals : null);
+            psi = Shell.Build(a.Get("shell") ?? "powershell", command, cwd, ctx.Runtime, a.Flag("as-file") ? a.Positionals : null, scripts.Add);
         }
         catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
         {
@@ -481,7 +513,7 @@ internal static class ExecTools
                     }
                 }
                 else ctx.Out.Write(squeeze.Apply(text));
-            }, a.GetDuration("timeout"), ctx.Ct, onNote: n => notes.Append(n));
+            }, a.GetDuration("timeout"), ctx.Ct, onStarted: process => started = process.Id, onNote: n => notes.Append(n));
             var errorText = PsErrors.ToPlainText(stderr.ToString());
             if (errorText.Length > 0) ctx.Err.Write(new Squeezer().Apply(errorText));
             if (notes.Length > 0) ctx.Err.Write(notes.ToString()); // after the error text: PowerShell's error format would swallow it
@@ -494,6 +526,12 @@ internal static class ExecTools
         catch (System.ComponentModel.Win32Exception ex)
         {
             return ctx.Fail($"exec: cannot start {psi.FileName}: {ex.Message}");
+        }
+        finally
+        {
+            // Not while a program the script left running may still read it (a script that starts itself again):
+            // then the file goes with the workspace when the session ends.
+            if (scripts.Count > 0 && (started == 0 || Shell.LeftRunning(started, 0).Count == 0)) Shell.DeleteScripts(scripts);
         }
     }
 

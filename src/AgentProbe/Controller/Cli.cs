@@ -321,6 +321,20 @@ internal static class Cli
             return [.. options, "--as-file", "--script", script!, "--", .. rest];
         }
 
+        // `exec '<command>' --full`: the whole command was given in quotes and an option of agentprobe follows it.
+        // Sent along, it becomes part of the command on the target (PowerShell then fails in its own words, or a
+        // program gets an argument nobody meant for it). It is refused here, where the answer can say what to do.
+        // (Only the options that are hardly anything but agentprobe's: --name, --out or -t after a quoted
+        // command are as likely the program's own.)
+        if (args.Length - i >= 2 && args[i].Any(char.IsWhiteSpace) &&
+            args[(i + 1)..].FirstOrDefault(x => x is "--full" or "--timeout" or "--shell" or "--cwd" or "--target" ||
+                                                x.StartsWith("--timeout=", StringComparison.Ordinal) || x.StartsWith("--shell=", StringComparison.Ordinal) || x.StartsWith("--cwd=", StringComparison.Ordinal) || x.StartsWith("--target=", StringComparison.Ordinal)) is { } late)
+        {
+            Console.Error.WriteLine($"{tool}: '{late}' comes after the command, where it would be sent to the target as part of the command. Nothing was run. " +
+                                    $"agentprobe's options go before the command: agentprobe {tool} {late} ... '<command>'. (To pass it to the command on purpose, put it inside the quotes.)");
+            return null;
+        }
+
         script = string.Join(' ', args[i..]);
         if (string.IsNullOrWhiteSpace(script))
         {
@@ -622,6 +636,7 @@ internal static class LocalRunner
                        || (tool.Name == "read" && args.Contains("--new"))
                        || (tool.Name == "envsnap" && (args.Contains("--save") || args.Contains("--diff")))
                        || (tool.LoudWhen?.Invoke(args) == true)
+                       || (tool.Name == "firewall" && args.Contains("--auto"))
                        || (tool.Name == "kill" && args.Length > 0 && !args[0].StartsWith('-'));
         if (stateful)
             return Write(error, $"`{string.Join(' ', new[] { tool.Name }.Concat(args.Take(2)))}` keeps state between calls and needs a real session: -t local runs each command in a fresh process. " +

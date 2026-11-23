@@ -177,6 +177,17 @@ Start-Sleep 600
     Check 'read --grep returns exactly the match' ($g -eq '5: line 5 value=35') $g
     Check '-t local refuses commands that need a session' ((AP -t local read $file --new).Code -eq 2 -and (AP -t local watch start explorer).Code -eq 2 -and (AP -t local deps $Exe --run).Code -eq 2) ''
 
+    # An option of agentprobe after the command would be sent to the target as part of the command: refused, with the way to write it.
+    $r = AP -t local exec 'Write-Output must-not-run' --full
+    Check 'exec: an agentprobe option after the command is refused, not sent along as part of the command' ($r.Code -eq 2 -and $r.Out -match "'--full' comes after the command" -and $r.Out -notmatch '(?m)^must-not-run') "$($r.Code) $($r.Out)"
+    Check 'exec: the same text inside the quotes is the command''s own business' ((AP -t local exec 'Write-Output ok --full').Out -match '(?m)^ok$') ''
+
+    # The firewall rules Windows keeps for programs of agentprobe workspaces, against what Windows has stored.
+    $stored = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules').PSObject.Properties | Where-Object { $_.Value -is [string] -and $_.Value -match '\|App=[^|]*\\agentprobe\\work-' })
+    $r = AP -t local firewall leftovers
+    if ($stored.Count -eq 0) { Check 'firewall leftovers: none stored, none listed' ($r.Code -eq 0 -and $r.Out -match '^no rule for a program in an agentprobe workspace') $r.Out }
+    else { Check 'firewall leftovers lists as many rules as Windows has stored for workspace programs' ($r.Code -eq 0 -and $r.Out -match "(?m)^(\.\.\. \d+ more\. )?$($stored.Count) rules? for programs in agentprobe workspaces") "stored: $($stored.Count)`n$($r.Out)" }
+
     # The lines of a time span: from the first time up to, not including, the second; a line without a time
     # (a stack trace) belongs to the line before it.
     $timed = Join-Path $work 'timed.log'
@@ -444,6 +455,7 @@ public static class CredPrompt {
     $clickFile = Join-Path $work 'clicked.txt'
     $touchFile = Join-Path $work 'touched.txt'
     $tapsFile = Join-Path $work 'taps.txt'
+    $toggleFile = Join-Path $work 'toggled.txt'
     $hwndFile = Join-Path $work 'hwnd.txt'
     $affinityFile = Join-Path $work 'affinity.txt'
     $formScript = @"
@@ -453,8 +465,11 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
 [Windows.Forms.Application]::EnableVisualStyles()
 `$neverShown = 1..3 | ForEach-Object { New-Object ApVerify.Views.EditorForm }
 `$wpfNeverShown = 1..2 | ForEach-Object { New-Object System.Windows.Window }
-`$wpfShown = New-Object System.Windows.Window; `$wpfShown.Title = 'ApWpf'; `$wpfShown.Width = 160; `$wpfShown.Height = 80; `$wpfShown.Left = 700; `$wpfShown.Top = 520; `$wpfShown.ShowInTaskbar = `$false; `$wpfShown.ShowActivated = `$false
-`$wpfSlider = New-Object System.Windows.Controls.Slider; `$wpfSlider.Name = 'wpfSlider'; `$wpfSlider.Minimum = 0; `$wpfSlider.Maximum = 1; `$wpfSlider.Value = 0.25; `$wpfShown.Content = `$wpfSlider
+`$wpfShown = New-Object System.Windows.Window; `$wpfShown.Title = 'ApWpf'; `$wpfShown.Width = 220; `$wpfShown.Height = 130; `$wpfShown.Left = 700; `$wpfShown.Top = 520; `$wpfShown.ShowInTaskbar = `$false; `$wpfShown.ShowActivated = `$false
+`$wpfSlider = New-Object System.Windows.Controls.Slider; `$wpfSlider.Name = 'wpfSlider'; `$wpfSlider.Minimum = 0; `$wpfSlider.Maximum = 1; `$wpfSlider.Value = 0.25
+`$wpfToggle = New-Object System.Windows.Controls.Primitives.ToggleButton; `$wpfToggle.Name = 'wpfToggle'; `$wpfToggle.Content = 'Gear'; `$wpfToggle.Height = 30
+`$wpfToggle.Add_Click({ [IO.File]::WriteAllText('$toggleFile', 'toggle-clicked') })
+`$wpfPanel = New-Object System.Windows.Controls.StackPanel; [void]`$wpfPanel.Children.Add(`$wpfSlider); [void]`$wpfPanel.Children.Add(`$wpfToggle); `$wpfShown.Content = `$wpfPanel
 `$wpfShown.Show()
 `$formClosed = New-Object ApVerify.Views.EditorForm; `$formClosed.ShowInTaskbar = `$false; `$formClosed.StartPosition = 'Manual'; `$formClosed.Left = 700; `$formClosed.Top = 620; `$formClosed.Width = 120; `$formClosed.Height = 60; `$formClosed.Show(); `$formClosed.Close()
 `$wpfClosed = New-Object System.Windows.Window; `$wpfClosed.Width = 120; `$wpfClosed.Height = 60; `$wpfClosed.Left = 700; `$wpfClosed.Top = 620; `$wpfClosed.ShowInTaskbar = `$false; `$wpfClosed.ShowActivated = `$false; `$wpfClosed.Show(); `$wpfClosed.Close()
@@ -462,7 +477,7 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
 `$secret.Show()
 `$kept = if ([ApVerify.Views.Input]::SetWindowDisplayAffinity(`$secret.Handle, 0x11)) { 'left out' } elseif ([ApVerify.Views.Input]::SetWindowDisplayAffinity(`$secret.Handle, 1)) { 'shown black' } else { 'none' }
 [IO.File]::WriteAllText('$affinityFile', `$kept)
-`$f = New-Object Windows.Forms.Form; `$f.Text = 'AP Verify Window'; `$f.Width = 440; `$f.Height = 330; `$f.StartPosition = 'Manual'; `$f.Left = 160; `$f.Top = 160; `$f.TopMost = `$true
+`$f = New-Object Windows.Forms.Form; `$f.Text = 'AP Verify Window'; `$f.Width = 440; `$f.Height = 375; `$f.StartPosition = 'Manual'; `$f.Left = 160; `$f.Top = 160; `$f.TopMost = `$true
 `$f.Add_Shown({ [IO.File]::WriteAllText('$hwndFile', `$f.Handle.ToInt64().ToString('X')); `$list.TopIndex = 30 })
 `$list = New-Object Windows.Forms.ListBox; `$list.Name = 'longList'; `$list.Left = 20; `$list.Top = 240; `$list.Width = 180; `$list.Height = 45; 1..60 | ForEach-Object { [void]`$list.Items.Add('item ' + `$_) }
 `$t = New-Object Windows.Forms.TextBox; `$t.Name = 'inputBox'; `$t.Left = 20; `$t.Top = 20; `$t.Width = 300
@@ -474,14 +489,17 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
 `$tabs.TabPages.Add('First tab'); `$tabs.TabPages.Add('Second tab')
 `$twinA = New-Object Windows.Forms.Button; `$twinA.Name = 'twinA'; `$twinA.Text = 'Twin'; `$twinA.Left = 20; `$twinA.Top = 205; `$twinA.Width = 90; `$twinA.Add_Click({ [IO.File]::WriteAllText('$clickFile', 'twin:A') })
 `$twinB = New-Object Windows.Forms.Button; `$twinB.Name = 'twinB'; `$twinB.Text = 'Twin'; `$twinB.Left = 120; `$twinB.Top = 205; `$twinB.Width = 90; `$twinB.Add_Click({ [IO.File]::WriteAllText('$clickFile', 'twin:B') })
-`$cover = New-Object Windows.Forms.Form; `$cover.Text = 'AP Verify Cover'; `$cover.Width = 200; `$cover.Height = 110; `$cover.StartPosition = 'Manual'; `$cover.Left = 165; `$cover.Top = 372; `$cover.TopMost = `$true; `$cover.ShowInTaskbar = `$false
+`$cover = New-Object Windows.Forms.Form; `$cover.Text = 'AP Verify Cover'; `$cover.Width = 200; `$cover.Height = 110; `$cover.StartPosition = 'Manual'; `$cover.Left = 165; `$cover.Top = 372; `$cover.TopMost = `$true; `$cover.ShowInTaskbar = `$false; `$cover.BackColor = [Drawing.Color]::Magenta
 `$showCover = New-Object Windows.Forms.Button; `$showCover.Name = 'showCover'; `$showCover.Text = 'Show cover'; `$showCover.Left = 230; `$showCover.Top = 205; `$showCover.Width = 80; `$showCover.Add_Click({ `$cover.Show() })
+`$bigCover = New-Object Windows.Forms.Button; `$bigCover.Name = 'bigCover'; `$bigCover.Text = 'Big cover'; `$bigCover.Left = 320; `$bigCover.Top = 250; `$bigCover.Width = 80; `$bigCover.Add_Click({ `$cover.Bounds = `$f.Bounds; `$cover.Show() })
+`$listCombo = New-Object Windows.Forms.ComboBox; `$listCombo.Name = 'listCombo'; `$listCombo.DropDownStyle = 'DropDownList'; [void]`$listCombo.Items.Add('Alpha'); [void]`$listCombo.Items.Add('Beta'); `$listCombo.SelectedIndex = 0; `$listCombo.Left = 20; `$listCombo.Top = 295; `$listCombo.Width = 120
+`$editCombo = New-Object Windows.Forms.ComboBox; `$editCombo.Name = 'editCombo'; `$editCombo.DropDownStyle = 'DropDown'; [void]`$editCombo.Items.Add('One'); `$editCombo.Left = 160; `$editCombo.Top = 295; `$editCombo.Width = 140
 `$hideCover = New-Object Windows.Forms.Button; `$hideCover.Name = 'hideCover'; `$hideCover.Text = 'Hide cover'; `$hideCover.Left = 320; `$hideCover.Top = 205; `$hideCover.Width = 80; `$hideCover.Add_Click({ `$cover.Hide() })
 `$d = New-Object Windows.Forms.Form; `$d.Text = 'AP Verify Dialog'; `$d.Width = 260; `$d.Height = 120; `$d.StartPosition = 'Manual'; `$d.Left = 660; `$d.Top = 160
 `$c = New-Object Windows.Forms.Button; `$c.Name = 'closeDialog'; `$c.Text = 'Close dialog'; `$c.Left = 20; `$c.Top = 20; `$c.Width = 120; `$c.DialogResult = 'OK'; `$d.Controls.Add(`$c)
 `$o = New-Object Windows.Forms.Button; `$o.Name = 'openDialog'; `$o.Text = 'Open dialog'; `$o.Left = 160; `$o.Top = 60; `$o.Width = 120
 `$o.Add_Click({ [void]`$f.BeginInvoke([Action]{ [void]`$d.ShowDialog(`$f) }) })
-`$f.Controls.Add(`$t); `$f.Controls.Add(`$b); `$f.Controls.Add(`$o); `$f.Controls.Add(`$check); `$f.Controls.Add(`$tabs); `$f.Controls.Add(`$twinA); `$f.Controls.Add(`$twinB); `$f.Controls.Add(`$showCover); `$f.Controls.Add(`$hideCover); `$f.Controls.Add(`$list)
+`$f.Controls.Add(`$t); `$f.Controls.Add(`$b); `$f.Controls.Add(`$o); `$f.Controls.Add(`$check); `$f.Controls.Add(`$tabs); `$f.Controls.Add(`$twinA); `$f.Controls.Add(`$twinB); `$f.Controls.Add(`$showCover); `$f.Controls.Add(`$hideCover); `$f.Controls.Add(`$list); `$f.Controls.Add(`$bigCover); `$f.Controls.Add(`$listCombo); `$f.Controls.Add(`$editCombo)
 [Windows.Forms.Application]::Run(`$f)
 "@
     $formFile = Join-Path $work 'form.ps1'; $formScript | Set-Content $formFile -Encoding UTF8   # too long for a command line
@@ -504,7 +522,7 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
     $r = AP -t local heap $form.Id --type DisplayClass --live --top 1
     Check 'heap --type finds compiler-made types (their names begin with <)' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s*[\d,]+\s+\S+\s+\S*<>c__DisplayClass') $r.Out
     $r = AP -t local heap $form.Id --type Forms.Button --live
-    Check 'heap --type with a dot looks in the full name' ($r.Out -match '(?m)^\s*7\s+\S+\s+System\.Windows\.Forms\.Button\s*$') $r.Out
+    Check 'heap --type with a dot looks in the full name' ($r.Out -match '(?m)^\s*8\s+\S+\s+System\.Windows\.Forms\.Button\s*$') $r.Out
     $r = AP -t local heap $form.Id --ns ApVerify.Views --live
     Check 'heap --ns keeps the types of one namespace' ($r.Out -match '(?m)^\s*4\s+\S+\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match 'Cache<System\.Int32>\+Node' -and $r.Out -notmatch '(?m)\sSystem\.') $r.Out
     $r = AP -t local heap $form.Id --type 'ApVerify.*Form' --live
@@ -595,11 +613,44 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
     } else { Check 'the cover window for the "in front" checks lies over the button' $false "$($cw.Out) / cover at $($coverAt -join ',') / $twin" }
     [void](AP -t local ui click 'Hide cover' --window 'AP Verify Window')
     [void](AP -t local wait --no-window 'AP Verify Cover' --timeout 10s)
+
+    # A window that lies wholly behind another one (a magenta one): `windows` marks it, a picture of the screen shows
+    # the one in front, and `screenshot --window` still shows the window itself and says that it is covered.
+    $press = (AP -t local ui 'AP Verify Window' --grep pressButton).Out
+    $origin = if ((AP -t local windows 'AP Verify Window').Out -match '(?m)\s(-?\d+),(-?\d+) \d+x\d+\s.*AP Verify Window') { @([int]$Matches[1], [int]$Matches[2]) } else { $null }
+    [void](AP -t local ui click 'Big cover' --window 'AP Verify Window')
+    $cw = AP -t local wait --window 'AP Verify Cover' --timeout 10s; Start-Sleep -Milliseconds 500
+    if ($cw.Code -eq 0 -and $origin -and $press -match '@(\d+),(\d+)') {
+        $bx = [int]$Matches[1] - $origin[0]; $by = [int]$Matches[2] - $origin[1]
+        $win = (AP -t local windows 'AP Verify').Out
+        Check 'windows marks a window that is behind another one as covered, and not the one in front' ($win -match '(?m)\scovered\s+AP Verify Window\s*$' -and $win -notmatch '(?m)covered\s+AP Verify Cover' -and $win -match '(?m)^covered = ') $win
+        Add-Type -AssemblyName System.Drawing
+        $own = Join-Path $work 'own.png'; $onScreen = Join-Path $work 'onscreen.png'
+        $sr = AP -t local screenshot --window 'AP Verify Window' -o $own
+        $sc = AP -t local screenshot --window 'AP Verify Cover' -o $onScreen
+        $pixel = { param($file, $x, $y) $bmp = [Drawing.Bitmap]::FromFile($file); try { $c = $bmp.GetPixel($x, $y); "$($c.R),$($c.G),$($c.B)" } finally { $bmp.Dispose() } }
+        $ownPixel = if (Test-Path $own) { & $pixel $own ($bx - 40) $by } else { 'no file' }
+        $coverPixel = if (Test-Path $onScreen) { & $pixel $onScreen ($bx - 40) $by } else { 'no file' }
+        Check 'screenshot --window shows the window itself although another window covers it, and says that it is covered' ($sr.Code -eq 0 -and $sr.Out -match 'ON THE SCREEN about \d+% of it is behind "AP Verify Cover"' -and $ownPixel -ne '255,0,255' -and $ownPixel -ne 'no file' -and $coverPixel -eq '255,0,255') "window: $ownPixel  cover: $coverPixel`n$($sr.Out)"
+    } else { Check 'the full-size cover window appeared' $false "$($cw.Out) / $press" }
+    [void](AP -t local ui click 'Hide cover' --window 'AP Verify Window')
+    [void](AP -t local wait --no-window 'AP Verify Cover' --timeout 10s)
     [void](AP -t local ui click 'First tab' --window 'AP Verify Window')
     Check 'ui: tree shows the edit field by id' ($tree.Out -match 'Edit.*#inputBox') $tree.Out
     $s = AP -t local ui set '#inputBox' 'hello ui' --window 'AP Verify Window'
     Check 'ui set succeeds' ($s.Code -eq 0) $s.Out
     Check 'ui get reads the value back' ((AP -t local ui get '#inputBox' --window 'AP Verify Window').Out -match '=hello ui') ''
+    $r = AP -t local ui click 'NoSuchControlZz' --window 'AP Verify Window'
+    Check 'ui: "no such control" names the window that was looked in' ($r.Code -ne 0 -and $r.Out -match "no control named 'NoSuchControlZz' in window `"AP Verify Window`"") $r.Out
+    $s = AP -t local ui set '#inputBox' 'read back' --window 'AP Verify Window'
+    Check 'ui set says what the control holds afterwards' ($s.Code -eq 0 -and $s.Out -match 'now ="read back"') $s.Out
+    [void](AP -t local ui set '#inputBox' 'hello ui' --window 'AP Verify Window')
+    $s = AP -t local ui set '#editCombo' 'typed-in' --window 'AP Verify Window'
+    $g = (AP -t local ui get '#editCombo' --window 'AP Verify Window').Out
+    Check 'ui set on a combo box puts the text into it (its edit field), and the value is there afterwards' ($s.Code -eq 0 -and $g -match '=typed-in') "$($s.Out) / $g"
+    $s = AP -t local ui set '#listCombo' 'NotInTheList' --window 'AP Verify Window'
+    $g = (AP -t local ui get '#listCombo' --window 'AP Verify Window').Out
+    Check 'ui set that a control does not take is an error, not a silent success' ($s.Code -ne 0 -and $g -match '=Alpha' -and $g -notmatch 'NotInTheList') "$($s.Code) $($s.Out) / $g"
     $c = AP -t local ui click 'Press me' --window 'AP Verify Window'
     Start-Sleep -Milliseconds 500
     Check 'ui click invoked the button (app saw the text)' ((Test-Path $clickFile) -and ((Get-Content $clickFile -Raw -Encoding UTF8) -eq 'clicked:hello ui')) "$($c.Out) / file: $(if (Test-Path $clickFile) { Get-Content $clickFile -Raw -Encoding UTF8 })"
@@ -631,6 +682,12 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
         Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
         [void](AP -t local click "@$px,$py"); Start-Sleep -Milliseconds 400
         Check 'the test window tells mouse from touch: a mouse click is seen as mouse' ((Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'mouse') "$(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })"
+        # A WPF ToggleButton offers only "toggle", which would flip its state without the app's click handler running.
+        Remove-Item $toggleFile -ErrorAction SilentlyContinue
+        [void](AP -t local focus 'ApWpf'); Start-Sleep -Milliseconds 400
+        $r = AP -t local ui click '#wpfToggle' --window 'ApWpf'; Start-Sleep -Milliseconds 500
+        Check 'ui click on a button that can only be toggled uses the mouse, so the app''s click handler runs' ($r.Code -eq 0 -and $r.Out -match 'with the mouse \(a button that can only be toggled' -and (Get-Content $toggleFile -Raw -ErrorAction SilentlyContinue) -eq 'toggle-clicked') "$($r.Code) $($r.Out) / $(if (Test-Path $toggleFile) { Get-Content $toggleFile -Raw })"
+        [void](AP -t local focus 'AP Verify Window'); Start-Sleep -Milliseconds 300
         Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
         $r = AP -t local touch tap "@$px,$py" --window 'AP Verify Window'; Start-Sleep -Milliseconds 600
         if ($r.Out -match 'Windows refused the touch input \(InitializeTouchInjection') {
@@ -846,6 +903,8 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
                 $ps2 = Join-Path $work 'laststep.ps1'; "Write-Output started`r`ncmd /c exit 5" | Set-Content $ps2 -Encoding UTF8
                 $r = AP -t verify exec -f $ps2
                 Check 'exec -f: a script whose last step fails returns that exit code, not 0' ($r.Code -eq 5 -and $r.Out -match 'started') "$($r.Code) $($r.Out)"
+                $r = AP -t verify exec '@(Get-ChildItem -Filter script-*.*).Count'
+                Check 'the script files exec -f ran from are gone from the workspace afterwards' ($r.Out.Trim() -eq '0') $r.Out
 
                 # A GUI app is tracked as a job only when it is started itself, not through a shell.
                 $gui = "$env:WINDIR\System32\winver.exe"   # a plain GUI program that every Windows has, server editions included
@@ -1019,6 +1078,8 @@ Write-Output 'script-done'
                     $r = AP -t verify firewall dismiss
                     Check 'firewall dismiss without a pid, with no prompt on the screen: says so, closes nothing' ($r.Code -eq 0 -and $r.Out -match 'no prompt of the firewall''s host program .* is on the screen; nothing to close') "$($r.Code) $($r.Out)"
                     Check 'firewall dismiss with a pid that is not a prompt says whose pid it wants' ((AP -t verify firewall dismiss $PID).Out -match 'No prompt of the firewall''s host program is on the screen') ''
+                    $r1 = AP -t verify firewall dismiss --auto; $r2 = AP -t verify firewall dismiss --auto; $r3 = AP -t verify firewall dismiss --auto off
+                    Check 'firewall dismiss --auto: on for the session, says so when asked again, and off' ($r1.Code -eq 0 -and $r1.Out -match 'from now until the session ends' -and $r2.Out -match '^already on: 0 prompts closed' -and $r3.Out -match 'no longer closed automatically') "$($r1.Out) / $($r2.Out) / $($r3.Out)"
                 }
 
                 # Closing the start screen's window asks for this: it must never cut off a connected PC,

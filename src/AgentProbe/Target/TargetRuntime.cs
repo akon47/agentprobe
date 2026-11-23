@@ -162,6 +162,15 @@ internal sealed class TargetRuntime
     /// </summary>
     public volatile bool Paused;
 
+    /// <summary>Set while `firewall dismiss --auto` is on: cancelling it stops the watch.</summary>
+    public CancellationTokenSource? PromptWatch;
+
+    /// <summary>How many system prompts this session closed (each one can leave firewall rules behind).</summary>
+    public int PromptsClosed;
+
+    /// <summary>The names of the firewall rules `firewall allow` made in this session: removed at its end, so never "left over".</summary>
+    public HashSet<string> SessionFirewallRules { get; } = [];
+
     private readonly List<(string what, Action undo)> _undo = [];
 
     /// <summary>Registers how to revert a change a tool made to this PC; run (newest first) when the session ends.</summary>

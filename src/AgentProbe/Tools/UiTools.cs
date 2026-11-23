@@ -33,6 +33,8 @@ internal static partial class UiTools
               "popup" marks an open menu or drop-down (untitled, shown as [its class]): the cheap way to ask "is the
               menu up?". "console" marks a console window, whose title is often an exe path that matches the app's
               name. --class adds each window's class.
+              "covered" marks a window that is mostly behind other windows: a screenshot of the screen, or a click
+              there, gets what is in front (`focus` brings it forward; `screenshot --window` shows it anyway).
               "no-capture" marks a window that keeps itself out of screen captures (a player of protected video,
               a password manager, a meeting app): the person at the PC sees it, a `screenshot` shows black or
               what is behind it there. `ui` still reads its controls.
@@ -42,10 +44,17 @@ internal static partial class UiTools
             """, WindowsAsync) { Quiet = true },
         new("screenshot", "Desktop", "Capture the screen (or one display/window) to a PNG on the developer PC",
             """
-            screenshot [-o file.png] [--display N] [--window TITLE|HWND] [--scale 0.5]
+            screenshot [-o file.png] [--display N] [--window TITLE|HWND [--raise]] [--scale 0.5]
               Saved on the developer PC, in its temp folder unless -o says where (the path is printed); open the
-              file to look at it. --window crops to one window and --scale shrinks
-              the image: both make it much cheaper to read. click/drag coordinates refer to the latest screenshot.
+              file to look at it. --window gives one window and --scale shrinks the image: both make it much
+              cheaper to read. click/drag coordinates refer to the latest screenshot.
+              Without --window the picture is the screen as the person at the PC sees it: whatever lies in front
+              is in it, agentprobe's own window included. --window asks that window to draw ITSELF, together with
+              the dialogs it owns, so it comes out whole even when other windows cover it; the answer says when
+              it is covered on the screen (a click there would go to what is in front). --raise brings it to the
+              front first. A window that cannot be drawn this way (it draws nothing when asked, it does not
+              respond, or Windows scales it for the display) is cut out of the screen instead, and the answer
+              says so and why.
             """, ScreenshotAsync),
         new("click", "Desktop", "Click at a position of the latest screenshot",
             """
@@ -152,6 +161,7 @@ internal static partial class UiTools
         var windows = EnumerateWindows();
         var anyDisabled = false;
         var anyNoCapture = false;
+        var anyCovered = false;
 
         // Prompts Windows shows in windows of its own (firewall, UAC, credentials) are listed whatever the filter:
         // their top-level windows are often untitled or empty, and they are exactly what an agent must not miss.
@@ -185,6 +195,14 @@ internal static partial class UiTools
                 anyNoCapture = true;
             }
 
+            if (w.Visible && !w.Minimized && !w.Disabled && !w.Hung && !popup && w.Title.Length > 0 && w.Rect.Width > 1
+                && w.Class is not ("Progman" or "WorkerW") && !Cloaked(w.Hwnd) // the desktop is behind everything by nature; a cloaked window is not on the screen
+                && CoveredBy(w, 3, [w.Hwnd, .. OwnedBy(windows, w.Hwnd).Select(x => x.Hwnd)]).share >= 0.5)
+            {
+                state = (state + " covered").TrimStart();
+                anyCovered = true;
+            }
+
             var pos = w.Minimized ? "" : $"{w.Rect.Left},{w.Rect.Top} {w.Rect.Width}x{w.Rect.Height}";
             Row("0x" + ((long)w.Hwnd).ToString("X"), w.Pid, process, pos, state, w.Class, Format.Clip(w.Title.Length > 0 ? w.Title : $"[{w.Class}]", 90));
         }
@@ -192,10 +210,59 @@ internal static partial class UiTools
         ctx.Out.Write(t.Count > 0 ? t.ToString() : "no matching windows\n");
         if (prompts.Count > 0) ctx.Out.WriteLine("SYSTEM PROMPT = a dialog of Windows itself (see its title) is waiting for the person at this PC; whatever caused it waits until they answer. " + SystemPrompts.Effect);
         if (anyDisabled) ctx.Out.WriteLine("disabled = that window takes no mouse or keyboard input now, usually because a dialog that belongs to it is open: close the dialog first; `ui click` goes through UI Automation instead of the mouse where the control allows it, and may still work.");
+        if (anyCovered) ctx.Out.WriteLine("covered = most of that window is behind other windows on the screen: a screenshot of the screen or a click there gets what is in front. `focus <title>` brings it forward; `screenshot --window <title>` shows the window itself all the same.");
         if (anyNoCapture) ctx.Out.WriteLine("no-capture = that window keeps itself out of screen captures: the person at the PC sees it, a `screenshot` shows black or what is behind it there. `ui` still reads its controls.");
         if (SystemPrompts.SecureDesktopShowing())
             ctx.Out.WriteLine("The secure desktop is showing (a UAC prompt, the lock screen or Ctrl+Alt+Del): the windows above cannot be seen or clicked until the person there answers.");
         return Task.FromResult(0);
+    }
+
+    /// <summary>
+    /// The windows that belong to a window: the ones whose chain of owners leads to it (its dialogs and message
+    /// boxes, and theirs). Front to back, as Windows lists them.
+    /// </summary>
+    internal static List<WindowInfo> OwnedBy(List<WindowInfo> all, nint hwnd) => all.Where(x =>
+    {
+        var up = x.Hwnd;
+        for (var i = 0; i < 16 && up != 0; i++)
+        {
+            up = Win32.GetWindow(up, 4); // GW_OWNER
+            if (up == hwnd) return true;
+        }
+
+        return false;
+    }).ToList();
+
+    /// <summary>Not on the screen at all although it counts as visible: on another virtual desktop, or a suspended Store app.</summary>
+    internal static bool Cloaked(nint hwnd) => Win32.DwmGetWindowAttribute(hwnd, 14, out var cloaked, 4) == 0 && cloaked != 0; // DWMWA_CLOAKED
+
+    /// <summary>
+    /// How much of a window is behind other windows, by asking Windows what is in front at a grid of points
+    /// across it (the same question a click answers), and what those windows are. <paramref name="itself"/> are
+    /// the windows that count as the window: it and what belongs to it. Points outside the desktop are not
+    /// counted. Not for a disabled window: Windows skips one when it is asked what is at a point.
+    /// </summary>
+    internal static (double share, List<nint> inFront) CoveredBy(WindowInfo w, int grid, HashSet<nint> itself)
+    {
+        var (vx, vy, vw, vh) = (Win32.GetSystemMetrics(76), Win32.GetSystemMetrics(77), Win32.GetSystemMetrics(78), Win32.GetSystemMetrics(79));
+        var inFront = new List<nint>();
+        int asked = 0, covered = 0;
+        for (var row = 0; row < grid; row++)
+        {
+            for (var column = 0; column < grid; column++)
+            {
+                var x = w.Rect.Left + (int)(w.Rect.Width * (column + 0.5) / grid);
+                var y = w.Rect.Top + (int)(w.Rect.Height * (row + 0.5) / grid);
+                if (x < vx || y < vy || x >= vx + vw || y >= vy + vh) continue;
+                asked++;
+                var at = RootAt(x, y);
+                if (at == 0 || itself.Contains(at)) continue;
+                covered++;
+                if (!inFront.Contains(at)) inFront.Add(at);
+            }
+        }
+
+        return (asked == 0 ? 0 : (double)covered / asked, inFront);
     }
 
     /// <summary>
@@ -447,18 +514,156 @@ internal static partial class UiTools
         return ok ? pixels : null;
     }
 
+    /// <summary>
+    /// True when Windows scales the window for its display: a program that does not know about display scaling
+    /// (or about the scaling of this display) is drawn at one size and shown at another.
+    /// </summary>
+    private static bool ScaledByWindows(nint hwnd)
+    {
+        try
+        {
+            var monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
+            return monitor != 0 && Win32.GetDpiForMonitor(monitor, 0, out var shown, out _) == 0 && GetDpiForWindow(hwnd) is var own && own != 0 && own != shown;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false; // before Windows 10 1607: no per-window scaling to ask about
+        }
+    }
+
+    /// <summary>
+    /// A picture of windows as they draw themselves (PrintWindow with the full-content flag), put together at
+    /// their places inside <paramref name="area"/>: first the window asked for, then the ones that belong to it,
+    /// back to front. Nothing on the screen can cover them. Null when the first window drew nothing (or only
+    /// black); a later one that draws nothing is left out, and <paramref name="drawn"/> says how many are in.
+    /// </summary>
+    private static unsafe byte[]? CaptureWindows(RECT area, IReadOnlyList<WindowInfo> backToFront, int width, int height, out int drawn)
+    {
+        drawn = 0;
+        var screen = Win32.GetDC(0);
+        var canvasDc = Win32.CreateCompatibleDC(screen);
+        var canvas = Win32.CreateCompatibleBitmap(screen, area.Width, area.Height);
+        var outDc = Win32.CreateCompatibleDC(screen);
+        var outBitmap = Win32.CreateCompatibleBitmap(screen, width, height);
+        var oldCanvas = canvas != 0 ? Win32.SelectObject(canvasDc, canvas) : 0;
+        try
+        {
+            if (screen == 0 || canvasDc == 0 || canvas == 0 || outDc == 0 || outBitmap == 0) return null;
+            for (var i = 0; i < backToFront.Count; i++)
+            {
+                var w = backToFront[i];
+                if (w.Rect.Width <= 0 || w.Rect.Height <= 0) continue;
+                var dc = Win32.CreateCompatibleDC(screen);
+                var bitmap = Win32.CreateCompatibleBitmap(screen, w.Rect.Width, w.Rect.Height);
+                var ok = dc != 0 && bitmap != 0;
+                if (ok)
+                {
+                    var old = Win32.SelectObject(dc, bitmap);
+                    ok = PrintWindow(w.Hwnd, dc, 2) != 0; // PW_RENDERFULLCONTENT: also what the window draws with the GPU
+
+                    // A window that answers without drawing leaves its picture black. For the window asked for
+                    // that is "no picture"; one that belongs to it is then simply not in the picture.
+                    if (ok)
+                    {
+                        Win32.SelectObject(dc, old);
+                        var own = new byte[w.Rect.Width * w.Rect.Height * 4];
+                        var info = new BITMAPINFOHEADER { biSize = (uint)sizeof(BITMAPINFOHEADER), biWidth = w.Rect.Width, biHeight = -w.Rect.Height, biPlanes = 1, biBitCount = 32 };
+                        fixed (byte* q = own) ok = Win32.GetDIBits(dc, bitmap, 0, (uint)w.Rect.Height, q, &info, 0) != 0;
+                        if (ok)
+                        {
+                            ok = false;
+                            for (var k = 0; k + 2 < own.Length; k += 4)
+                            {
+                                if (own[k] == 0 && own[k + 1] == 0 && own[k + 2] == 0) continue;
+                                ok = true;
+                                break;
+                            }
+                        }
+
+                        old = Win32.SelectObject(dc, bitmap);
+                        if (ok) Win32.BitBlt(canvasDc, w.Rect.Left - area.Left, w.Rect.Top - area.Top, w.Rect.Width, w.Rect.Height, dc, 0, 0, 0x00CC0020); // SRCCOPY
+                    }
+
+                    Win32.SelectObject(dc, old);
+                }
+
+                if (bitmap != 0) Win32.DeleteObject(bitmap);
+                if (dc != 0) Win32.DeleteDC(dc);
+                if (ok) drawn++;
+                else if (i == 0) return null;
+            }
+
+            var oldOut = Win32.SelectObject(outDc, outBitmap);
+            if (width == area.Width && height == area.Height)
+            {
+                Win32.BitBlt(outDc, 0, 0, width, height, canvasDc, 0, 0, 0x00CC0020);
+            }
+            else
+            {
+                SetStretchBltMode(outDc, 4); // HALFTONE
+                StretchBlt(outDc, 0, 0, width, height, canvasDc, 0, 0, area.Width, area.Height, 0x00CC0020);
+            }
+
+            Win32.SelectObject(outDc, oldOut);
+            var pixels = new byte[width * height * 4];
+            var header = new BITMAPINFOHEADER { biSize = (uint)sizeof(BITMAPINFOHEADER), biWidth = width, biHeight = -height, biPlanes = 1, biBitCount = 32 };
+            fixed (byte* p = pixels)
+            {
+                if (Win32.GetDIBits(outDc, outBitmap, 0, (uint)height, p, &header, 0) == 0) return null;
+            }
+
+            return pixels;
+        }
+        finally
+        {
+            if (canvas != 0) Win32.SelectObject(canvasDc, oldCanvas);
+            if (canvas != 0) Win32.DeleteObject(canvas);
+            if (canvasDc != 0) Win32.DeleteDC(canvasDc);
+            if (outBitmap != 0) Win32.DeleteObject(outBitmap);
+            if (outDc != 0) Win32.DeleteDC(outDc);
+            if (screen != 0) Win32.ReleaseDC(0, screen);
+        }
+    }
+
     private static async Task<int> ScreenshotAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args);
+        var a = ArgParser.Parse(args, "raise");
         var monitors = Monitors();
         RECT area;
         string what;
+        List<WindowInfo>? itself = null; // --window: the window and the dialogs it owns, back to front
         if (a.Get("window") is { } spec)
         {
             var w = FindWindow(spec);
             if (w == null) return ctx.Fail($"screenshot: no window matches '{spec}' (see `windows`).");
-            if (w.Minimized) return ctx.Fail($"screenshot: \"{w.Title}\" is minimized. `focus` it first.");
+            var raise = a.Flag("raise");
+            if (raise && a.Has("thumb")) return ctx.Fail("screenshot: --raise is not for the dashboard's preview, which only looks.");
+            if (raise)
+            {
+                if (IsOwnWindow(w.Hwnd)) return ctx.Fail("screenshot: --raise does not bring agentprobe's own window on the target to the front.");
+                ctx.Runtime.Audit.Write($"screenshot --raise: bringing \"{Format.Clip(w.Title, 60)}\" to the front");
+                if (!BringToFront(w.Hwnd)) ctx.Err.WriteLine($"[screenshot: Windows refused to bring \"{Format.Clip(w.Title, 60)}\" to the front (an elevated window?)]");
+                w = EnumerateWindows().FirstOrDefault(x => x.Hwnd == w.Hwnd) ?? w; // it may have been restored: its place is new
+            }
+
+            if (w.Minimized) return ctx.Fail($"screenshot: \"{w.Title}\" is minimized{(raise ? " and Windows did not restore it" : ". `focus` it first, or add --raise")}.");
+
+            // The window with what belongs to it: its dialogs and message boxes are windows of their own, owned by
+            // it. Only the ones with a title (a shadow or a glow frame has none), on the desktop, and not so far
+            // away that the picture would be mostly empty.
             area = w.Rect;
+            var desk = new RECT { Left = Win32.GetSystemMetrics(76), Top = Win32.GetSystemMetrics(77) };
+            (desk.Right, desk.Bottom) = (desk.Left + Win32.GetSystemMetrics(78), desk.Top + Win32.GetSystemMetrics(79));
+            var owned = OwnedBy(EnumerateWindows(), w.Hwnd)
+                .Where(x => x.Visible && !x.Minimized && x.Title.Length > 0 && x.Rect.Width > 1 && !Cloaked(x.Hwnd)
+                            && x.Rect.Left >= desk.Left - 100 && x.Rect.Top >= desk.Top - 100 && x.Rect.Right <= desk.Right + 100 && x.Rect.Bottom <= desk.Bottom + 100)
+                .Reverse().ToList();
+            itself = [w, .. owned];
+            foreach (var x in owned)
+            {
+                area = new RECT { Left = Math.Min(area.Left, x.Rect.Left), Top = Math.Min(area.Top, x.Rect.Top), Right = Math.Max(area.Right, x.Rect.Right), Bottom = Math.Max(area.Bottom, x.Rect.Bottom) };
+            }
+
             what = $"window \"{Format.Clip(w.Title, 50)}\"";
         }
         else if (a.Has("display"))
@@ -488,7 +693,37 @@ internal static partial class UiTools
         var width = Math.Max(1, (int)(area.Width * scale));
         var height = Math.Max(1, (int)(area.Height * scale));
 
-        var pixels = Capture(area, width, height, scale < 1);
+        // A window is asked to draw itself, so that it comes out whole whatever lies in front of it. When it
+        // cannot, it is cut out of the screen, and the answer says which and why:
+        //  - it drew nothing, or only black (some windows do not draw this way);
+        //  - it is not responding (asking it would wait for it);
+        //  - Windows scales it for the display (an app that does not know about display scaling draws itself
+        //    smaller than it is shown, so the picture and the click coordinates would not fit the screen).
+        var fromScreen = itself == null;
+        var whyScreen = "";
+        var drawn = 0;
+        byte[]? pixels = null;
+        if (itself != null)
+        {
+            if (itself[0].Hung) whyScreen = "it is not responding, so it was not asked to draw itself";
+            else if (ScaledByWindows(itself[0].Hwnd)) whyScreen = "Windows scales that window for the display, and it would draw itself at another size than it is shown";
+            else if ((long)area.Width * area.Height > 80_000_000) whyScreen = "it is too large to be drawn off the screen";
+            else pixels = CaptureWindows(area, itself, width, height, out drawn);
+            if (pixels == null && whyScreen.Length == 0) whyScreen = "it drew nothing, or only black, when asked to draw itself";
+        }
+
+        if (pixels == null)
+        {
+            if (itself != null) area = itself[0].Rect; // the window's own place on the screen, nothing more
+            (width, height) = (Math.Max(1, (int)(area.Width * scale)), Math.Max(1, (int)(area.Height * scale)));
+            fromScreen = true;
+            pixels = Capture(area, width, height, scale < 1);
+        }
+        else if (drawn > 1)
+        {
+            what += $" with {drawn - 1} window{(drawn == 2 ? "" : "s")} that belong{(drawn == 2 ? "s" : "")} to it ({string.Join(", ", itself!.Skip(1).Take(3).Select(x => "\"" + Format.Clip(x.Title, 30) + "\""))})";
+        }
+
         if (pixels == null) return ctx.Fail("screenshot: capture failed (secure desktop such as UAC or the lock screen is showing?).");
 
         var file = Path.Combine(Path.GetTempPath(), $"{AppInfo.Name}-shot-{Guid.NewGuid():N}.png");
@@ -504,16 +739,47 @@ internal static partial class UiTools
             (_shotX, _shotY, _shotScale) = (area.Left, area.Top, scale); // click coordinates follow the agent's own screenshots only
             ctx.Runtime.Audit.Write($"screenshot of {what}");
             ctx.Out.WriteLine($"{width}x{height} PNG of {what}" + (scale < 1 ? $" at {scale:0.##}x" : "") + "; click/drag take coordinates in this image");
+            if (itself != null)
+            {
+                // What is in front of it on the screen. A disabled window cannot be asked about (Windows skips
+                // it at a point), and one that is cloaked is not on the screen in the first place.
+                var main = itself[0];
+                var known = !main.Disabled && !Cloaked(main.Hwnd);
+                var (share, inFront) = known ? CoveredBy(main, 6, [.. itself.Select(x => x.Hwnd)]) : (0, []);
+                if (fromScreen)
+                {
+                    ctx.Out.WriteLine($"This is that part of the SCREEN, not the window drawn by itself: {whyScreen}." +
+                                      (inFront.Count > 0 ? $" {string.Join(", ", inFront.Take(3).Select(Describe))} lie{(inFront.Count == 1 ? "s" : "")} in front of it there and {(inFront.Count == 1 ? "is" : "are")} in the picture (`focus`, or --raise, brings the window forward)." : ""));
+                }
+                else if (Cloaked(main.Hwnd))
+                {
+                    ctx.Out.WriteLine("The picture is the window as it draws itself. It is NOT ON THE SCREEN now (another virtual desktop, or an app Windows has suspended): the person at the PC does not see it.");
+                }
+                else if (main.Disabled)
+                {
+                    ctx.Out.WriteLine("The picture is the window as it draws itself. The window is disabled now (a dialog that belongs to it is open?), so what lies in front of it on the screen could not be asked: `windows` shows what is open.");
+                }
+                else if (inFront.Count > 0)
+                {
+                    ctx.Out.WriteLine($"The picture is the window as it draws itself. ON THE SCREEN about {Math.Round(share * 100)}% of it is behind {string.Join(", ", inFront.Take(3).Select(Describe))}" +
+                                      (inFront.Count > 3 ? $" and {inFront.Count - 3} more" : "") +
+                                      ": the person at the PC does not see all of this, and a click there goes to what is in front (`click --window <title> --raise`).");
+                }
+
+                if (!fromScreen && SystemPrompts.SecureDesktopShowing())
+                    ctx.Out.WriteLine("The target shows its secure desktop now (a UAC prompt, the lock screen or Ctrl+Alt+Del): the person there does not see this window at all, and nothing on it can be clicked.");
+            }
 
             // A window may keep itself out of captures: the image then differs from what the person at the PC
             // sees, and nothing in the image says so.
             var unseen = EnumerateWindows().Where(w => w.CaptureAffinity != 0 && w.Visible && !w.Minimized && w.Pid != Environment.ProcessId
+                                                       && (fromScreen || itself!.Any(x => x.Hwnd == w.Hwnd)) // a window that drew itself is not hidden by another one's wish
                                                        && w.Rect.Width > 1 && w.Rect.Right > area.Left && w.Rect.Left < area.Right && w.Rect.Bottom > area.Top && w.Rect.Top < area.Bottom
                                                        && !(Win32.DwmGetWindowAttribute(w.Hwnd, 14, out var cloaked, 4) == 0 && cloaked != 0)).ToList(); // DWMWA_CLOAKED: on another desktop
             if (unseen.Count > 0)
             {
                 ctx.Out.WriteLine("NOT in this image as the person at the PC sees it: " + string.Join("; ", unseen.Take(6).Select(w =>
-                                      $"{Describe(w.Hwnd)} at {w.Rect.Left},{w.Rect.Top} {w.Rect.Width}x{w.Rect.Height} ({(w.CaptureAffinity == 1 ? "shown black" : "left out: what is behind it shows")})")) +
+                                      $"{Describe(w.Hwnd)} at {w.Rect.Left},{w.Rect.Top} {w.Rect.Width}x{w.Rect.Height} ({(w.CaptureAffinity == 1 || !fromScreen ? "shown black" : "left out: what is behind it shows")})")) +
                                   (unseen.Count > 6 ? $" (+{unseen.Count - 6} more)" : "") +
                                   ". Those windows keep themselves out of screen captures; `ui <title>` reads their controls.");
             }
@@ -1025,6 +1291,15 @@ internal static partial class UiTools
 
     [LibraryImport("kernel32.dll")]
     private static partial nint GetConsoleWindow();
+
+    [LibraryImport("user32.dll")]
+    private static partial int PrintWindow(nint hwnd, nint hdc, uint flags);
+
+    [LibraryImport("user32.dll")]
+    private static partial nint MonitorFromWindow(nint hwnd, uint flags);
+
+    [LibraryImport("user32.dll")]
+    private static partial uint GetDpiForWindow(nint hwnd);
 
     [LibraryImport("user32.dll")]
     private static partial int PostMessageW(nint hwnd, uint message, nint wParam, nint lParam);

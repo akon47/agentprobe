@@ -165,6 +165,15 @@ internal static class SessionTools
         var remove = a.Flag("remove-exe");
         ctx.Runtime.Audit.Write("session ended by the developer PC" + (remove ? " (removing the exe)" : ""));
         ctx.Out.WriteLine("session ended: jobs stopped, workspace removed" + (remove ? ", exe deleted" : "") + $". Activity log kept on the target: {ctx.Runtime.Audit.FilePath}");
+
+        // What the session cannot take back: firewall rules Windows made for programs that ran from the workspace.
+        if (ctx.Runtime.HasWorkDir && FirewallTools.Leftovers(ctx.Runtime, ctx.Runtime.WorkDir) is { Count: > 0 } rules)
+        {
+            var asked = rules.Count(r => r.Asked);
+            ctx.Out.WriteLine($"{rules.Count} Windows Firewall rule{(rules.Count == 1 ? "" : "s")} for programs of this session's workspace stay on that PC ({string.Join(", ", rules.Select(r => Path.GetFileName(r.Program)).Distinct(StringComparer.OrdinalIgnoreCase).Take(5))})" +
+                              (asked > 0 ? $"; Windows made {(asked == rules.Count ? "them" : $"{asked} of them")} when it asked about those programs" : "") +
+                              ". Removing them needs administrator rights: `firewall cleanup` in a later session on an elevated target.");
+        }
         _ = Task.Run(async () =>
         {
             await Task.Delay(400); // let this reply get out first
