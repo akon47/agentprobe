@@ -386,6 +386,12 @@ public static class CredPrompt {
     '{"runtimeOptions":{"configProperties":{}}}' | Set-Content (Join-Path $sc8 'App.runtimeconfig.json')
     $r = AP -t local deps (Join-Path $sc8 'App.exe')
     Check 'deps: a self-contained .NET app without its deps.json is reported (the host trap)' ($r.Code -eq 1 -and $r.Out -match '(?m)^HOST TRAP\s+App\.deps\.json is missing' -and $r.Out -match '0x80008081') $r.Out
+    $fxr11 = Get-ChildItem "$env:ProgramFiles\dotnet\host\fxr" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(\d+)\.' -and [int]$Matches[1] -ge 11 } | Select-Object -First 1
+    if ($fxr11) {
+        $sc11 = Join-Path $work 'selfcontained11'; Copy-Item $sc8 $sc11 -Recurse; Copy-Item (Join-Path $fxr11.FullName 'hostfxr.dll') (Join-Path $sc11 'hostfxr.dll') -Force
+        $r = AP -t local deps (Join-Path $sc11 'App.exe')
+        Check 'deps: with a .NET 11 host in the folder the missing deps.json is noted, not called a trap (that host starts the app)' ($r.Out -notmatch 'HOST TRAP' -and $r.Out -match 'no App\.deps\.json \(the \.NET \d+ host starts the app without it') $r.Out
+    }
     '{"runtimeTarget":{"name":".NETCoreApp,Version=v8.0/win-x64"},"targets":{".NETCoreApp,Version=v8.0/win-x64":{"App/1.0.0":{"runtime":{"there.dll":{}}},"Lib/2.0.0":{"runtime":{"lib/net8.0/NotThere.dll":{}},"native":{"coreclr.dll":{}}}}}}' | Set-Content (Join-Path $sc8 'App.deps.json')
     $r = AP -t local deps (Join-Path $sc8 'App.exe')
     Check 'deps: files the deps.json lists are checked against the folder; no host trap once it is there' ($r.Code -eq 1 -and $r.Out -notmatch 'HOST TRAP' -and $r.Out -match '(?m)^MISSING\s+1 of the 3 files that App\.deps\.json lists is not in the app''s folder: NotThere\.dll \(Lib/2\.0\.0\)') $r.Out
@@ -831,8 +837,10 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
                 $sdk = if (Get-Command dotnet -ErrorAction SilentlyContinue) { (& dotnet --version 2>$null | Select-Object -First 1) }
                 $built = $false
                 if ("$sdk" -match '^(\d+)\.') {
+                    # The .NET 11 host no longer has the trap these checks are about: the app is built for .NET 10 at most.
+                    $tfm = "net$([Math]::Min([int]$Matches[1], 10)).0"
                     $src = Join-Path $work 'hostapp-src'; $app = Join-Path $work 'hostapp'; New-Item -ItemType Directory $src | Out-Null
-                    "<Project Sdk=`"Microsoft.NET.Sdk`"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net$($Matches[1]).0</TargetFramework><RuntimeIdentifier>win-x64</RuntimeIdentifier><SelfContained>true</SelfContained><AssemblyName>ApHostApp</AssemblyName></PropertyGroup></Project>" | Set-Content "$src\hostapp.csproj"
+                    "<Project Sdk=`"Microsoft.NET.Sdk`"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>$tfm</TargetFramework><RuntimeIdentifier>win-x64</RuntimeIdentifier><SelfContained>true</SelfContained><AssemblyName>ApHostApp</AssemblyName></PropertyGroup></Project>" | Set-Content "$src\hostapp.csproj"
                     'System.Console.WriteLine("ap-host-app ran"); return 7;' | Set-Content "$src\Program.cs"
                     & dotnet publish "$src\hostapp.csproj" -c Release -o $app --nologo -v q 2>&1 | Out-Null
                     $built = (Test-Path "$app\ApHostApp.exe") -and (Test-Path "$app\ApHostApp.deps.json")

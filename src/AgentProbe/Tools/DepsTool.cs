@@ -332,10 +332,13 @@ internal static partial class DepsTool
             {
                 // fx_muxer.cpp, detect_operating_mode: with coreclr next to the host and no <app>.deps.json there, an
                 // <app>.runtimeconfig.json in the CURRENT folder makes the host run in "split/FX" mode, in which
-                // the exe is not an app. Reproduced with the .NET 8 host; the same code is in the 9 and 10 hosts.
+                // the exe is not an app. Reproduced with the .NET 8 and 10 hosts; the same code is in the 9 host.
+                // The .NET 11 host no longer does this: it was seen to start such an app from its own folder.
                 var major = int.TryParse(hostVersion?.Split('.')[0], out var m) ? m : 0;
                 var known = major is >= 8 and <= 10 ? "" : $" (seen with the .NET 8, 9 and 10 hosts; this folder has host {hostVersion ?? "of unknown version"}: `deps <exe> --run` shows what it does)";
-                problems.Add($"HOST TRAP   {appName}.deps.json is missing while the folder has its own runtime (coreclr.dll) and {appName}.runtimeconfig.json{known}.\n" +
+                if (major >= 11)
+                    depsNote += $" (the .NET {major} host starts the app without it; hosts up to .NET 10 do not, from the app's own folder)";
+                else problems.Add($"HOST TRAP   {appName}.deps.json is missing while the folder has its own runtime (coreclr.dll) and {appName}.runtimeconfig.json{known}.\n" +
                              $"            The .NET host then starts the app only when the working folder is NOT the app's folder. Started from its own\n" +
                              $"            folder (a double-click, a shortcut that starts in that folder, `start --exe` without --cwd) it ends with\n" +
                              $"            0x80008081: no window, no log, nothing in the event log.\n" +
