@@ -233,14 +233,19 @@ internal sealed class JobManager(TargetRuntime runtime)
     private readonly List<Job> _jobs = [];
     private int _nextId;
 
-    public Job Start(string shell, string command, string cwd, string? name, IReadOnlyList<string>? fileArgs = null) =>
-        Track(Shell.Build(shell, command, cwd, runtime, fileArgs), command, name);
+    public Job Start(string shell, string command, string cwd, string? name, IReadOnlyList<string>? fileArgs = null, IReadOnlyList<(string name, string value)>? env = null)
+    {
+        var psi = Shell.Build(shell, command, cwd, runtime, fileArgs);
+        Apply(psi, env);
+        return Track(psi, command, name);
+    }
 
     /// <summary>
     /// Starts a program itself, without a shell in between, so the job IS that program: its pid, its exit code,
     /// and <c>kill</c> ends it. A GUI app started through a shell is not waited for, and the job would end at once.
     /// </summary>
-    public Job StartExe(string exe, IReadOnlyList<string> args, string? cwd, string? name)
+    /// <param name="rawArguments">Arguments as one command-line string (what a shortcut holds); <paramref name="args"/> follow them.</param>
+    public Job StartExe(string exe, IReadOnlyList<string> args, string? cwd, string? name, IReadOnlyList<(string name, string value)>? env = null, string? rawArguments = null)
     {
         var psi = new ProcessStartInfo(exe)
         {
@@ -251,8 +256,48 @@ internal sealed class JobManager(TargetRuntime runtime)
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
-        foreach (var a in args) psi.ArgumentList.Add(a);
-        return Track(psi, (exe + " " + string.Join(' ', args)).TrimEnd(), name);
+        if (string.IsNullOrWhiteSpace(rawArguments))
+        {
+            foreach (var a in args) psi.ArgumentList.Add(a);
+        }
+        else
+        {
+            psi.Arguments = (rawArguments.Trim() + " " + string.Join(' ', args.Select(QuoteArgument))).TrimEnd();
+        }
+
+        Apply(psi, env);
+        var shown = string.IsNullOrWhiteSpace(rawArguments) ? string.Join(' ', args) : psi.Arguments;
+        return Track(psi, (exe + " " + shown).TrimEnd(), name);
+    }
+
+    private static void Apply(ProcessStartInfo psi, IReadOnlyList<(string name, string value)>? env)
+    {
+        if (env == null) return;
+        foreach (var (name, value) in env) psi.Environment[name] = value;
+    }
+
+    /// <summary>One argument as Windows programs read their command line (quotes and the backslashes before them escaped).</summary>
+    public static string QuoteArgument(string a)
+    {
+        const char quote = '"';
+        const char backslash = '\\';
+        if (a.Length > 0 && a.IndexOfAny([' ', '\t', quote]) < 0) return a;
+        var sb = new StringBuilder().Append(quote);
+        var slashes = 0;
+        foreach (var c in a)
+        {
+            if (c == backslash)
+            {
+                slashes++;
+                continue;
+            }
+
+            sb.Append(backslash, c == quote ? (slashes * 2) + 1 : slashes);
+            slashes = 0;
+            sb.Append(c);
+        }
+
+        return sb.Append(backslash, slashes * 2).Append(quote).ToString();
     }
 
     private Job Track(ProcessStartInfo psi, string command, string? name)
@@ -318,13 +363,23 @@ internal static class ExecTools
             """, ExecAsync),
         new("start", "Run", "Start a long-running command in the background",
             """
-            start [--name NAME] [--shell ..] [--cwd DIR] <command>
-            start [--name NAME] [--cwd DIR] --exe <path> [args]
+            start [--name NAME] [--shell ..] [--cwd DIR] [--env NAME=VALUE]... <command>
+            start [--name NAME] [--cwd DIR] [--env NAME=VALUE]... --exe <path> [arguments for the program]
+            start [--name NAME] [--cwd DIR] [--env NAME=VALUE]... --lnk <shortcut.lnk> [more arguments]
               Returns a job id. The job keeps running if the connection drops. Read it with `logs`, stop it with `kill`.
               --exe starts the program itself, with no shell in between: use it for an app with a window. The job
-              is then that app (its pid, its exit code with crash codes named, `kill <job>` closes it, `wait --job`
-              waits for it), and it starts in its own folder unless --cwd says otherwise. Started as a <command>
-              instead, a GUI app is not waited for and the job ends at once while the app runs on untracked.
+              is then that app (its pid, its exit code with crash codes and .NET host errors named, `kill <job>`
+              closes it, `wait --job` waits for it), and it starts in its own folder unless --cwd says otherwise.
+              Started as a <command> instead, a GUI app is not waited for and the job ends at once while the app
+              runs on untracked.
+              EVERYTHING after the --exe path goes to the program as its arguments, words that look like options
+              included: --name, --cwd and --env belong BEFORE --exe.
+              --lnk starts what a shortcut starts: its target with its arguments in its "Start in" folder, the way
+              the person at the PC starts the app from the desktop or the Start menu. `stat <shortcut.lnk>` shows
+              those three without starting anything.
+              --env sets an environment variable for the job; repeat it for more (--env COREHOST_TRACE=1).
+              The answer names the folder the job started in (cwd=): an app can behave differently from another
+              folder. A program started with --exe or --lnk that is gone within moments is reported with its exit code.
             """, StartAsync),
         new("jobs", "Run", "List background jobs", "jobs", JobsAsync) { Quiet = true },
         new("logs", "Run", "Output of a background job (only what is new since the last call)",
@@ -378,7 +433,7 @@ internal static class ExecTools
             if (errorText.Length > 0) ctx.Err.Write(new Squeezer().Apply(errorText));
 
             // A crash exit code reads better with its meaning next to it.
-            if ((uint)code >= 0xC0000000) ctx.Err.WriteLine($"[exit code {Native.ProcessDetails.ExitCodeName((uint)code)}]");
+            if (Native.ProcessDetails.IsFailureCode((uint)code)) ctx.Err.WriteLine($"[exit code {Native.ProcessDetails.ExitCodeName((uint)code)}]");
             SystemPrompts.Warn(ctx.Err);
             return code;
         }
@@ -393,37 +448,96 @@ internal static class ExecTools
         return StartCoreAsync(ctx, args);
     }
 
+    /// <summary><c>--env NAME=VALUE</c>, any number of times. Null (after saying why) when one of them is not of that form.</summary>
+    public static List<(string name, string value)>? ParseEnv(ToolContext ctx, string tool, ArgParser a)
+    {
+        var env = new List<(string, string)>();
+        foreach (var pair in a.GetAll("env"))
+        {
+            var eq = pair.IndexOf('=');
+            if (eq <= 0)
+            {
+                ctx.Fail($"{tool}: --env wants NAME=VALUE, got '{pair}'.");
+                return null;
+            }
+
+            env.Add((pair[..eq], pair[(eq + 1)..]));
+        }
+
+        return env;
+    }
+
     private static async Task<int> StartCoreAsync(ToolContext ctx, string[] args)
     {
         var a = ArgParser.Parse(args, "as-file");
         var cwd = a.Get("cwd") is { } c ? ctx.Runtime.ResolvePath(c) : null;
+        if (cwd != null && !Directory.Exists(cwd)) return ctx.Fail($"start: the folder {cwd} does not exist on the target.");
+        var env = ParseEnv(ctx, "start", a);
+        if (env == null) return 2;
+        var envNote = env.Count > 0 ? "  env: " + string.Join(' ', env.Select(e => $"{e.name}={Format.Clip(e.value, 60)}")) : "";
         try
         {
             Job job;
-            if (a.Get("exe") is { } exe)
+            var direct = a.Has("exe") || a.Has("lnk"); // the job is the program itself, not a shell
+            if (a.Get("lnk") is { } lnk)
+            {
+                var shortcut = ctx.Runtime.ResolvePath(lnk);
+                if (!File.Exists(shortcut)) return ctx.Fail($"start: {shortcut} does not exist on the target.");
+                var link = Native.ShellLink.Read(shortcut, out var why);
+                if (link == null) return ctx.Fail($"start: cannot read the shortcut {shortcut}: {why}.");
+                if (link.Target.Length == 0)
+                    return ctx.Fail($"start: the shortcut {shortcut} does not point to a file (a Store app, a web link or a shell folder): nothing was started.");
+                if (link.Advertised)
+                    return ctx.Fail($"start: {shortcut} is a shortcut made by Windows Installer: it holds no program path (Windows works it out when the shortcut is used), so nothing was started. Give the program itself: start --exe <path>.");
+                if (!File.Exists(link.Target))
+                    return ctx.Fail($"start: the shortcut {shortcut} points to {link.Target}, which does not exist on the target: nothing was started.");
+                if (!link.Target.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    return ctx.Fail($"start: the shortcut {shortcut} points to {link.Target}, which is not a program (.exe): nothing was started.");
+
+                // Explorer starts a shortcut that names no "Start in" folder in a folder of its own choosing; here
+                // it is the program's folder, and the answer says so.
+                var startIn = cwd ?? (link.WorkingDirectory.Length > 0 ? link.WorkingDirectory : null);
+                if (startIn != null && !Directory.Exists(startIn))
+                    return ctx.Fail($"start: the shortcut's \"Start in\" folder {startIn} does not exist on the target: nothing was started.");
+                job = ctx.Runtime.Jobs.StartExe(link.Target, a.Positionals, startIn, a.Get("name"), env, link.Arguments);
+                var folderNote = cwd != null ? " (--cwd, not the shortcut's)"
+                    : link.WorkingDirectory.Length > 0 ? " (the shortcut's \"Start in\")"
+                    : " (the shortcut names no \"Start in\" folder: the program's own folder was used, Explorer may use another)";
+                var shownArgs = job.Process.StartInfo.Arguments is { Length: > 0 } raw ? raw : string.Join(' ', a.Positionals.Select(JobManager.QuoteArgument));
+                ctx.Runtime.Audit.Write($"start --lnk: {shortcut} starts {link.Target}{(shownArgs.Length > 0 ? " " + Format.Clip(shownArgs, 200) : "")} in {job.Process.StartInfo.WorkingDirectory} (job {job.Id}, pid {job.Pid})");
+                ctx.Out.WriteLine($"job {job.Id} started (pid {job.Pid}): {Path.GetFileName(link.Target)}  cwd={job.Process.StartInfo.WorkingDirectory}{folderNote}");
+                ctx.Out.WriteLine($"  shortcut target {link.Target}" + (shownArgs.Length > 0 ? "  args: " + Format.Clip(shownArgs, 200) : "") + envNote);
+            }
+            else if (a.Get("exe") is { } exe)
             {
                 var path = ctx.Runtime.ResolvePath(exe);
                 if (!File.Exists(path)) return ctx.Fail($"start: {path} does not exist on the target.");
-                job = ctx.Runtime.Jobs.StartExe(path, a.Positionals, cwd, a.Get("name"));
-                ctx.Out.WriteLine($"job {job.Id} started (pid {job.Pid}): {Path.GetFileName(path)}");
+                job = ctx.Runtime.Jobs.StartExe(path, a.Positionals, cwd, a.Get("name"), env);
+                ctx.Out.WriteLine($"job {job.Id} started (pid {job.Pid}): {Path.GetFileName(path)}  cwd={job.Process.StartInfo.WorkingDirectory}" +
+                                  (a.Positionals.Count > 0 ? "  args: " + Format.Clip(string.Join(' ', a.Positionals.Select(JobManager.QuoteArgument)), 200) : "") + envNote);
             }
             else
             {
                 var command = a.Get("script") ?? string.Join(' ', a.Positionals);
                 if (string.IsNullOrWhiteSpace(command)) return ctx.Fail("start: no command given.");
-                job = ctx.Runtime.Jobs.Start(a.Get("shell") ?? "powershell", command, cwd ?? ctx.Runtime.WorkDir, a.Get("name"), a.Flag("as-file") ? a.Positionals : null);
-                ctx.Out.WriteLine($"job {job.Id} started (pid {job.Pid})");
+                job = ctx.Runtime.Jobs.Start(a.Get("shell") ?? "powershell", command, cwd ?? ctx.Runtime.WorkDir, a.Get("name"), a.Flag("as-file") ? a.Positionals : null, env);
+                ctx.Out.WriteLine($"job {job.Id} started (pid {job.Pid})  cwd={job.Process.StartInfo.WorkingDirectory}{envNote}");
             }
 
             // A shell that only launched something is done within moments: say so now, instead of leaving a job
-            // that looks like the app but is not.
+            // that looks like the app but is not. A program that was started itself and is gone within moments
+            // did not start: its exit code is the first clue, so it is given right away.
             // (The process is asked directly: the job's own exit code is set only after its output has been read,
             // and an app the shell launched keeps that output open.)
-            if (!a.Has("exe")) await Task.WhenAny(job.Process.WaitForExitAsync(ctx.Ct), Task.Delay(2500, ctx.Ct));
-            if (!a.Has("exe") && job.Process.HasExited)
+            await Task.WhenAny(job.Process.WaitForExitAsync(ctx.Ct), Task.Delay(direct ? 1500 : 2500, ctx.Ct));
+            if (job.Process.HasExited)
             {
-                ctx.Err.WriteLine($"[job {job.Id} already ended with exit {Native.ProcessDetails.ExitCodeName((uint)job.Process.ExitCode)}. If it launched an app with a window, the app is NOT this job: " +
-                                  "start it with `start --exe <path> [args]` to track the app itself.]");
+                var code = Native.ProcessDetails.ExitCodeName((uint)job.Process.ExitCode);
+                ctx.Err.WriteLine(direct
+                    ? $"[job {job.Id} already ended with exit {code}. `logs {job.Id}` shows what it wrote" +
+                      (job.Process.ExitCode == 0 ? ".]" : "; if that explains nothing: `deps <exe>`, and `deps <exe> --run` for a .NET app.]")
+                    : $"[job {job.Id} already ended with exit {code}. If it launched an app with a window, the app is NOT this job: " +
+                      "start it with `start --exe <path> [args]` to track the app itself.]");
             }
 
             SystemPrompts.Warn(ctx.Err);

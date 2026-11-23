@@ -124,16 +124,16 @@ MCP의 도구 정의는 매 턴마다 에이전트의 컨텍스트를 차지하�
 
 | 영역 | 명령 |
 |---|---|
-| 실행 | `exec` (PowerShell, pwsh, 32비트 PowerShell, cmd. `exec -f script.ps1 -Arg 값`은 스크립트를 인자와 함께 보냄), 백그라운드 작업 `start` / `jobs` / `logs` / `kill` (`start --exe app.exe`는 GUI 앱 자체를 작업으로 추적), 프로세스·창·포트·파일·로그 줄·CPU 유휴를 기다리는 `wait` |
-| 파일 | `push`, `pull` (파일과 폴더), `ls`, `read` (tail, grep, 줄 범위, 새 줄만), `stat` (버전, x86/x64, .NET 여부, SHA-256, 인터넷 다운로드 차단 표시), `locks` (파일을 잡고 있는 프로세스) |
-| 첫 진단 | `triage`: 부하, 응답 없는 창, 최근 크래시와 오류, 디스크 부족, 재부팅 대기, 그리고 다음에 볼 것 |
-| 프로세스 | `ps`, `top`, `proc`, `threads` (스레드별 CPU, 대기 이유, 시작 모듈), `stacks` (실행 중인 프로세스의 콜스택, 같은 스택끼리 묶음), `modules` (로드된 DLL의 버전과 경로), `handles` (종류별 개수와 증가분), `vmmap` (어떤 종류의 메모리가 늘어나는지: 힙, 스택, 이미지, 매핑 파일), `heap` (.NET 객체를 형식별로 세고, 원하면 아직 참조되는 것만 세며, 살아 있는 창 객체와 그중 화면에 떠 있는 개수, 하나를 살려 두는 참조 경로를 보여 줌. 테스트할 PC에서 스냅샷으로 읽음), `dump` (소형 또는 전체 메모리 덤프를 개발 PC로 가져오거나 그 PC에 남김) |
+| 실행 | `exec` (PowerShell, pwsh, 32비트 PowerShell, cmd. `exec -f script.ps1 -Arg 값`은 스크립트를 인자와 함께 보냄), 백그라운드 작업 `start` / `jobs` / `logs` / `kill` (`start --exe app.exe`는 GUI 앱 자체를 작업으로 추적, `start --lnk`는 바로가기가 실행하는 그대로 실행, `--env 이름=값`으로 환경 변수 지정), 프로세스·창·포트·파일·로그 줄·CPU 유휴를 기다리는 `wait` |
+| 파일 | `push`, `pull` (파일과 폴더), `ls`, `read` (tail, grep, 줄 범위, 로그의 시간 구간, 새 줄만), `stat` (버전, x86/x64, .NET 여부, SHA-256, 인터넷 다운로드 차단 표시, 바로가기가 실행하는 것), `locks` (파일을 잡고 있는 프로세스) |
+| 첫 진단 | `triage`: 부하, 응답 없는 창, 최근 크래시와 오류, 디스크 부족, 재부팅 대기, 그리고 다음에 볼 것. 실행 중이 아닌 앱은 설치된 위치와 실행 방법을 알려 줌 |
+| 프로세스 | `ps`, `top`, `proc`, `threads` (스레드별 CPU, 대기 이유, 이름, 만든 시각, 시작 모듈. 이름별 스레드 수), `stacks` (실행 중인 프로세스의 콜스택, 같은 스택끼리 묶음), `modules` (로드된 DLL의 버전과 경로), `handles` (종류별 개수와 증가분), `vmmap` (어떤 종류의 메모리가 늘어나는지: 힙, 스택, 이미지, 매핑 파일), `heap` (.NET 객체를 형식별로 세고, 원하면 아직 참조되는 것만 세며, 살아 있는 창 객체와 그중 화면에 떠 있는 개수, 하나를 살려 두는 참조 경로, 객체의 필드 값을 보여 줌. 테스트할 PC에서 스냅샷으로 읽음), `dump` (소형 또는 전체 메모리 덤프를 개발 PC로 가져오거나 그 PC에 남김) |
 | 시스템 | `sys` (OS 빌드, 하드웨어, 로캘, GPU 드라이버, 디스플레이, .NET·VC++ 런타임), `mem` (커밋, 풀, 대기 목록, 메모리를 많이 쓰는 프로그램), `net` (리스닝 포트, 프로세스별 연결, 도달 가능 여부), `svc`, `reg`, `firewall` (올린 프로그램이 세션 동안 연결을 받도록 허용하거나, Windows 방화벽 창을 닫음) |
-| 왜 그 PC만? | `compare <pc> local` (OS, 드라이버, 런타임, 환경 변수, PATH, 설치 프로그램, 서비스, 파일의 차이), `envsnap --save/--diff` (설치 프로그램이나 업데이트가 바꾼 것), `deps` (없는 DLL, x86/x64 불일치, 없는 함수, 없는 .NET 런타임) |
+| 왜 그 PC만? | `compare <pc> local` (OS, 드라이버, 런타임, 환경 변수, PATH, 설치 프로그램, 서비스, 파일의 차이), `envsnap --save/--diff` (설치 프로그램이나 업데이트가 바꾼 것), `deps` (없는 DLL, x86/x64 불일치, 없는 함수, 없는 .NET 런타임. .NET 앱은 호스트가 필요로 하는 것도 확인: 앱 DLL, `.deps.json`과 거기 적힌 파일. `deps --run`은 호스트 추적을 켜고 한 번 실행해 호스트가 왜 포기했는지 알려 줌) |
 | 로그 | `events` (Windows 이벤트 로그, 필터·중복 제거), `crashes` (문제 모듈, 예외 코드, 덤프 파일, 블루스크린), `dbg` (OutputDebugString 캡처, DebugView 역할) |
 | 모니터링 | `watch`: 프로세스별 private 바이트, 핸들, GDI/USER 개체, 스레드, CPU의 증가율과 누수 판정. 지켜보는 프로세스와 그 프로세스가 띄운 것의 시작·종료(종료 코드 해석 포함), 모든 크래시, 응답을 멈춘 창. Windows가 자기 도우미 프로세스를 띄우고 닫는 잡음은 건수만 표시 |
 | 캡처 | `trace` (프로세스의 파일·레지스트리 접근 중 실패한 것만 집계: Process Monitor에서 가장 쓸모 있는 화면을 짧은 표로), `crashdumps on` (앱이 죽을 때마다 Windows가 덤프 저장), `wpr start/stop` (Windows Performance Recorder 추적: CPU, 디스크, 파일, 레지스트리, 힙) |
-| 화면 | `ui` (창의 컨트롤을 글자로 읽고, 이름으로 누르고 읽고 채움), `windows` (사람의 응답을 기다리는 Windows 프롬프트와 열려 있는 메뉴도 표시: 방화벽, UAC, 자격 증명), `screenshot` (전체, 모니터, 창 하나, 축소), `click`, `drag`, `scroll`, `type`, `key`, `focus` |
+| 화면 | `ui` (창의 컨트롤을 선택·체크·펼침 상태와 함께 글자로 읽고, 이름으로 누르고 터치하고 읽고 채움), `windows` (사람의 응답을 기다리는 Windows 프롬프트와 열려 있는 메뉴도 표시: 방화벽, UAC, 자격 증명), `screenshot` (전체, 모니터, 창 하나, 축소), `click` (클릭을 받은 창을 알려 주고, 지정한 창을 다른 창이 가리고 있으면 누르지 않음), `touch` (손가락처럼 탭, 길게 누르기, 끌기. 터치 화면이 없는 PC에서도 동작), `drag`, `scroll`, `type`, `key`, `focus` |
 | 세션 | `list`, `dashboard`, `name`, `history`, `result`, `reboot --wait`, `end` |
 
 `agentprobe help`가 전체 목록을, `agentprobe help <명령>`이 옵션을 보여 줍니다.
@@ -164,6 +164,7 @@ agentprobe dump MyApp --full -o .\dumps\       # WinDbg / Visual Studio / dotnet
 
 - `agentprobe name -t LAB-PC07 gpu-rig`로 PC에 짧은 이름을 붙입니다. 이름은 개발 PC에 기억됩니다.
   테스트할 PC 쪽에서 `agentprobe share --name gpu-rig`로 스스로 이름을 정할 수도 있습니다.
+  `agentprobe share --minimized`는 개발 PC가 연결되면 자기 창을 작업 표시줄로 내려, 테스트할 앱을 가리지 않게 합니다.
 - `-t gpu-rig`, `-t a,b,c`, `-t "LAB-*"`, `-t all`. 여러 대를 지정하면 같은 결과끼리 묶입니다.
   ```
   == 47 targets (exit 0): LAB-PC01, LAB-PC02, ... +35 more

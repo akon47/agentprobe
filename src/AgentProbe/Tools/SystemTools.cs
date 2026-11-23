@@ -386,7 +386,36 @@ internal static partial class SystemTools
         {
             var matches = ProcessTools.Find(procs, args[0]);
             o.WriteLine();
-            if (matches.Count == 0) o.WriteLine($"process  '{args[0]}' is NOT running");
+            if (matches.Count == 0)
+            {
+                // No process to look at: the next step is to start it and read what comes back, so say where it is.
+                o.WriteLine($"process  '{args[0]}' is NOT running");
+                var installs = AppLocator.Find(args[0], out var searchCut);
+                foreach (var i in installs)
+                {
+                    o.WriteLine($"  {(i.Exact ? "found " : "maybe ")} {i.Exe}  ({i.Source})" + (i.Shortcut != null
+                        ? $"\n         started by {i.Shortcut}" + (string.IsNullOrEmpty(i.StartIn) ? "" : $", in {i.StartIn}")
+                        : ""));
+                }
+
+                if (installs.Count > 0)
+                {
+                    var first = installs[0];
+                    findings.Add($"'{args[0]}' is not running. " + (first.Exact ? "Start it" : $"If {Path.GetFileName(first.Exe)} above is the app (it was found by a name that only contains '{args[0]}'), start it") +
+                                 " and read its exit code: " +
+                                 (first.Shortcut != null ? $"`start --lnk \"{first.Shortcut}\"` (as the person at the PC does), or " : "") +
+                                 $"`start --exe \"{first.Exe}\"`. If it ends at once: `deps \"{first.Exe}\"`, then `crashes` and `events`" +
+                                 (searchCut != null ? $". ({searchCut})" : ""));
+                }
+                else
+                {
+                    findings.Add($"'{args[0]}' is not running, and " + (searchCut != null
+                                     ? $"the search for where it is installed did not get far ({searchCut}): "
+                                     : "nothing by that name was found in App Paths, the installed programs or the desktop and Start menu shortcuts: ") +
+                                 "give its path to `start --exe <path>` (read the exit code) and `deps <path>`");
+                }
+            }
+
             foreach (var p in matches.OrderByDescending(p => p.PrivateBytes).Take(5))
             {
                 var h = ProcessDetails.Open(p.Pid);

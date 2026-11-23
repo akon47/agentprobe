@@ -30,9 +30,16 @@ internal static partial class ProcessTools
             """, ProcAsync) { Quiet = true },
         new("threads", "Processes", "Threads of a process with CPU use, state and start module (find the busy or stuck thread)",
             """
-            threads <pid|name> [--interval 1s] [--top 20]
-              CPU% per thread over the interval, plus state/wait reason. A hung UI with ~0% CPU everywhere is a
-              deadlock or blocking wait; one thread at 100/cores % is a busy loop. Follow up with `dump`.
+            threads <pid|name> [--interval 1s] [--top 20] [--grep REGEX] [--by-name]
+              CPU% per thread over the interval, plus state/wait reason, when the thread was created, its name and
+              the module it started in. A hung UI with ~0% CPU everywhere is a deadlock or blocking wait; one
+              thread at 100/cores % is a busy loop. Follow up with `stacks` or `dump`.
+              NAME is the thread's description: what .NET (Core) sets from Thread.Name and what native code sets
+              with SetThreadDescription ("Stylus Input", ".NET Server GC"). A .NET Framework Thread.Name is not
+              visible to other processes and stays empty here.
+              --grep keeps the threads whose NAME or START matches (all of them, not only the top ones): "is the
+              worker thread there, and since when?". --by-name counts the threads per name, for a process with
+              hundreds of them.
             """, ThreadsAsync) { Quiet = true },
         new("modules", "Processes", "DLLs loaded in a process (spot the wrong version or an unexpected path)",
             """
@@ -290,7 +297,20 @@ internal static partial class ProcessTools
 
     private static async Task<int> ThreadsAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args);
+        var a = ArgParser.Parse(args, "by-name");
+        System.Text.RegularExpressions.Regex? grep = null;
+        if (a.Get("grep") is { } pattern)
+        {
+            try
+            {
+                grep = new System.Text.RegularExpressions.Regex(pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            }
+            catch (ArgumentException ex)
+            {
+                return ctx.Fail("threads: bad --grep pattern: " + ex.Message);
+            }
+        }
+
         var p = Single(ctx, "threads", [.. a.Positionals], true);
         if (p == null) return 2;
         var interval = a.GetDuration("interval") ?? TimeSpan.FromSeconds(1);
@@ -298,11 +318,11 @@ internal static partial class ProcessTools
         await Task.Delay(interval, ctx.Ct);
         var later = ProcessSnapshot.Take(true).FirstOrDefault(x => x.Pid == p.Pid && x.CreateTime == p.CreateTime);
         if (later == null) return ctx.Fail($"threads: {p.Name} ({p.Pid}) exited during the sample.");
-        WriteThreads(ctx, later, p, sw.Elapsed, a.GetInt("top", 20));
+        WriteThreads(ctx, later, p, sw.Elapsed, a.GetInt("top", a.Flag("by-name") ? 40 : 20), grep, a.Flag("by-name"));
         return 0;
     }
 
-    private static unsafe void WriteThreads(ToolContext ctx, ProcessEntry now, ProcessEntry? before, TimeSpan elapsed, int top)
+    private static unsafe void WriteThreads(ToolContext ctx, ProcessEntry now, ProcessEntry? before, TimeSpan elapsed, int top, System.Text.RegularExpressions.Regex? grep = null, bool byName = false)
     {
         var threads = now.ThreadList ?? [];
         var prev = before?.ThreadList?.ToDictionary(t => t.Tid) ?? [];
@@ -331,33 +351,112 @@ internal static partial class ProcessTools
         if (before != null && sumPct < 1 && processBusy < 1 && UiTools.EnumerateWindows().Any(w => w.Pid == now.Pid && w.Hung))
             ctx.Out.WriteLine("! a window of this process is not responding while its threads use no CPU: blocked/deadlocked, not busy. Take a `dump`.");
 
-        var table = new Table(">TID", ">CPU%", ">CPU TIME", "STATE", ">SWITCHES", "START");
+        // Name and start module need a handle to each thread. With --grep or --by-name every thread is asked,
+        // otherwise only the ones that are listed.
+        var details = new Dictionary<int, (string start, string name, bool nameRead, bool opened)>();
+        (string start, string name, bool nameRead, bool opened) Detail(int tid)
+        {
+            if (!details.TryGetValue(tid, out var d)) details[tid] = d = ThreadDetail(tid, modules);
+            return d;
+        }
+
+        static string Created(ThreadEntry t) => t.CreateTime > 0 ? Format.Time(DateTime.FromFileTimeUtc(t.CreateTime)) : "";
+
+        if (byName)
+        {
+            var groups = rows.GroupBy(r => Detail(r.t.Tid) is { nameRead: true } d ? (d.name.Length > 0 ? d.name : "(no name)") : "(name not readable)")
+                .Select(g => (name: g.Key, count: g.Count(), pct: g.Sum(r => r.pct), first: g.Min(r => r.t.CreateTime), last: g.Max(r => r.t.CreateTime)))
+                .Where(g => grep == null || (g.name is not ("(no name)" or "(name not readable)") && grep.IsMatch(g.name))) // the two placeholders are not names
+                .OrderByDescending(g => g.count).ThenBy(g => g.name, StringComparer.Ordinal).ToList();
+            if (groups.Count == 0)
+            {
+                ctx.Out.WriteLine("[no thread name matches]");
+                return;
+            }
+
+            static string When(long fileTime) => fileTime > 0 ? Format.Time(DateTime.FromFileTimeUtc(fileTime)) : "";
+            var names = new Table(">COUNT", ">CPU%", "FIRST CREATED", "LAST CREATED", "NAME");
+            foreach (var g in groups.Take(top)) names.Add(g.count, before != null ? Format.Pct(g.pct) : "", When(g.first), g.count > 1 ? When(g.last) : "", g.name);
+            ctx.Out.Write(names.ToString());
+            if (groups.Count > top) ctx.Out.WriteLine($"… {groups.Count - top} more names, {groups.Skip(top).Sum(g => g.count)} threads (--top)");
+            return;
+        }
+
+        if (grep != null)
+        {
+            var total = rows.Count;
+            rows = rows.Where(r => Detail(r.t.Tid) is var d && (grep.IsMatch(d.name) || grep.IsMatch(d.start))).ToList();
+            var unopened = details.Values.Count(d => !d.opened);
+            var unnamed = details.Values.Count(d => d.opened && !d.nameRead);
+            ctx.Out.WriteLine($"{rows.Count} of {total} threads match in NAME or START" +
+                              (unopened > 0 ? $"; {unopened} threads could not be opened and were NOT looked at (a protected process, or run agentprobe elevated on the target)" : "") +
+                              (unnamed > 0 ? $"; the names of {unnamed} threads could not be read: those are judged by START alone" : ""));
+            if (rows.Count == 0) return;
+        }
+
+        var table = new Table(">TID", ">CPU%", ">CPU TIME", "STATE", ">SWITCHES", "CREATED", "NAME", "START");
         foreach (var (t, pct) in rows.Take(top))
         {
             var state = t.State == 5 ? "wait:" + ProcessSnapshot.WaitReasonName(t.WaitReason) : ProcessSnapshot.ThreadStateName(t.State);
-            table.Add(t.Tid, before != null ? Format.Pct(pct) : "", Cpu(t.KernelTime + t.UserTime), state, t.ContextSwitches, StartSymbol(t.Tid, modules));
+            var d = Detail(t.Tid);
+            table.Add(t.Tid, before != null ? Format.Pct(pct) : "", Cpu(t.KernelTime + t.UserTime), state, t.ContextSwitches, Created(t), d.nameRead ? Format.Clip(d.name, 48) : "?", d.start);
         }
 
         ctx.Out.Write(table.ToString());
         if (rows.Count > top) ctx.Out.WriteLine($"… {rows.Count - top} more threads (--top)");
+        if (rows.Take(top).Any(r => !Detail(r.t.Tid).nameRead))
+        {
+            ctx.Out.WriteLine(_noThreadNames
+                ? "NAME ?: this Windows has no thread names (they came with Windows 10 version 1607)."
+                : "NAME ?: that thread's name could not be read (a protected process, or run agentprobe elevated on the target).");
+        }
     }
 
-    /// <summary>"module.dll+0x1234" for the thread's user-mode start address, when it can be read.</summary>
-    private static unsafe string StartSymbol(int tid, List<(nint baseAddr, uint size, string path)> modules)
+    /// <summary>
+    /// What needs a handle to the thread: "module.dll+0x1234" for its user-mode start address, and its description
+    /// (the name .NET or native code gave it). <c>nameRead</c> is false when the name could not be asked for, which
+    /// is not the same as a thread without a name; <c>opened</c> is false when nothing at all could be asked.
+    /// </summary>
+    private static bool _noThreadNames; // GetThreadDescription does not exist on this Windows
+
+    private static unsafe (string start, string name, bool nameRead, bool opened) ThreadDetail(int tid, List<(nint baseAddr, uint size, string path)> modules)
     {
+        var start = "";
         var th = OpenThread(0x0040, 0, (uint)tid); // THREAD_QUERY_INFORMATION
-        if (th == 0) return "";
-        try
+        if (th != 0)
         {
             nint address = 0;
-            if (NtQueryInformationThread(th, 9, &address, (uint)sizeof(nint), out _) < 0 || address == 0) return ""; // ThreadQuerySetWin32StartAddress
-            foreach (var (baseAddr, size, path) in modules)
+            if (NtQueryInformationThread(th, 9, &address, (uint)sizeof(nint), out _) >= 0 && address != 0) // ThreadQuerySetWin32StartAddress
             {
-                if (address >= baseAddr && address < baseAddr + (nint)size)
-                    return $"{Path.GetFileName(path)}+0x{(long)(address - baseAddr):X}";
+                start = "0x" + ((long)address).ToString("X");
+                foreach (var (baseAddr, size, path) in modules)
+                {
+                    if (address >= baseAddr && address < baseAddr + (nint)size)
+                    {
+                        start = $"{Path.GetFileName(path)}+0x{(long)(address - baseAddr):X}";
+                        break;
+                    }
+                }
             }
+        }
+        else
+        {
+            th = OpenThread(0x0800, 0, (uint)tid); // THREAD_QUERY_LIMITED_INFORMATION is enough for the name
+        }
 
-            return "0x" + ((long)address).ToString("X");
+        if (th == 0) return (start, "", false, false);
+        try
+        {
+            char* description = null;
+            if (_noThreadNames || GetThreadDescription(th, &description) < 0) return (start, "", false, true);
+            var name = description != null ? new string(description) : "";
+            if (description != null) Win32.LocalFree((nint)description);
+            return (start, name, true, true);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            _noThreadNames = true; // Windows older than 10 version 1607 has no thread descriptions
+            return (start, "", false, true);
         }
         finally
         {
@@ -488,6 +587,9 @@ internal static partial class ProcessTools
 
     [LibraryImport("kernel32.dll")]
     private static partial nint OpenThread(uint access, int inherit, uint tid);
+
+    [LibraryImport("kernel32.dll")]
+    private static unsafe partial int GetThreadDescription(nint thread, char** description);
 
     [LibraryImport("ntdll.dll")]
     private static unsafe partial int NtQueryInformationThread(nint thread, int infoClass, void* buffer, uint length, out uint returnLength);

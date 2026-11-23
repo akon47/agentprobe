@@ -303,7 +303,56 @@ internal static unsafe class ProcessDetails
         0xC000013A => "0xC000013A Ctrl+C",
         0x40010004 => "0x40010004 killed (debugger/terminate)",
         0xCFFFFFFF => "0xCFFFFFFF hung app terminated",
+        _ when HostErrorName(code) is { } host => $"0x{code:X8} .NET host: {host}",
         _ when code > 0x7FFFFFFF => $"0x{code:X8}",
         _ => code.ToString(),
+    };
+
+    /// <summary>True for an exit code that has a name worth printing: a crash code, or an error of the .NET host.</summary>
+    public static bool IsFailureCode(uint code) => code >= 0xC0000000 || HostErrorName(code) != null;
+
+    /// <summary>
+    /// What the .NET host (apphost, hostfxr, hostpolicy) returns when an app does not get as far as its own code:
+    /// the StatusCode values of dotnet/runtime's error_codes.h. Where a name changed between versions, both are given.
+    /// </summary>
+    public static string? HostErrorName(uint code) => code switch
+    {
+        0x80008081 => "InvalidArgFailure (bad arguments, or the host did not take the exe for an app: `deps <exe> --run`)",
+        0x80008082 => "CoreHostLibLoadFailure (hostfxr or hostpolicy could not be loaded)",
+        0x80008083 => "CoreHostLibMissingFailure (hostfxr or hostpolicy not found)",
+        0x80008084 => "CoreHostEntryPointFailure (a host library lacks an entry point: mixed versions?)",
+        0x80008085 => "CurrentHostFindFailure (the host could not find its own path)",
+        0x80008087 => "CoreClrResolveFailure (coreclr.dll not found)",
+        0x80008088 => "CoreClrBindFailure (coreclr.dll lacks an entry point)",
+        0x80008089 => "CoreClrInitFailure (the runtime failed to start)",
+        0x8000808A => "CoreClrExeFailure (the runtime failed to run the app)",
+        0x8000808B => "ResolverInitFailure (the app's .deps.json could not be read)",
+        0x8000808C => "ResolverResolveFailure (an assembly the .deps.json lists was not found, or two conflict)",
+        0x8000808D => "LibHostCurExeFindFailure",
+        0x8000808E => "LibHostInitFailure",
+        0x80008090 => "LibHostExecModeFailure",
+        0x80008091 => "LibHostSdkFindFailure (the host looked for an SDK command: it did not take its argument for an app)",
+        0x80008092 => "LibHostInvalidArgs",
+        0x80008093 => "InvalidConfigFile (.runtimeconfig.json is missing or invalid)",
+        0x80008094 => "AppArgNotRunnable",
+        0x80008095 => "AppHostExeNotBoundFailure (the exe is an app host that was never bound to an app DLL)",
+        0x80008096 => "FrameworkMissingFailure (the .NET runtime the app asks for is not installed)",
+        0x80008097 => "HostApiFailed",
+        0x80008098 => "HostApiBufferTooSmall",
+        0x80008099 => "LibHostUnknownCommand",
+        0x8000809A => "AppPathFindFailure (the app's DLL is not next to the exe)",
+        0x8000809B => "SdkResolveFailure",
+        0x8000809C => "FrameworkCompatFailure (the app's frameworks ask for incompatible versions)",
+        0x8000809D => "FrameworkCompatRetry",
+        0x8000809F => "BundleExtractionFailure (a single-file app could not be unpacked)",
+        0x800080A0 => "BundleExtractionIOError (a single-file app could not be unpacked: disk error)",
+        0x800080A1 => "LibHostDuplicateProperty (.runtimeconfig.json sets a property the host sets itself)",
+        0x800080A2 => "HostApiUnsupportedVersion",
+        0x800080A3 => "HostInvalidState",
+        0x800080A4 => "HostPropertyNotFound",
+        0x800080A5 => "HostIncompatibleConfig",
+        0x800080A6 => "HostApiUnsupportedScenario",
+        0x800080A7 => "HostFeatureDisabled",
+        _ => null,
     };
 }

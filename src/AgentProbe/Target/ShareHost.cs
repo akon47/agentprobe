@@ -27,6 +27,8 @@ internal sealed partial class ShareHost
     private TargetRuntime _runtime = null!;
     private Identity _identity = null!;
     private string? _trustedFingerprint;
+    private bool _minimized;
+    private int _minimizedDone;
     private byte[]? _trustedKey;
     private IPEndPoint? _lastEndpoint;
     private string _controllerName = "developer PC";
@@ -46,6 +48,7 @@ internal sealed partial class ShareHost
     private ShareHost(ArgParser args)
     {
         _autoYes = args.Flag("yes");
+        _minimized = args.Flag("minimized");
         _trustPrefix = args.Get("trust")?.Replace("-", "").ToUpperInvariant();
         if (args.Get("controller") is { } hosts) _extraHosts.AddRange(hosts.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         _extraHosts.AddRange(args.Positionals);
@@ -60,7 +63,7 @@ internal sealed partial class ShareHost
 
     public static async Task<int> RunAsync(string[] argv)
     {
-        var args = ArgParser.Parse(argv, "yes", "resume", "dry-run");
+        var args = ArgParser.Parse(argv, "yes", "resume", "dry-run", "minimized");
         if (args.Get("lang") is { } lang) Lang.Set(lang);
         if (args.Flag("dry-run")) return await new ShareHost(args).DryRunAsync();
         if (args.Get("trust") is { } trust && trust.Replace("-", "").Length != 16)
@@ -143,6 +146,7 @@ internal sealed partial class ShareHost
             resumedHistory = state.History;
             _resumedAfterUpdate = state.Reason == "update";
             _continueRunsAfter = state.LastRun;
+            _minimized |= state.Minimized;
         }
         else
         {
@@ -320,6 +324,7 @@ internal sealed partial class ShareHost
                     Lang.T("agentprobe: this PC is being controlled remotely. Close its window to stop.", "agentprobe: 이 PC가 원격으로 제어되고 있습니다. 멈추려면 agentprobe 창을 닫으세요."));
                 var session = new TargetSession(channel, _runtime, _controllerName, a => Badge.SetDetail(DateTime.Now.ToString("HH:mm:ss") + "  " + a));
                 _connected = true;
+                MinimizeOnce();
                 try
                 {
                     await session.RunAsync(BuildHello(), ct);
@@ -508,6 +513,22 @@ internal sealed partial class ShareHost
         return (picked >= 0 && picked < candidates.Count ? candidates[picked.Value] : null, true);
     }
 
+    /// <summary>
+    /// <c>share --minimized</c>: once a developer PC is connected this window has said what it had to say, and on
+    /// a test PC it lies in front of the app under test. It goes to the taskbar, once; the banner on the screen
+    /// and the log in the window stay as they are. Only when this process has the console to itself, never the
+    /// terminal of someone who started sharing from their shell. (A terminal that puts every new console in a tab
+    /// of one window is minimized as a whole: there is no window of our own to tell apart.)
+    /// </summary>
+    private unsafe void MinimizeOnce()
+    {
+        if (!_minimized || Interlocked.Exchange(ref _minimizedDone, 1) != 0) return;
+        var list = stackalloc uint[4];
+        if (GetConsoleProcessList(list, 4) != 1) return; // the console is shared with a shell
+        var console = GetConsoleWindow();
+        if (console != 0) ShowWindow(console, 6); // SW_MINIMIZE
+    }
+
     private Dictionary<string, string> BuildHello()
     {
         using var os = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
@@ -527,7 +548,35 @@ internal sealed partial class ShareHost
             ["started"] = _runtime.StartedUtc.Ticks.ToString(),
             ["utc"] = DateTime.UtcNow.Ticks.ToString(),
             ["resumed"] = IsResume ? "1" : "0",
+            ["addrs"] = string.Join(' ', OwnAddresses()),
         };
+    }
+
+    /// <summary>
+    /// This PC's IPv4 addresses, for the developer PC's list: a PC with several network adapters is often known to
+    /// its user by another address than the one the connection happens to come from.
+    /// </summary>
+    private static List<string> OwnAddresses()
+    {
+        var list = new List<string>();
+        try
+        {
+            foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up || nic.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+                foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+                {
+                    var text = ua.Address.ToString();
+                    if (ua.Address.AddressFamily == AddressFamily.InterNetwork && !text.StartsWith("169.254.", StringComparison.Ordinal) && !list.Contains(text) && list.Count < 6) list.Add(text);
+                }
+            }
+        }
+        catch (System.Net.NetworkInformation.NetworkInformationException)
+        {
+            // the adapter list is not available: the connection's own address is still known
+        }
+
+        return list;
     }
 
     /// <summary>Stable per-PC-and-user id (a hash, never the raw MachineGuid) so the developer PC can remember a label.</summary>
@@ -554,6 +603,7 @@ internal sealed partial class ShareHost
             // Only a reboot's history is carried over: its entries read "before reboot", which would be false here.
             History = reason.Length == 0 ? _runtime.ExportHistory(60) : [],
             LastRun = _runtime.LastRunNumber,
+            Minimized = _minimized,
             ExpiresUtc = DateTime.UtcNow.Add(validFor),
         };
     }
@@ -644,6 +694,16 @@ internal sealed partial class ShareHost
         if (type is 5 or 6) _instance?.End(false); // CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
         return 0; // let the default handling continue
     }
+
+    [LibraryImport("kernel32.dll")]
+    private static partial nint GetConsoleWindow();
+
+    [LibraryImport("kernel32.dll")]
+    private static unsafe partial uint GetConsoleProcessList(uint* list, uint count);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool ShowWindow(nint hwnd, int command);
 
     [LibraryImport("kernel32.dll")]
     private static unsafe partial int SetConsoleCtrlHandler(delegate* unmanaged[Stdcall]<uint, int> handler, int add);

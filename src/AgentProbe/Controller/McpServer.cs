@@ -22,7 +22,7 @@ internal static class CommandLine
             // Options first, then the rest of the line verbatim so quotes reach the shell untouched.
             var options = new List<string>();
             var i = 1;
-            while (i + 1 < tokens.Count && tokens[i].text is "--shell" or "--cwd" or "--timeout" or "--name")
+            while (i + 1 < tokens.Count && (tokens[i].text is "--shell" or "--cwd" or "--timeout" or "--name" || (tool.Name == "start" && tokens[i].text == "--env")))
             {
                 options.Add(tokens[i].text);
                 options.Add(tokens[i + 1].text);
@@ -30,11 +30,12 @@ internal static class CommandLine
             }
 
             if (i >= tokens.Count) return (tool, [], $"{tool.Name}: no command given.");
-            if (tool.Name == "start" && tokens[i].text == "--exe")
+            if (tool.Name == "start" && tokens[i].text is "--exe" or "--lnk")
             {
-                // start --exe <path> [args]: the program itself, with the words after its path as its arguments.
-                if (i + 1 >= tokens.Count) return (tool, [], "start: --exe needs the path of a program on the target.");
-                return (tool, [.. options, "--exe", tokens[i + 1].text, "--", .. tokens.Skip(i + 2).Select(t => t.text)], null);
+                // start --exe <path> [args] / --lnk <shortcut> [args]: the program itself, with the words after
+                // the path as its arguments.
+                if (i + 1 >= tokens.Count) return (tool, [], $"start: {tokens[i].text} needs a path on the target.");
+                return (tool, [.. options, tokens[i].text, tokens[i + 1].text, "--", .. tokens.Skip(i + 2).Select(t => t.text)], null);
             }
 
             options.Add("--script");
@@ -188,7 +189,7 @@ internal static class McpServer
                $"Start with `{exe} guide` (or the `guide` tool), then `list`, then `triage`. " +
                "Typical commands: triage, ps, top, proc <name>, threads <pid>, modules <pid>, handles <pid>, mem, sys, events, crashes, " +
                "dbg, watch start <name> / watch, deps <exe>, compare <target> local, exec '<powershell>', start/logs/kill, push/pull, " +
-               "windows, screenshot, click/type/key, wait, history, reboot --wait, end. `help <command>` shows options.";
+               "windows, ui <window>, screenshot, click/touch/type/key, wait, history, reboot --wait, end. `help <command>` shows options.";
     }
 
     private static void WriteTools(Utf8JsonWriter w)

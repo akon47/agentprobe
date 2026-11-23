@@ -98,12 +98,12 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
         // no history entry, no line in the activity log, no change to the banner.
         // The developer PC asks for this, but the target decides: only read-only tools may run unlogged, so nothing
         // that changes this PC (exec, kill, input, files...) can ever be kept out of the activity log.
-        var background = m.Background && (tool.Quiet || (tool.Name == "screenshot" && args.Contains("--thumb")));
+        var background = m.Background && (tool.IsQuiet(args) || (tool.Name == "screenshot" && args.Contains("--thumb")));
         var record = background ? new RunRecord { Tool = tool.Name, Args = args } : runtime.NewRun(tool.Name, args, controllerName);
         if (!background)
         {
             await TrySendAsync(new Msg { Type = "started", Id = m.Id, Code = record.No });
-            if (!tool.Quiet) runtime.Audit.Write($"#{record.No} {Format.Clip(record.CommandLine, 300)}");
+            if (!tool.IsQuiet(args)) runtime.Audit.Write($"#{record.No} {Format.Clip(record.CommandLine, 300)}");
             activity(Format.Clip(record.CommandLine, 70));
         }
 

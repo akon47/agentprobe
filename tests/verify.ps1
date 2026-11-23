@@ -107,6 +107,31 @@ try {
     $r = AP -t local threads $helper.Id --interval 500ms
     Check 'threads runs and names a start module' ($r.Code -eq 0 -and $r.Out -match '\.dll\+0x|\.exe\+0x') $r.Out
 
+    # A thread that was given a name, in a process whose start time is known.
+    $namedScript = Join-Path $work 'named.ps1'
+    @'
+Add-Type -Namespace ApVerify -Name Thr -MemberDefinition '[DllImport("kernel32.dll")] public static extern IntPtr GetCurrentThread(); [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern int SetThreadDescription(IntPtr thread, string description);'
+[void][ApVerify.Thr]::SetThreadDescription([ApVerify.Thr]::GetCurrentThread(), 'ApVerify Named Thread')
+Start-Sleep 600
+'@ | Set-Content $namedScript -Encoding UTF8
+    $named = Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$namedScript`"" -WindowStyle Hidden -PassThru
+    Start-Sleep 4
+    $r = AP -t local threads $named.Id --grep 'ApVerify Named' --interval 300ms
+    $row = ($r.Out -split "`n" | Where-Object { $_ -match 'ApVerify Named Thread' } | Select-Object -First 1)
+    Check 'threads --grep finds the thread by its name, and only that one' ($r.Code -eq 0 -and $r.Out -match '(?m)^1 of \d+ threads match' -and $row) $r.Out
+    if ("$row" -match '^\s*(\d+)\s.*\s(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\s') {
+        $shown = Get-Date -Month $Matches[2] -Day $Matches[3] -Hour $Matches[4] -Minute $Matches[5] -Second $Matches[6]
+        $thread = (Get-Process -Id $named.Id).Threads | Where-Object Id -eq ([int]$Matches[1])
+        Check 'threads: CREATED is when Windows says that thread started' ($thread -and [Math]::Abs(($shown - $thread.StartTime).TotalSeconds) -le 2) "row: $row / Windows: thread $($thread.Id) $($thread.StartTime)"
+    } else { Check 'threads: CREATED column' $false $r.Out }
+    $r = AP -t local threads $named.Id --by-name --interval 300ms
+    Check 'threads --by-name counts the threads per name' ($r.Out -match '(?m)^\s*1\s+\S+\s+\d\d-\d\d \d\d:\d\d:\d\d\s+ApVerify Named Thread\s*$' -and $r.Out -match '\(no name\)') $r.Out
+    $r = AP -t local threads $named.Id --by-name --grep 'no name' --interval 300ms
+    Check 'threads --by-name --grep does not take the placeholder "(no name)" for a name' ($r.Out -notmatch '\(no name\)' -and $r.Out -match 'no thread name matches') $r.Out
+    $r = AP -t local threads $named.Id --grep 'NoSuchThreadNameZz' --interval 300ms
+    Check 'threads --grep with no match says how many threads were looked at' ($r.Out -match '(?m)^0 of \d+ threads match') $r.Out
+    Stop-Process -Id $named.Id -Force
+
     $r = AP -t local stacks $helper.Id --top 3
     Check 'stacks walks the threads' ($r.Code -eq 0 -and $r.Out -match 'ntdll') $r.Out
 
@@ -150,7 +175,31 @@ try {
     Check 'read --lines 100-101 numbers the lines' ((AP -t local read $file --lines 100-101).Out.Trim() -eq "100: line 100 value=700`n101: line 101 value=707") ''
     $g = (AP -t local read $file --grep 'value=35$').Out.Trim()
     Check 'read --grep returns exactly the match' ($g -eq '5: line 5 value=35') $g
-    Check '-t local refuses commands that need a session' ((AP -t local read $file --new).Code -eq 2 -and (AP -t local watch start explorer).Code -eq 2) ''
+    Check '-t local refuses commands that need a session' ((AP -t local read $file --new).Code -eq 2 -and (AP -t local watch start explorer).Code -eq 2 -and (AP -t local deps $Exe --run).Code -eq 2) ''
+
+    # The lines of a time span: from the first time up to, not including, the second; a line without a time
+    # (a stack trace) belongs to the line before it.
+    $timed = Join-Path $work 'timed.log'
+    @('2026-01-01 11:59:59 before', '2026-01-01 12:02:00 first', '   at Some.Frame()', '[12:03:30.250] middle', '2026-01-01 12:04:59 last', '2026-01-01 12:05:00 after', 'no time, after', '1/1/2026 1:03:00 PM afternoon') | Set-Content $timed -Encoding UTF8
+    $r = AP -t local read $timed --between 12:02 12:05
+    Check 'read --between: the lines from the first time up to the second, with the lines that belong to them' ($r.Out.Trim() -eq "2: 2026-01-01 12:02:00 first`n3:    at Some.Frame()`n4: [12:03:30.250] middle`n5: 2026-01-01 12:04:59 last") $r.Out
+    $r = AP -t local read --between 12:02-12:05 $timed --grep 'first|after'
+    Check 'read --between combines with --grep' ($r.Out.Trim() -eq '2: 2026-01-01 12:02:00 first') $r.Out
+    $r = AP -t local read $timed --between 23:00 00:30
+    Check 'read --between with nothing in the span: says what span the file does cover' ($r.Out -match 'no line from 23:00:00 up to 00:30:00' -and $r.Out -match 'run from 11:59:59 to 13:03:00') $r.Out
+    $r = AP -t local read $timed --between 13:00 13:10
+    Check 'read --between reads a 12-hour clock (1:03:00 PM is 13:03)' ($r.Out.Trim() -eq '8: 1/1/2026 1:03:00 PM afternoon') $r.Out
+    $r = AP -t local read $timed --between 12:02 12:05 --lines 3-4
+    Check 'read --between --lines: a line range that starts on a line without a time still knows whose line it is' ($r.Out.Trim() -eq "3:    at Some.Frame()`n4: [12:03:30.250] middle") $r.Out
+    $r = AP -t local read $file --between 12:00 13:00
+    Check 'read --between on a file without times says so, not "no lines"' ($r.Out -match 'no line of this file has a time of day') $r.Out
+
+    # What a shortcut starts, compared with what was written into it.
+    $lnk = Join-Path $work 'ApVerify Shortcut.lnk'
+    $shell = New-Object -ComObject WScript.Shell
+    $sc = $shell.CreateShortcut($lnk); $sc.TargetPath = "$env:WINDIR\System32\winver.exe"; $sc.Arguments = '--alpha "two words"'; $sc.WorkingDirectory = $env:WINDIR; $sc.Save()
+    $r = AP -t local stat $lnk
+    Check 'stat on a shortcut: its target, arguments and start folder' ($r.Out -match "(?m)^\s+shortcut\s+target\s+$([regex]::Escape("$env:WINDIR\System32\winver.exe"))\s*$" -and $r.Out -match '(?m)^\s+arguments --alpha "two words"\s*$' -and $r.Out -match "(?m)^\s+start in\s+$([regex]::Escape($env:WINDIR))\s*$") $r.Out
 
     # A file in this PC's own ANSI code page: 949 on Korean Windows, 1252 on Western European ones, and so on.
     $acp = [int](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage').ACP
@@ -329,6 +378,18 @@ public static class CredPrompt {
     $r = AP -t local deps (Join-Path $fake 'App.exe')
     Check 'deps: a .NET app host whose runtime is missing is reported' ($r.Code -eq 1 -and $r.Out -match 'NO RUNTIME\s+Microsoft\.NETCore\.App 99') $r.Out
 
+    # A folder that looks like a self-contained .NET app (its own host and runtime, a runtimeconfig without a
+    # framework) but has no App.deps.json: the .NET host does not start that from its own folder.
+    $sc8 = Join-Path $work 'selfcontained'; New-Item -ItemType Directory $sc8 | Out-Null
+    Copy-Item "$env:WINDIR\System32\where.exe" (Join-Path $sc8 'App.exe')
+    foreach ($n in 'hostfxr.dll', 'hostpolicy.dll', 'coreclr.dll', 'there.dll') { Copy-Item "$env:WINDIR\System32\version.dll" (Join-Path $sc8 $n) }
+    '{"runtimeOptions":{"configProperties":{}}}' | Set-Content (Join-Path $sc8 'App.runtimeconfig.json')
+    $r = AP -t local deps (Join-Path $sc8 'App.exe')
+    Check 'deps: a self-contained .NET app without its deps.json is reported (the host trap)' ($r.Code -eq 1 -and $r.Out -match '(?m)^HOST TRAP\s+App\.deps\.json is missing' -and $r.Out -match '0x80008081') $r.Out
+    '{"runtimeTarget":{"name":".NETCoreApp,Version=v8.0/win-x64"},"targets":{".NETCoreApp,Version=v8.0/win-x64":{"App/1.0.0":{"runtime":{"there.dll":{}}},"Lib/2.0.0":{"runtime":{"lib/net8.0/NotThere.dll":{}},"native":{"coreclr.dll":{}}}}}}' | Set-Content (Join-Path $sc8 'App.deps.json')
+    $r = AP -t local deps (Join-Path $sc8 'App.exe')
+    Check 'deps: files the deps.json lists are checked against the folder; no host trap once it is there' ($r.Code -eq 1 -and $r.Out -notmatch 'HOST TRAP' -and $r.Out -match '(?m)^MISSING\s+1 of the 3 files that App\.deps\.json lists is not in the app''s folder: NotThere\.dll \(Lib/2\.0\.0\)') $r.Out
+
     # The MCP server speaks JSON-RPC on stdio: ask it what it offers.
     $mcp = New-Object System.Diagnostics.ProcessStartInfo; $mcp.FileName = $Exe; $mcp.Arguments = 'mcp'; $mcp.UseShellExecute = $false; $mcp.CreateNoWindow = $true
     $mcp.RedirectStandardInput = $true; $mcp.RedirectStandardOutput = $true; $mcp.StandardOutputEncoding = [Text.Encoding]::UTF8
@@ -375,9 +436,12 @@ public static class CredPrompt {
     # ------------------------------------------------------------------ desktop
     Write-Host "`ndesktop and UI automation (a small test window appears)"
     $clickFile = Join-Path $work 'clicked.txt'
+    $touchFile = Join-Path $work 'touched.txt'
+    $hwndFile = Join-Path $work 'hwnd.txt'
+    $affinityFile = Join-Path $work 'affinity.txt'
     $formScript = @"
 Add-Type -AssemblyName System.Windows.Forms, PresentationFramework, PresentationCore, WindowsBase
-Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { public class EditorForm : System.Windows.Forms.Form { } public class Cache<T> { public class Node { } } public static class Holder { public static object[] Nodes = new object[] { new Cache<int>.Node(), new Cache<int>.Node(), new Cache<int>.Node(), new Cache<int>.Node(), new Cache<int>.Node() }; } }'
+Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace ApVerify.Views { public class EditorForm : System.Windows.Forms.Form { public int Number = 42; public string Note = "ap-note"; public bool Flag = true; public System.Drawing.Point Where = new System.Drawing.Point(3, 4); public System.DayOfWeek Day = System.DayOfWeek.Wednesday; public object Nothing; public System.Collections.Generic.List<int> Items = new System.Collections.Generic.List<int>(); public int[] Numbers = new int[7]; public string Auto { get; set; } public EditorForm() { Auto = "auto-value"; } } public class Cache<T> { public class Node { } } public static class Holder { public static object[] Nodes = new object[] { new Cache<int>.Node(), new Cache<int>.Node(), new Cache<int>.Node(), new Cache<int>.Node(), new Cache<int>.Node() }; } public static class Input { [System.Runtime.InteropServices.DllImport("user32.dll")] static extern System.IntPtr GetMessageExtraInfo(); public static bool FromTouch() { return (GetMessageExtraInfo().ToInt64() & 0xFFFFFF80) == 0xFF515780; } [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(System.IntPtr hwnd, uint affinity); } }'
 `$nodes = [ApVerify.Views.Holder]::Nodes.Length
 [Windows.Forms.Application]::EnableVisualStyles()
 `$neverShown = 1..3 | ForEach-Object { New-Object ApVerify.Views.EditorForm }
@@ -385,17 +449,33 @@ Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { 
 `$wpfShown = New-Object System.Windows.Window; `$wpfShown.Title = 'ApWpf'; `$wpfShown.Width = 160; `$wpfShown.Height = 80; `$wpfShown.Left = 700; `$wpfShown.Top = 520; `$wpfShown.ShowInTaskbar = `$false; `$wpfShown.ShowActivated = `$false; `$wpfShown.Show()
 `$formClosed = New-Object ApVerify.Views.EditorForm; `$formClosed.ShowInTaskbar = `$false; `$formClosed.StartPosition = 'Manual'; `$formClosed.Left = 700; `$formClosed.Top = 620; `$formClosed.Width = 120; `$formClosed.Height = 60; `$formClosed.Show(); `$formClosed.Close()
 `$wpfClosed = New-Object System.Windows.Window; `$wpfClosed.Width = 120; `$wpfClosed.Height = 60; `$wpfClosed.Left = 700; `$wpfClosed.Top = 620; `$wpfClosed.ShowInTaskbar = `$false; `$wpfClosed.ShowActivated = `$false; `$wpfClosed.Show(); `$wpfClosed.Close()
-`$f = New-Object Windows.Forms.Form; `$f.Text = 'AP Verify Window'; `$f.Width = 440; `$f.Height = 190; `$f.StartPosition = 'Manual'; `$f.Left = 160; `$f.Top = 160; `$f.TopMost = `$true
+`$secret = New-Object Windows.Forms.Form; `$secret.Text = 'AP Verify NoCapture'; `$secret.Width = 200; `$secret.Height = 70; `$secret.StartPosition = 'Manual'; `$secret.Left = 700; `$secret.Top = 420; `$secret.ShowInTaskbar = `$false; `$secret.TopMost = `$true
+`$secret.Show()
+`$kept = if ([ApVerify.Views.Input]::SetWindowDisplayAffinity(`$secret.Handle, 0x11)) { 'left out' } elseif ([ApVerify.Views.Input]::SetWindowDisplayAffinity(`$secret.Handle, 1)) { 'shown black' } else { 'none' }
+[IO.File]::WriteAllText('$affinityFile', `$kept)
+`$f = New-Object Windows.Forms.Form; `$f.Text = 'AP Verify Window'; `$f.Width = 440; `$f.Height = 330; `$f.StartPosition = 'Manual'; `$f.Left = 160; `$f.Top = 160; `$f.TopMost = `$true
+`$f.Add_Shown({ [IO.File]::WriteAllText('$hwndFile', `$f.Handle.ToInt64().ToString('X')) })
 `$t = New-Object Windows.Forms.TextBox; `$t.Name = 'inputBox'; `$t.Left = 20; `$t.Top = 20; `$t.Width = 300
 `$b = New-Object Windows.Forms.Button; `$b.Name = 'pressButton'; `$b.Text = 'Press me'; `$b.Left = 20; `$b.Top = 60; `$b.Width = 120
 `$b.Add_Click({ [IO.File]::WriteAllText('$clickFile', 'clicked:' + `$t.Text) })
+`$b.Add_MouseDown({ [IO.File]::WriteAllText('$touchFile', `$(if ([ApVerify.Views.Input]::FromTouch()) { 'touch' } else { 'mouse' })) })
+`$check = New-Object Windows.Forms.CheckBox; `$check.Name = 'checkBox'; `$check.Text = 'Check me'; `$check.Left = 300; `$check.Top = 62; `$check.Width = 110; `$check.Checked = `$true
+`$tabs = New-Object Windows.Forms.TabControl; `$tabs.Name = 'tabs'; `$tabs.Left = 20; `$tabs.Top = 100; `$tabs.Width = 380; `$tabs.Height = 90
+`$tabs.TabPages.Add('First tab'); `$tabs.TabPages.Add('Second tab')
+`$twinA = New-Object Windows.Forms.Button; `$twinA.Name = 'twinA'; `$twinA.Text = 'Twin'; `$twinA.Left = 20; `$twinA.Top = 205; `$twinA.Width = 90; `$twinA.Add_Click({ [IO.File]::WriteAllText('$clickFile', 'twin:A') })
+`$twinB = New-Object Windows.Forms.Button; `$twinB.Name = 'twinB'; `$twinB.Text = 'Twin'; `$twinB.Left = 120; `$twinB.Top = 205; `$twinB.Width = 90; `$twinB.Add_Click({ [IO.File]::WriteAllText('$clickFile', 'twin:B') })
+`$cover = New-Object Windows.Forms.Form; `$cover.Text = 'AP Verify Cover'; `$cover.Width = 200; `$cover.Height = 110; `$cover.StartPosition = 'Manual'; `$cover.Left = 165; `$cover.Top = 372; `$cover.TopMost = `$true; `$cover.ShowInTaskbar = `$false
+`$showCover = New-Object Windows.Forms.Button; `$showCover.Name = 'showCover'; `$showCover.Text = 'Show cover'; `$showCover.Left = 230; `$showCover.Top = 205; `$showCover.Width = 80; `$showCover.Add_Click({ `$cover.Show() })
+`$hideCover = New-Object Windows.Forms.Button; `$hideCover.Name = 'hideCover'; `$hideCover.Text = 'Hide cover'; `$hideCover.Left = 320; `$hideCover.Top = 205; `$hideCover.Width = 80; `$hideCover.Add_Click({ `$cover.Hide() })
 `$d = New-Object Windows.Forms.Form; `$d.Text = 'AP Verify Dialog'; `$d.Width = 260; `$d.Height = 120; `$d.StartPosition = 'Manual'; `$d.Left = 660; `$d.Top = 160
 `$c = New-Object Windows.Forms.Button; `$c.Name = 'closeDialog'; `$c.Text = 'Close dialog'; `$c.Left = 20; `$c.Top = 20; `$c.Width = 120; `$c.DialogResult = 'OK'; `$d.Controls.Add(`$c)
 `$o = New-Object Windows.Forms.Button; `$o.Name = 'openDialog'; `$o.Text = 'Open dialog'; `$o.Left = 160; `$o.Top = 60; `$o.Width = 120
 `$o.Add_Click({ [void]`$f.BeginInvoke([Action]{ [void]`$d.ShowDialog(`$f) }) })
-`$f.Controls.Add(`$t); `$f.Controls.Add(`$b); `$f.Controls.Add(`$o); [Windows.Forms.Application]::Run(`$f)
+`$f.Controls.Add(`$t); `$f.Controls.Add(`$b); `$f.Controls.Add(`$o); `$f.Controls.Add(`$check); `$f.Controls.Add(`$tabs); `$f.Controls.Add(`$twinA); `$f.Controls.Add(`$twinB); `$f.Controls.Add(`$showCover); `$f.Controls.Add(`$hideCover)
+[Windows.Forms.Application]::Run(`$f)
 "@
-    $form = Start-Process powershell -ArgumentList '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-EncodedCommand', ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($formScript))) -PassThru
+    $formFile = Join-Path $work 'form.ps1'; $formScript | Set-Content $formFile -Encoding UTF8   # too long for a command line
+    $form = Start-Process powershell -ArgumentList '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$formFile`"" -PassThru
     $w = AP -t local wait --window 'AP Verify Window' --timeout 20s
     Check 'wait --window sees the test window' ($w.Code -eq 0) $w.Out
     $win = AP -t local windows 'AP Verify'
@@ -403,18 +483,18 @@ Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { 
 
     # Window objects on the managed heap. That process holds, per type (count / on screen / closed):
     #   EditorForm (derived from Form)  4 / 0 / 1   three never shown, one shown and closed again
-    #   Form                            2 / 1 / 0   the form on screen, and its dialog that is not open
+    #   Form                            4 / 2 / 0   the form and the no-capture window on screen, the dialog and the cover window that are not open
     #   WPF Window                      4 / 1 / 1   two never shown, one on screen, one shown and closed again
     $r = AP -t local heap $form.Id --windows
-    Check 'heap --windows: window objects per type, how many are shown and how many were closed' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s*4\s+0\s+1\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match '(?m)^\s*2\s+1\s+0\s+System\.Windows\.Forms\.Form\s*$' -and $r.Out -match '(?m)^\s*4\s+1\s+1\s+System\.Windows\.Window\s*$' -and $r.Out -match '(?m)^CLOSED: ') $r.Out
+    Check 'heap --windows: window objects per type, how many are shown and how many were closed' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s*4\s+0\s+1\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match '(?m)^\s*4\s+2\s+0\s+System\.Windows\.Forms\.Form\s*$' -and $r.Out -match '(?m)^\s*4\s+1\s+1\s+System\.Windows\.Window\s*$' -and $r.Out -match '(?m)^CLOSED: ') $r.Out
     $r = AP -t local heap $form.Id --type Form --live --top 300
-    Check 'heap --type looks at the type''s own name, not at its namespace' ($r.Out -match '(?m)^\s*4\s+\S+\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match '(?m)^\s*2\s+\S+\s+System\.Windows\.Forms\.Form\s*$' -and $r.Out -notmatch '(?m)System\.Windows\.Forms\.(Button|TextBox)\s*$') $r.Out
+    Check 'heap --type looks at the type''s own name, not at its namespace' ($r.Out -match '(?m)^\s*4\s+\S+\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match '(?m)^\s*4\s+\S+\s+System\.Windows\.Forms\.Form\s*$' -and $r.Out -notmatch '(?m)System\.Windows\.Forms\.(Button|TextBox)\s*$') $r.Out
     $r = AP -t local heap $form.Id --type Node --ns ApVerify --live
     Check 'heap --type finds a type nested in a generic type by its own name' ($r.Out -match '(?m)^\s*5\s+\S+\s+ApVerify\.Views\.Cache<System\.Int32>\+Node\s*$' -and @($r.Out -split "`n").Count -eq 3) $r.Out
     $r = AP -t local heap $form.Id --type DisplayClass --live --top 1
     Check 'heap --type finds compiler-made types (their names begin with <)' ($r.Code -eq 0 -and $r.Out -match '(?m)^\s*[\d,]+\s+\S+\s+\S*<>c__DisplayClass') $r.Out
     $r = AP -t local heap $form.Id --type Forms.Button --live
-    Check 'heap --type with a dot looks in the full name' ($r.Out -match '(?m)^\s*3\s+\S+\s+System\.Windows\.Forms\.Button\s*$') $r.Out
+    Check 'heap --type with a dot looks in the full name' ($r.Out -match '(?m)^\s*7\s+\S+\s+System\.Windows\.Forms\.Button\s*$') $r.Out
     $r = AP -t local heap $form.Id --ns ApVerify.Views --live
     Check 'heap --ns keeps the types of one namespace' ($r.Out -match '(?m)^\s*4\s+\S+\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match 'Cache<System\.Int32>\+Node' -and $r.Out -notmatch '(?m)\sSystem\.') $r.Out
     $r = AP -t local heap $form.Id --type 'ApVerify.*Form' --live
@@ -424,8 +504,72 @@ Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { 
     $hinted = (AP -t local heap $form.Id --type '*ApVerify*' --live).Out
     Check 'heap: the pattern that hint suggests does list those types' ($hinted -match 'ApVerify\.Views\.EditorForm' -and $hinted -match 'Cache<System\.Int32>\+Node') $hinted
 
+    $r = AP -t local heap $form.Id --type 'EditorForm,Node|NoSuchTypeZz' --ns ApVerify --live
+    Check 'heap --type with several names: one snapshot, a row for each, and the one that matched nothing is named' ($r.Out -match '(?m)^\s*4\s+\S+\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match '(?m)^\s*5\s+\S+\s+ApVerify\.Views\.Cache<System\.Int32>\+Node\s*$' -and $r.Out -match '(?m)^no reachable object of a type matching: NoSuchTypeZz\s*$' -and @($r.Out -split "`n" | Where-Object { $_ -match 'snapshot taken' }).Count -eq 1) $r.Out
+    $r = AP -t local heap $form.Id --type 'ApVerifyNope[,],EditorForm' --live
+    Check 'heap --type: a comma inside [ ] is part of a name, not a separator (no flood of every array type)' ($r.Out -match '(?m)^\s*4\s+\S+\s+ApVerify\.Views\.EditorForm\s*$' -and $r.Out -match '(?m)^no reachable object of a type matching: ApVerifyNope\[,\]\s*$' -and $r.Out -notmatch '(?m)\sSystem\.Object\[\]\s*$') $r.Out
+    $r = AP -t local heap $form.Id --show EditorForm --top 2
+    $fieldLines = @('Number = 42', 'Note = "ap-note"', 'Flag = true', 'Where = \{System\.Drawing\.Point: x = 3, y = 4\}', 'Day = 3 \(System\.DayOfWeek\)', 'Nothing = null', 'Items = System\.Collections\.Generic\.List<System\.Int32>', 'Numbers = System\.Int32\[\] \(length 7\)', 'Auto = "auto-value"')
+    $wrongFields = @($fieldLines | Where-Object { $r.Out -notmatch "(?m)^\s+$_\s*$" })
+    Check 'heap --show: the values of an object''s fields (numbers, text, a struct, an enum, references)' ($r.Code -eq 0 -and $wrongFields.Count -eq 0 -and $r.Out -match "4 reachable objects of type 'EditorForm', the first 2 shown" -and $r.Out -match '(?m)^#2\s+ApVerify\.Views\.EditorForm') "not found: $($wrongFields -join ' | ')`n$($r.Out)"
+    $r = AP -t local heap $form.Id --show EditorForm --fields 'Number,auto,noSuchFieldZz' --top 1
+    Check 'heap --show --fields: only the named fields; one that does not exist is said to be missing' ($r.Out -match '(?m)^\s+Number = 42\s*$' -and $r.Out -match '(?m)^\s+Auto = "auto-value"\s*$' -and $r.Out -notmatch 'Note = ' -and $r.Out -match 'no field named noSuchFieldZz') $r.Out
+    $r = AP -t local heap $form.Id --show NoSuchTypeForVerify
+    Check 'heap --show for a type nothing reachable has: says so' ($r.Out -match "no reachable object of type 'NoSuchTypeForVerify'") $r.Out
+
+    $shownHwnd = (AP -t local windows --hwnd 'AP Verify Window').Out.Trim()
+    Check 'windows --hwnd prints the handle of that window' ((Test-Path $hwndFile) -and $shownHwnd -eq ('0x' + (Get-Content $hwndFile -Raw).Trim())) "got '$shownHwnd', the window says $(if (Test-Path $hwndFile) { Get-Content $hwndFile -Raw })"
+
     $tree = AP -t local ui 'AP Verify Window'
     Check 'ui: tree shows the button by name' ($tree.Out -match 'Button "Press me" #pressButton') $tree.Out
+    # What the controls report about themselves: the check box is checked, the first tab is the selected one.
+    Check 'ui: state of a check box, of the tabs and of the window' ($tree.Out -match '(?m)CheckBox "Check me" #checkBox \(checked\)' -and $tree.Out -match '(?m)TabItem "First tab" \(selected\)' -and $tree.Out -match '(?m)TabItem "Second tab" @' -and $tree.Out -match '(?m)^Window "AP Verify Window" \(normal\)') $tree.Out
+    [void](AP -t local ui click 'Second tab' --window 'AP Verify Window'); [void](AP -t local ui click 'Check me' --window 'AP Verify Window'); Start-Sleep -Milliseconds 400
+    $g1 = (AP -t local ui get 'Second tab' --window 'AP Verify Window').Out; $g2 = (AP -t local ui get 'First tab' --window 'AP Verify Window').Out; $g3 = (AP -t local ui get 'Check me' --window 'AP Verify Window').Out
+    Check 'ui get: the state follows what was done (the other tab is selected, the box is unchecked)' ($g1 -match '^TabItem "Second tab" \(selected\)' -and $g2 -match '^TabItem "First tab" @' -and $g3 -match '\(unchecked\)') "$g1 / $g2 / $g3"
+    Check 'ui get: a tab and its page have the same name; the tab is taken and the answer says there are two' ($g1 -match '\[2 controls have that name; this is the first') $g1
+
+    # --grep looks at every control; --max limits the lines printed, and the total is stated.
+    $r = AP -t local ui 'AP Verify Window' --grep 'Twin' --max 2
+    Check 'ui --grep finds controls beyond the first --max of the tree' ($r.Out -match '2 controls match' -and @($r.Out -split "`n" | Where-Object { $_ -match '^Button "Twin"' }).Count -eq 2) $r.Out
+    $r = AP -t local ui 'AP Verify Window' --grep 'Twin' --max 1
+    Check 'ui --grep --max 1: one line, and it says that two match' ($r.Out -match '1 matching controls shown of 2 that match' -and @($r.Out -split "`n" | Where-Object { $_ -match '^Button "Twin"' }).Count -eq 1) $r.Out
+
+    # Two buttons with the same name: the first is taken and the answer says there are two; --nth picks.
+    Remove-Item $clickFile -ErrorAction SilentlyContinue
+    $r = AP -t local ui click 'Twin' --window 'AP Verify Window'; Start-Sleep -Milliseconds 300
+    Check 'ui click on a name two controls have: the first, and the answer says there are two' ($r.Out -match '\[2 controls have that name; this is the first' -and (Get-Content $clickFile -Raw -ErrorAction SilentlyContinue) -eq 'twin:A') "$($r.Out) / $(if (Test-Path $clickFile) { Get-Content $clickFile -Raw })"
+    $r = AP -t local ui click 'Twin' --nth 2 --window 'AP Verify Window'; Start-Sleep -Milliseconds 300
+    Check 'ui click --nth 2 takes the second' ($r.Code -eq 0 -and (Get-Content $clickFile -Raw -ErrorAction SilentlyContinue) -eq 'twin:B') "$($r.Out) / $(if (Test-Path $clickFile) { Get-Content $clickFile -Raw })"
+    $r = AP -t local ui click 'Twin' --nth 3 --window 'AP Verify Window'
+    Check 'ui click --nth 3 of two: an error, nothing pressed' ($r.Code -ne 0 -and $r.Out -match 'only 2 controls have the name') $r.Out
+
+    # Another window in front of a control: what needs the mouse or a finger is refused and names that window.
+    # (Nothing is clicked in these checks, so they also run on a PC someone is using.)
+    Remove-Item $clickFile -ErrorAction SilentlyContinue
+    [void](AP -t local ui click 'Show cover' --window 'AP Verify Window')
+    $cw = AP -t local wait --window 'AP Verify Cover' --timeout 10s
+    $twin = (AP -t local ui 'AP Verify Window' --grep 'twinA').Out
+    $coverAt = if ((AP -t local windows 'AP Verify Cover').Out -match '(?m)\s(-?\d+),(-?\d+) (\d+)x(\d+)\s.*AP Verify Cover') { @([int]$Matches[1], [int]$Matches[2], [int]$Matches[3], [int]$Matches[4]) } else { $null }
+    $twinAt = if ($twin -match '@(\d+),(\d+)') { @([int]$Matches[1], [int]$Matches[2]) } else { $null }
+    if ($cw.Code -eq 0 -and $coverAt -and $twinAt -and $twinAt[0] -ge $coverAt[0] -and $twinAt[0] -lt ($coverAt[0] + $coverAt[2]) -and $twinAt[1] -ge $coverAt[1] -and $twinAt[1] -lt ($coverAt[1] + $coverAt[3])) {
+        $tx = $twinAt[0]; $ty = $twinAt[1]
+        $r = AP -t local ui dblclick 'Twin' --window 'AP Verify Window'
+        Check 'ui dblclick on a covered control: refused, the window in front is named' ($r.Code -ne 0 -and $r.Out -match 'is not on "AP Verify Window" \(powershell\.exe pid \d+\): "AP Verify Cover" \(powershell\.exe pid \d+\) is in front of it there; nothing was done' -and -not (Test-Path $clickFile)) "$($r.Code) $($r.Out)"
+        $r = AP -t local ui tap 'Twin' --window 'AP Verify Window'
+        Check 'ui tap on a covered control: refused the same way' ($r.Code -ne 0 -and $r.Out -match '"AP Verify Cover" .* is in front of it there; nothing was done' -and -not (Test-Path $clickFile)) "$($r.Code) $($r.Out)"
+        $r = AP -t local click "@$tx,$ty" --window 'AP Verify Window'
+        Check 'click --window: refused when another window is in front at that point' ($r.Code -ne 0 -and $r.Out -match '"AP Verify Cover" .* is in front of it there; nothing was done' -and $r.Out -match '--raise' -and -not (Test-Path $clickFile)) "$($r.Code) $($r.Out)"
+        $r = AP -t local touch tap "@$tx,$ty" --window 'AP Verify Window'
+        Check 'touch --window: refused when another window is in front at that point' ($r.Code -ne 0 -and $r.Out -match '"AP Verify Cover" .* is in front of it there; nothing was done' -and -not (Test-Path $clickFile)) "$($r.Code) $($r.Out)"
+        $r = AP -t local click "@$tx,$ty" --window
+        Check 'click --window without a title: an error, nothing clicked (not an unconditional click)' ($r.Code -ne 0 -and $r.Out -match '--window needs a title' -and -not (Test-Path $clickFile)) "$($r.Code) $($r.Out)"
+        $r = AP -t local click "@$tx,$ty" --window 'No Such Window Zz'
+        Check 'click --window with a title that matches nothing: an error, nothing clicked' ($r.Code -ne 0 -and $r.Out -match "no window matches 'No Such Window Zz'" -and -not (Test-Path $clickFile)) "$($r.Code) $($r.Out)"
+    } else { Check 'the cover window for the "in front" checks lies over the button' $false "$($cw.Out) / cover at $($coverAt -join ',') / $twin" }
+    [void](AP -t local ui click 'Hide cover' --window 'AP Verify Window')
+    [void](AP -t local wait --no-window 'AP Verify Cover' --timeout 10s)
+    [void](AP -t local ui click 'First tab' --window 'AP Verify Window')
     Check 'ui: tree shows the edit field by id' ($tree.Out -match 'Edit.*#inputBox') $tree.Out
     $s = AP -t local ui set '#inputBox' 'hello ui' --window 'AP Verify Window'
     Check 'ui set succeeds' ($s.Code -eq 0) $s.Out
@@ -446,12 +590,36 @@ Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { 
         [void](AP -t local click ($ex + 15) ($ey + 2) --hover --screen); Start-Sleep -Milliseconds 200
         $at = [System.Windows.Forms.Cursor]::Position
         Check 'click --hover moves the pointer there without clicking' ([Math]::Abs($at.X - ($ex + 15)) -le 1 -and [Math]::Abs($at.Y - ($ey + 2)) -le 1 -and -not (Test-Path $clickFile)) "pointer at $($at.X),$($at.Y), asked for $($ex + 15),$($ey + 2)"
-        [void](AP -t local click $ex $ey --screen); Start-Sleep -Milliseconds 200
+        $cr = AP -t local click $ex $ey --screen; Start-Sleep -Milliseconds 200
+        Check 'click names the window that got the click' ($cr.Out -match "clicked at screen $ex,$ey on `"AP Verify Window`" \(powershell\.exe pid $($form.Id)\)") $cr.Out
         [void](AP -t local key ctrl+a); [void](AP -t local type 'typed 한글 a\nb'); Start-Sleep -Milliseconds 300
         Check 'click + type put the text in the field, backslashes untouched' ((AP -t local ui get '#inputBox' --window 'AP Verify Window').Out -match '=typed 한글 a\\nb') (AP -t local ui get '#inputBox' --window 'AP Verify Window').Out
         [void](AP -t local key tab); [void](AP -t local key space); Start-Sleep -Milliseconds 500
         Check 'key presses reached the app (button pressed with the keyboard)' ((Test-Path $clickFile) -and ((Get-Content $clickFile -Raw -Encoding UTF8) -eq 'clicked:typed 한글 a\nb')) "file: $(if (Test-Path $clickFile) { Get-Content $clickFile -Raw -Encoding UTF8 })"
     } else { Check 'ui: edit field position' $false $edit }
+
+    # Touch: the app must see a finger, not the mouse (Windows marks the mouse messages it makes from touch).
+    $press = (AP -t local ui 'AP Verify Window' --grep pressButton).Out
+    if ($press -match '@(\d+),(\d+)') {
+        $px = $Matches[1]; $py = $Matches[2]
+        Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
+        [void](AP -t local click "@$px,$py"); Start-Sleep -Milliseconds 400
+        Check 'the test window tells mouse from touch: a mouse click is seen as mouse' ((Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'mouse') "$(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })"
+        Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
+        $r = AP -t local touch tap "@$px,$py" --window 'AP Verify Window'; Start-Sleep -Milliseconds 600
+        if ($r.Out -match 'Windows refused the touch input \(InitializeTouchInjection') {
+            Write-Host "  skipped: this Windows does not accept injected touch input ($($r.Out.Trim()))." -ForegroundColor Yellow
+        } else {
+            Check 'touch tap presses the button, and the app sees touch input' ($r.Code -eq 0 -and $r.Out -match "tapped by touch at screen $px,$py on `"AP Verify Window`"" -and (Test-Path $clickFile) -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch') "$($r.Code) $($r.Out) / pressed: $(Test-Path $clickFile) / seen as: $(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })"
+            Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
+            $r = AP -t local ui tap 'Press me' --window 'AP Verify Window'; Start-Sleep -Milliseconds 600
+            Check 'ui tap taps a control by name, by touch' ($r.Code -eq 0 -and $r.Out -match 'tapped Button "Press me" by touch' -and (Test-Path $clickFile) -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch') "$($r.Code) $($r.Out) / seen as: $(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })"
+            Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
+            $r = AP -t local touch drag "@$px,$py" "@$([int]$px + 200),$([int]$py + 120)" --duration 200ms; Start-Sleep -Milliseconds 400
+            Check 'touch drag that leaves the button does not press it' ($r.Code -eq 0 -and $r.Out -match 'dragged by touch' -and -not (Test-Path $clickFile)) "$($r.Code) $($r.Out)"
+        }
+        [void](AP -t local click "@$px,$([int]$py - 45)" --hover)   # the pointer comes back after touch input
+    } else { Check 'ui: button position for the touch checks' $false $press }
     }
 
     # A modal dialog disables the window it belongs to: `windows` says so, and a click on that window names it.
@@ -472,6 +640,21 @@ Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { 
     Start-Sleep -Milliseconds 700
     $win = (AP -t local windows 'AP Verify').Out
     Check 'windows: no longer disabled once the dialog is closed' ($win -match 'AP Verify Window' -and $win -notmatch 'disabled' -and $win -notmatch 'AP Verify Dialog') $win
+
+    # A window that keeps itself out of screen captures is on the screen for the person, not in a screenshot:
+    # `windows` marks it, and a screenshot of the area it is in names it.
+    $kept = if (Test-Path $affinityFile) { (Get-Content $affinityFile -Raw).Trim() } else { 'none' }
+    if ($kept -eq 'none') {
+        Write-Host '  skipped: this Windows did not let the test window keep itself out of captures, so there is nothing to detect.' -ForegroundColor Yellow
+    } else {
+        $win = (AP -t local windows 'AP Verify').Out
+        Check 'windows marks a window that keeps itself out of screen captures, and only that one' ($win -match '(?m)\sno-capture\s+AP Verify NoCapture\s*$' -and $win -notmatch '(?m)no-capture\s+AP Verify Window' -and $win -match '(?m)^no-capture = ') $win
+        $full = Join-Path $work 'full.png'
+        $sr = AP -t local screenshot --scale 0.25 -o $full
+        Check 'screenshot names the window that is on the screen but not in the image, and how it came out' ($sr.Out -match "NOT in this image as the person at the PC sees it: .*`"AP Verify NoCapture`" \(powershell\.exe pid $($form.Id)\) at -?\d+,-?\d+ \d+x\d+ \($([regex]::Escape($(if ($kept -eq 'left out') { 'left out: what is behind it shows' } else { 'shown black' })))\)") $sr.Out
+        $sr = AP -t local screenshot --window 'AP Verify Window' -o (Join-Path $work 'one.png')
+        Check 'screenshot of an area without such a window says nothing of the kind' ($sr.Out -notmatch 'NOT in this image') $sr.Out
+    }
 
     $shot = Join-Path $work 'shot.png'
     $sr = AP -t local screenshot --window 'AP Verify Window' -o $shot
@@ -507,6 +690,17 @@ Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { 
             $share = Start-Process $Exe -ArgumentList 'share', '--trust', $myKey, '--name', 'verify' -WindowStyle Minimized -PassThru
             $up = $false; 1..30 | ForEach-Object { if (-not $up) { Start-Sleep -Milliseconds 700; if ((AP list).Out -match '(?m)^verify\s') { $up = $true } } }
             Check 'a local target connects by discovery' $up (AP list).Out
+            if ($up) {
+                # A PC with several adapters: the list also gives the addresses it does not connect from.
+                $listed = (AP list).Out
+                $from = if ($listed -match '(?m)^verify\s+\S+\s+\S+\s+(\d+\.\d+\.\d+\.\d+)\s') { $Matches[1] } else { '' }
+                $upIf = @(Get-NetAdapter | Where-Object Status -eq 'Up' | ForEach-Object { $_.ifIndex })
+                $own = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $upIf -contains $_.InterfaceIndex -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { $_.IPAddress })
+                $others = if ($listed -match '(?m)^ADDRESS is the address each PC connects from\. Other addresses it reports having: verify ([\d., ]+)') { @($Matches[1].Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() }
+                $expectOthers = @($own | Where-Object { $_ -ne $from })
+                if ($expectOthers.Count -eq 0) { Check 'list: a PC with one address has no "other addresses" line' ($others.Count -eq 0) $listed }
+                else { Check 'list: the other addresses of a PC are ones Windows reports for it, and not the one it connects from' ($others.Count -ge 1 -and @($others | Where-Object { $own -notcontains $_ -or $_ -eq $from }).Count -eq 0) "listed: $($others -join ' ')  Windows: $($own -join ' ')  connects from: $from`n$listed" }
+            }
             if ($up) {
                 $dry = AP share --dry-run --lang en
                 Check 'share --dry-run: the developer PC that answers is listed with its key, and nothing is shared' ($dry.Code -eq 0 -and $dry.Out -match "(?m)^\s+$([regex]::Escape($env:COMPUTERNAME))\s+\(user .+\)\s+key $myKey\s+at [\d., ]+$" -and @((AP list).Out -split "`n" | Where-Object { $_ -match '\sidle\s|\sbusy' }).Count -eq 1) $dry.Out
@@ -589,6 +783,80 @@ Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { 
                 Check 'start <command> that only launches a GUI app says the job is not the app' ($r.Out -match 'already ended' -and $r.Out -match 'start --exe') $r.Out
                 [void](AP -t verify kill --name winver.exe)
 
+                # The folder a job starts in is part of the answer, and a job can be given environment variables.
+                $r = AP -t verify start --name cwdjob --exe $gui
+                Check 'start --exe names the folder the program started in (its own, by default)' ($r.Out -match "job \d+ started \(pid \d+\): winver\.exe\s+cwd=$([regex]::Escape("$env:WINDIR\System32"))\s*$") $r.Out
+                [void](AP -t verify kill cwdjob)
+                $r = AP -t verify start --name envjob --cwd $work --env AP_VERIFY_ONE=first --env 'AP_VERIFY_TWO=two words' 'Write-Output "$env:AP_VERIFY_ONE/$env:AP_VERIFY_TWO/$((Get-Location).Path)"; Start-Sleep 20'
+                Start-Sleep 3
+                $lg = (AP -t verify logs envjob).Out
+                Check 'start --env and --cwd reach the job, and the answer shows them' ($r.Out -match "cwd=$([regex]::Escape($work))" -and $r.Out -match 'env: AP_VERIFY_ONE=first AP_VERIFY_TWO=two words' -and $lg -match "(?m)^first/two words/$([regex]::Escape($work))\s*$") "$($r.Out)`n$lg"
+                [void](AP -t verify kill envjob)
+                Check 'start --env without NAME=VALUE is an error' ((AP -t verify start --env NOVALUE 'Write-Output x').Code -eq 2) ''
+
+                # A shortcut is started as the person at the PC starts it: its target, its arguments, its start folder.
+                $r = AP -t verify start --name lnkjob --lnk $lnk
+                $lnkPid = if ($r.Out -match 'job \d+ started \(pid (\d+)\): winver\.exe\s+cwd=(\S+)') { [int]$Matches[1] } else { 0 }
+                $lnkProc = if ($lnkPid) { Get-CimInstance Win32_Process -Filter "ProcessId=$lnkPid" }
+                Check 'start --lnk starts the shortcut''s target with its arguments in its start folder' ($lnkProc -and $lnkProc.Name -eq 'winver.exe' -and $lnkProc.CommandLine -match '--alpha "two words"\s*$' -and $r.Out -match "cwd=$([regex]::Escape($env:WINDIR)) \(the shortcut's `"Start in`"\)" -and $r.Out -match 'shortcut target .*winver\.exe\s+args: --alpha "two words"') "$($r.Out)`n$($lnkProc.CommandLine)"
+                [void](AP -t verify kill lnkjob); Start-Sleep 1
+
+                # An app that is not running: triage finds it by its Start menu shortcut and says how to start it.
+                $menuLnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'ApVerify Probe App.lnk'
+                try {
+                    Copy-Item $lnk $menuLnk
+                    $unLnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Uninstall ApVerify Probe App.lnk'
+                    $sc2 = $shell.CreateShortcut($unLnk); $sc2.TargetPath = "$env:WINDIR\System32\where.exe"; $sc2.Save()
+                    $tr = (AP -t verify triage ApVerifyProbe).Out
+                    Check 'triage for an app that is not running: where it may be installed and how to start it' ($tr -match "(?m)^process\s+'ApVerifyProbe' is NOT running" -and $tr -match "(?m)^\s+maybe\s+$([regex]::Escape("$env:WINDIR\System32\winver.exe"))\s+\(shortcut\)" -and $tr -match "start --lnk `"$([regex]::Escape($menuLnk))`"" -and $tr -match 'If winver\.exe above is the app') $tr
+                    Check 'triage does not offer an uninstaller as the app' ($tr -notmatch 'Uninstall ApVerify' -and $tr -notmatch 'where\.exe') $tr
+                } finally { Remove-Item $menuLnk, $unLnk -Force -ErrorAction SilentlyContinue }
+                $tr = (AP -t verify triage NoSuchAppForVerifyZz).Out
+                Check 'triage for a name nothing is installed under says that nothing was found' ($tr -match "'NoSuchAppForVerifyZz' is not running, and nothing by that name was found") $tr
+
+                # Exit codes of the .NET host are named like crash codes.
+                $r = AP -t verify exec --shell cmd 'exit /b -2147450751'
+                Check 'exec: an exit code of the .NET host is named' ($r.Code -eq -2147450751 -and $r.Out -match '\[exit code 0x80008081 \.NET host: InvalidArgFailure') "$($r.Code) $($r.Out)"
+                $r = AP -t verify deps "$env:WINDIR\System32\where.exe" --run --wait 5s '--' /?
+                Check 'deps --run on a program without a .NET host: says there is no host trace, and gives the exit code' ($r.Out -match 'no host trace was written' -and $r.Out -match '(?m)^result\s+the program ended after .* with exit 0\s*$') "$($r.Code) $($r.Out)"
+                $r = AP -t verify deps "$env:WINDIR\System32\where.exe" --run --wait 5s '--' -o ap-verify-arg --full   # quoted: PowerShell would take a bare -- for itself
+                $activity = Get-Content (Join-Path (Split-Path $Exe) 'agentprobe-activity.log') -Tail 200 -Encoding UTF8 -ErrorAction SilentlyContinue
+                Check 'deps --run: what follows -- goes to the program, not to agentprobe' ($r.Out -match 'args: -o ap-verify-arg --full') $r.Out
+                Check 'deps --run is in the activity log with the program and its arguments, like any command that starts something' (@($activity | Where-Object { $_ -match '#\d+ deps .*where\.exe --run .*-- -o ap-verify-arg' }).Count -ge 1 -and @($activity | Where-Object { $_ -match 'deps --run: started .*where\.exe -o ap-verify-arg --full in ' }).Count -ge 1) (($activity | Select-Object -Last 6) -join "`n")
+                $r = AP -t verify read $big --new --between 12:00 13:00
+                Check 'read --between with --new is refused, not answered about lines that were not read' ($r.Code -eq 2 -and $r.Out -match 'does not combine with --new') "$($r.Code) $($r.Out)"
+
+                # A real self-contained .NET app, when this PC can build one: what agentprobe says about a missing
+                # deps.json is what the .NET host really does (ends with 0x80008081 from the app's own folder only).
+                $sdk = if (Get-Command dotnet -ErrorAction SilentlyContinue) { (& dotnet --version 2>$null | Select-Object -First 1) }
+                $built = $false
+                if ("$sdk" -match '^(\d+)\.') {
+                    $src = Join-Path $work 'hostapp-src'; $app = Join-Path $work 'hostapp'; New-Item -ItemType Directory $src | Out-Null
+                    "<Project Sdk=`"Microsoft.NET.Sdk`"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net$($Matches[1]).0</TargetFramework><RuntimeIdentifier>win-x64</RuntimeIdentifier><SelfContained>true</SelfContained><AssemblyName>ApHostApp</AssemblyName></PropertyGroup></Project>" | Set-Content "$src\hostapp.csproj"
+                    'System.Console.WriteLine("ap-host-app ran"); return 7;' | Set-Content "$src\Program.cs"
+                    & dotnet publish "$src\hostapp.csproj" -c Release -o $app --nologo -v q 2>&1 | Out-Null
+                    $built = (Test-Path "$app\ApHostApp.exe") -and (Test-Path "$app\ApHostApp.deps.json")
+                }
+                if (-not $built) {
+                    Write-Host '  skipped: no .NET SDK that can publish a self-contained app here, so the .NET host checks run against no real host.' -ForegroundColor Yellow
+                } else {
+                    $r = AP -t verify deps "$app\ApHostApp.exe"
+                    Check 'deps: a complete self-contained .NET app has no problems' ($r.Code -eq 0 -and $r.Out -match 'ApHostApp\.deps\.json lists \d+ files, all in the folder') $r.Out
+                    $r = AP -t verify deps "$app\ApHostApp.exe" --run
+                    Check 'deps --run: the host runs it as an app, starts the runtime, and the app''s own exit code comes back' ($r.Code -eq 0 -and $r.Out -match '(?m)^host\s+apphost \d+\.\d+\.\d+.*hostfxr \d+.*hostpolicy \d+' -and $r.Out -match '(?m)^mode\s+app \(' -and $r.Out -match '(?m)^app\s+self-contained, runtime .*coreclr\.dll' -and $r.Out -match '(?m)^result\s+the host started the runtime; the app ended after .* with exit 7\.') "$($r.Code) $($r.Out)"
+                    Remove-Item "$app\ApHostApp.deps.json"
+                    $r = AP -t verify deps "$app\ApHostApp.exe"
+                    Check 'deps: the same app without its deps.json: the host trap is reported' ($r.Code -eq 1 -and $r.Out -match '(?m)^HOST TRAP\s+ApHostApp\.deps\.json is missing') $r.Out
+                    $r = AP -t verify start --name trap --exe "$app\ApHostApp.exe"
+                    Check 'what deps says is what the .NET host does: started from its own folder it ends with 0x80008081' ($r.Out -match "cwd=$([regex]::Escape($app))" -and $r.Out -match 'already ended with exit 0x80008081 \.NET host: InvalidArgFailure') $r.Out
+                    $r = AP -t verify start --name notrap --cwd $work --exe "$app\ApHostApp.exe"
+                    Check '... and started from another folder it runs (its own exit code 7)' ($r.Out -match 'already ended with exit 7\.' -and (AP -t verify logs notrap --all).Out -match 'ap-host-app ran') "$($r.Out)`n$((AP -t verify logs notrap --all).Out)"
+                    $r = AP -t verify deps "$app\ApHostApp.exe" --run
+                    Check 'deps --run names the mode the host took (split/FX), the exit code and what the host wrote' ($r.Code -eq 1 -and $r.Out -match '(?m)^mode\s+split/FX: NOT how an app runs' -and $r.Out -match '(?m)^result\s+the host gave up before it started the runtime: exit 0x80008081 \.NET host: InvalidArgFailure' -and $r.Out -match '(?m)^host trace: .*hosttrace-.*\.log \(\d+ lines') "$($r.Code) $($r.Out)"
+                    $r = AP -t verify deps "$app\ApHostApp.exe" --run --cwd $work
+                    Check 'deps --run --cwd: from another folder the same app starts' ($r.Code -eq 0 -and $r.Out -match '(?m)^mode\s+app \(' -and $r.Out -match 'with exit 7\.') "$($r.Code) $($r.Out)"
+                }
+
                 $grow = Join-Path $work 'grow.log'; 'first' | Set-Content $grow
                 [void](AP -t verify read $grow --new)
                 Add-Content $grow 'appended one'; Add-Content $grow 'appended two'
@@ -623,7 +891,7 @@ Add-Type -ReferencedAssemblies System.Windows.Forms 'namespace ApVerify.Views { 
                 $rep = (AP -t verify watch stop).Out
                 Check 'watch: reports the exit of the watched process' ($rep -match "exit\s+powershell\.exe\($($leak2.Id)\)") $rep
 
-                $h = (AP -t verify history --last 40).Out
+                $h = (AP -t verify history --last 200).Out
                 Check 'history lists what was run, with exit codes' ($h -match 'exit 7\s+exec Write-Output' -and $h -match 'exit 124') $h
                 $shotR = Join-Path $work 'remote.png'; [void](AP -t verify screenshot --scale 0.25 -o $shotR)
                 Check 'screenshot arrives over the session' ((Test-Path $shotR) -and (Get-Item $shotR).Length -gt 1000) ''

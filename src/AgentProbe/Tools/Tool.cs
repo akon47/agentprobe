@@ -8,6 +8,15 @@ internal sealed record Tool(string Name, string Group, string Summary, string Us
 {
     /// <summary>Chatty read-only tools are not written to the on-screen activity log one by one.</summary>
     public bool Quiet { get; init; }
+
+    /// <summary>
+    /// For a quiet tool that has one form which does change the PC (<c>deps --run</c> starts a program): true
+    /// for the arguments of that form, which is then logged and counted like any other command.
+    /// </summary>
+    public Func<string[], bool>? LoudWhen { get; init; }
+
+    /// <summary>May this call stay out of the activity log's command lines?</summary>
+    public bool IsQuiet(string[] args) => Quiet && LoudWhen?.Invoke(args) != true;
 }
 
 /// <summary>Everything a tool needs: where to write, when to stop, and the per-run state of this target.</summary>

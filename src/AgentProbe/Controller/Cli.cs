@@ -168,6 +168,12 @@ internal static class Cli
                 break;
             }
 
+            if (a == "--")
+            {
+                result.AddRange(args[i..]); // what follows belongs to the tool (the arguments of a program it starts)
+                break;
+            }
+
             if (a is "-t" or "--target" && i + 1 < args.Length) target = args[++i];
             else if (a.StartsWith("--target=", StringComparison.Ordinal)) target = a[9..];
             else if (a == "--full" && command is not ("dump" or "crashdumps")) full = true; // for those two it is the tool's own option
@@ -223,6 +229,31 @@ internal static class Cli
                 }
 
                 return [.. options, "--exe", args[i], "--", .. args[(i + 1)..]];
+            }
+
+            if (a == "--lnk" && tool == "start")
+            {
+                // start --lnk <shortcut> [more args]: what the shortcut starts; what follows is added to its arguments.
+                if (++i >= args.Length)
+                {
+                    Console.Error.WriteLine("--lnk needs the path of a shortcut (.lnk) on the target.");
+                    return null;
+                }
+
+                return [.. options, "--lnk", args[i], "--", .. args[(i + 1)..]];
+            }
+
+            if (a == "--env" && tool == "start")
+            {
+                if (i + 1 >= args.Length || !args[i + 1].Contains('='))
+                {
+                    Console.Error.WriteLine("--env needs NAME=VALUE.");
+                    return null;
+                }
+
+                options.Add(a);
+                options.Add(args[++i]);
+                continue;
             }
 
             if (wholeScript && a == "--") break; // the script's arguments start here
@@ -555,6 +586,7 @@ internal static class LocalRunner
         var stateful = tool.Name is "watch" or "dbg" or "trace" or "start" or "jobs" or "logs" or "history" or "result" or "crashdumps" or "wpr"
                        || (tool.Name == "read" && args.Contains("--new"))
                        || (tool.Name == "envsnap" && (args.Contains("--save") || args.Contains("--diff")))
+                       || (tool.LoudWhen?.Invoke(args) == true)
                        || (tool.Name == "kill" && args.Length > 0 && !args[0].StartsWith('-'));
         if (stateful)
             return Write(error, $"`{string.Join(' ', new[] { tool.Name }.Concat(args.Take(2)))}` keeps state between calls and needs a real session: -t local runs each command in a fresh process. " +

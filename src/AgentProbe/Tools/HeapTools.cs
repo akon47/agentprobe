@@ -21,13 +21,21 @@ internal static class HeapTools
             heap <pid|name> [--type TEXT] [--ns TEXT] [--top 25] [--live] [--timeout 2m]
             heap <pid|name> --windows [--type TEXT] [--ns TEXT]
             heap <pid|name> --why <TYPE>
+            heap <pid|name> --show <TYPE> [--fields a,b] [--top 5]
               The .NET objects on the process's heap by type, largest total first: COUNT, BYTES, TYPE.
               BYTES is the objects' own size: what they point to (a byte[] in a field) is counted under its own type.
               --type keeps the types whose OWN name contains TEXT (case-insensitive): the part after the namespace,
               without generic arguments, so `--type Window` finds MyApp.SettingsWindow and not everything in
               System.Windows. TEXT with a dot is looked for in the whole name (`--type MyApp.Views`), and TEXT with
               * or ? is a pattern the whole name has to match (`--type "MyApp.*Window"`, `--type "*Cache*"`).
+              Several at once, from ONE snapshot: `--type "Pen,Stylus,Tablet"` (or with | between them); a text
+              that matches nothing is named in the answer.
               --ns keeps the types whose namespace contains TEXT; it combines with --type.
+              --show prints the fields of the first reachable objects of that type (its name, with or without
+              namespace): numbers, booleans and strings as their values, enums as their number, a reference as
+              the type of the object it points to (or null), a small struct with its own fields. The type's own
+              fields come first, inherited ones after; --fields keeps the named ones (`--fields _disposed,Name`;
+              an auto-property is named by the property). These are fields: a WPF dependency property is not one.
               --live counts only objects that are still reachable from a root, i.e. what a garbage collection
               would keep: the number to compare before and after a fix ("20 editor windows" -> "0").
               --windows answers "how many windows are still alive?": the reachable objects of WPF Window,
@@ -37,9 +45,11 @@ internal static class HeapTools
               --why takes the nearest reachable object of that type (its name, with or without namespace; if there
               is none, the first type whose name contains the text) and prints the chain of references that keeps it
               alive, from its root down to it.
-              The heap is read from a snapshot, so the app is paused only while the snapshot is taken. --live and
-              --why walk every reference and take longer on a large heap; when --timeout ends them early the
-              output says INCOMPLETE. For .NET Framework and .NET (Core) processes that are 64-bit like
+              The heap is read from a snapshot, so the app is paused only while the snapshot is taken: at most the
+              "snapshot taken in N ms" of the answer, every time `heap` is called (one or two hundred ms for a
+              large app, which is several frames of an app that shows live video: ask for all you need in one
+              call). --live, --why and --show walk every reference and take longer on a large heap; when
+              --timeout ends them early the output says INCOMPLETE. For .NET Framework and .NET (Core) processes that are 64-bit like
               agentprobe: a 32-bit process cannot be read this way (see `dump --full --keep-remote`).
             """, HeapAsync),
     ];
@@ -172,6 +182,36 @@ internal static class HeapTools
     /// </summary>
     private static Func<string, bool> TypeFilter(string? type, string? ns)
     {
+        if (type == null) return OneTypeFilter(null, ns);
+        var each = Alternatives(type).Select(t => OneTypeFilter(t, ns)).ToList();
+        return each.Count == 1 ? each[0] : name => each.Any(f => f(name));
+    }
+
+    /// <summary>
+    /// The texts of a --type that asks for several at once: "Pen,Stylus|Tablet" is three. A comma inside generic
+    /// arguments ("Dictionary&lt;String, Int32&gt;") or array brackets ("Byte[,]") belongs to the name and does not separate.
+    /// </summary>
+    private static List<string> Alternatives(string type)
+    {
+        var parts = new List<string>();
+        var depth = 0;
+        var start = 0;
+        for (var i = 0; i <= type.Length; i++)
+        {
+            var c = i < type.Length ? type[i] : '|';
+            if (c is '<' or '[') depth++;
+            else if (c is '>' or ']') depth = Math.Max(0, depth - 1);
+            if (i < type.Length && !(c == '|' || (c == ',' && depth == 0))) continue;
+            var part = type[start..i].Trim();
+            if (part.Length > 0) parts.Add(part);
+            start = i + 1;
+        }
+
+        return parts.Count > 0 ? parts : [type];
+    }
+
+    private static Func<string, bool> OneTypeFilter(string? type, string? ns)
+    {
         Func<string, bool> byType = _ => true;
         if (type != null && (type.Contains('*') || type.Contains('?')))
         {
@@ -214,9 +254,11 @@ internal static class HeapTools
         }
 
         var why = a.Get("why");
+        var show = a.Get("show");
         var windowsOnly = a.Flag("windows");
-        if (windowsOnly && why != null) return ctx.Fail("heap: --windows and --why are two different questions; ask them one at a time.");
-        var live = a.Flag("live") || why != null || windowsOnly;
+        if ((windowsOnly ? 1 : 0) + (why != null ? 1 : 0) + (show != null ? 1 : 0) > 1) return ctx.Fail("heap: --windows, --why and --show are different questions; ask them one at a time.");
+        if (a.Flag("show") || a.Flag("why")) return ctx.Fail("heap: --show and --why need a type name.");
+        var live = a.Flag("live") || why != null || windowsOnly || show != null;
         var filter = a.Get("type");
         var ns = a.Get("ns");
         Func<string, bool> wanted;
@@ -281,6 +323,9 @@ internal static class HeapTools
             }
 
             string? chain = null;
+            long showCount = 0;
+            var showObjects = new List<ulong>(); // the first ones met, nearest to a root first
+            var showNear = new Dictionary<string, long>(StringComparer.Ordinal); // other types whose name contains the text
             if (!live)
             {
                 foreach (var o in heap.EnumerateObjects())
@@ -319,6 +364,20 @@ internal static class HeapTools
                     var o = heap.GetObject(queue.Dequeue());
                     if (!o.IsValid) continue;
                     Count(o);
+                    if (show != null)
+                    {
+                        var name = o.Type?.Name ?? "";
+                        if (IsType(name, show))
+                        {
+                            showCount++;
+                            if (showObjects.Count < 50) showObjects.Add(o.Address);
+                        }
+                        else if (name.Contains(show, StringComparison.OrdinalIgnoreCase))
+                        {
+                            showNear[name] = showNear.GetValueOrDefault(name) + 1;
+                        }
+                    }
+
                     if (why != null)
                     {
                         var name = o.Type?.Name ?? "";
@@ -361,11 +420,40 @@ internal static class HeapTools
             }
 
             var flavor = $".NET {(clr.Flavor == ClrFlavor.Desktop ? "Framework " : "")}{clr.Version}";
+            if (show != null)
+            {
+                var stopped = complete ? "" : $"; INCOMPLETE: stopped after {Format.Duration(sw.Elapsed)}, there may be more (raise --timeout)";
+                if (showObjects.Count == 0)
+                {
+                    ctx.Out.WriteLine($"{p.Name} (pid {p.Pid}, {flavor}): no reachable object of type '{show}' ({objects:N0} reachable objects looked at; snapshot taken in {snapshotMs} ms){stopped}");
+                    if (showNear.Count > 0)
+                        ctx.Out.WriteLine("types whose name contains it: " + string.Join(", ", showNear.OrderByDescending(n => n.Value).Take(8).Select(n => $"{Format.Clip(n.Key, 90)} ({n.Value:N0})")) + (showNear.Count > 8 ? $" (+{showNear.Count - 8} more)" : ""));
+                    return complete ? 0 : 124;
+                }
+
+                var shownObjects = Math.Clamp(a.GetInt("top", 5), 1, 50);
+                var wantedFields = a.Get("fields")?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                ctx.Out.WriteLine($"{p.Name} (pid {p.Pid}, {flavor}): {showCount:N0} reachable object{(showCount == 1 ? "" : "s")} of type '{show}'" +
+                                  (showCount > shownObjects ? $", the first {Math.Min(shownObjects, showObjects.Count)} shown (--top)" : "") + $"; snapshot taken in {snapshotMs} ms{stopped}");
+                var number = 0;
+                foreach (var address in showObjects.Take(shownObjects)) ctx.Out.Write(Fields(heap.GetObject(address), ++number, wantedFields));
+                return complete ? 0 : 124;
+            }
+
             if (chain != null)
             {
                 ctx.Out.WriteLine($"{p.Name} (pid {p.Pid}, {flavor}): what keeps the first reachable '{why}' object alive (root first; snapshot taken in {snapshotMs} ms)");
                 ctx.Out.Write(chain);
                 return 0;
+            }
+
+            // Several texts were asked for at once: one that found nothing must not hide among the rows of the others.
+            string? Unmatched()
+            {
+                if (filter == null || Alternatives(filter) is not { Count: > 1 } alternatives) return null;
+                var nothing = alternatives.Where(alt => !stats.Keys.Any(OneTypeFilter(alt, ns))).ToList();
+                return nothing.Count == 0 ? null
+                    : $"no {(live ? "reachable " : "")}{(windowsOnly ? "window " : "")}object of a type matching: {string.Join(", ", nothing)}{(complete ? "" : " (not met before it stopped)")}";
             }
 
             var shown = stats.Where(s => wanted(s.Key)).OrderByDescending(s => windowsOnly ? s.Value.Count : s.Value.Bytes).ThenBy(s => s.Key, StringComparer.Ordinal).ToList();
@@ -385,6 +473,7 @@ internal static class HeapTools
                 }
 
                 ctx.Out.Write(w.ToString());
+                if (Unmatched() is { } noWindows) ctx.Out.WriteLine(noWindows);
                 if (shown.Count > top) ctx.Out.WriteLine($"... and {shown.Count - top:N0} more window types ({shown.Skip(top).Sum(s => s.Value.Count):N0} objects): raise --top or narrow with --type");
                 if (shown.Any(s => s.Value.StateUnknown > 0))
                     ctx.Out.WriteLine("?: this framework version keeps a window's state somewhere this tool does not know; COUNT is still exact.");
@@ -422,6 +511,9 @@ internal static class HeapTools
             var t = new Table(">COUNT", ">BYTES", "TYPE");
             foreach (var s in shown.Take(top)) t.Add(s.Value.Count.ToString("N0"), Format.Bytes(s.Value.Bytes), Format.Clip(s.Key, 150));
             ctx.Out.Write(t.ToString());
+
+            if (Unmatched() is { } noObjects) ctx.Out.WriteLine(noObjects);
+
             if (shown.Count > top)
             {
                 var rest = shown.Skip(top).ToList();
@@ -436,6 +528,146 @@ internal static class HeapTools
             return ctx.Fail($"heap: could not read the .NET heap of {p.Name} (pid {p.Pid}): {ex.GetType().Name}: {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// One object for --show: its type and size, then its fields, the type's own first and inherited ones after.
+    /// A value that cannot be read is printed as such, never as a default.
+    /// </summary>
+    private static string Fields(ClrObject o, int number, string[]? wanted)
+    {
+        var sb = new System.Text.StringBuilder();
+        var type = o.Type;
+        sb.Append('#').Append(number).Append("  ").Append(Format.Clip(type?.Name ?? "(unknown type)", 140)).Append($" ({Format.Bytes((long)o.Size)})\n");
+        if (type == null) return sb.ToString();
+
+        // Most derived class first: its fields are the ones the question is usually about.
+        var chain = new List<string>();
+        for (var t = type; t != null && chain.Count < 64; t = t.BaseType) chain.Add(t.Name ?? "");
+        int Level(ClrInstanceField f)
+        {
+            var at = chain.IndexOf(f.ContainingType?.Name ?? "");
+            return at < 0 ? chain.Count : at;
+        }
+
+        var fields = type.Fields.Where(f => f.Name != null).OrderBy(Level).ToList();
+        if (wanted != null)
+        {
+            static string Bare(string n) => n.TrimStart('_');
+            var missing = wanted.Where(w => !fields.Any(f => Matches(f, w))).ToList();
+            fields = fields.Where(f => wanted.Any(w => Matches(f, w))).ToList();
+            if (missing.Count > 0)
+                sb.Append($"   no field named {string.Join(", ", missing)}; the type has: {Format.Clip(string.Join(", ", type.Fields.Where(f => f.Name != null).OrderBy(Level).Select(f => FieldName(f.Name!))), 600)}\n");
+
+            static bool Matches(ClrInstanceField f, string asked) =>
+                f.Name!.Equals(asked, StringComparison.OrdinalIgnoreCase) || FieldName(f.Name!).Equals(asked, StringComparison.OrdinalIgnoreCase) ||
+                Bare(FieldName(f.Name!)).Equals(Bare(asked), StringComparison.OrdinalIgnoreCase);
+        }
+
+        const int most = 40;
+        string? declaredBy = null;
+        foreach (var f in fields.Take(wanted != null ? int.MaxValue : most))
+        {
+            var owner = f.ContainingType?.Name ?? "";
+            if (owner != declaredBy && owner != type.Name && owner.Length > 0) sb.Append("   (from ").Append(Format.Clip(owner, 120)).Append(")\n");
+            declaredBy = owner;
+            sb.Append("   ").Append(FieldName(f.Name!)).Append(" = ").Append(Value(f, o.Address, false, 0)).Append('\n');
+        }
+
+        if (wanted == null && fields.Count > most) sb.Append($"   ... {fields.Count - most} more fields (--fields <names> picks any of them)\n");
+        if (fields.Count == 0 && wanted == null) sb.Append("   (no fields)\n");
+        return sb.ToString();
+    }
+
+    /// <summary>"Name" for the field the compiler made for an auto-property ("&lt;Name&gt;k__BackingField"), else the field's own name.</summary>
+    private static string FieldName(string raw) =>
+        raw.Length > 2 && raw[0] == '<' && raw.IndexOf(">k__BackingField", StringComparison.Ordinal) is > 1 and var end ? raw[1..end] : raw;
+
+    /// <summary>A field's value as text. <paramref name="interior"/>: the field belongs to a struct that lies inside another object.</summary>
+    private static string Value(ClrInstanceField f, ulong address, bool interior, int depth)
+    {
+        static string Inv(IFormattable v) => v.ToString(null, System.Globalization.CultureInfo.InvariantCulture);
+        static string Text(string s) => "\"" + Format.Clip(s, 160) + "\"" + (s.Length >= 4096 ? " (4096 characters or more: only that much is read)" : s.Length > 160 ? $" ({s.Length} characters)" : "");
+        try
+        {
+            // The library answers 0, false or null for memory it cannot read; that must not be printed as a value.
+            var size = f.ElementType == ClrElementType.Struct ? Math.Max(1, f.Size) : f.IsObjectReference || f.ElementType == ClrElementType.String ? 8 : Math.Max(1, f.Size);
+            var probe = new byte[Math.Min(size, 64)];
+            if (f.ContainingType is { } owner && owner.Heap.Runtime.DataTarget.DataReader.Read(f.GetAddress(address, interior), probe) != probe.Length) return "(memory not readable)";
+
+            switch (f.ElementType)
+            {
+                case ClrElementType.Boolean: return f.Read<bool>(address, interior) ? "true" : "false";
+                case ClrElementType.Char:
+                {
+                    var c = f.Read<char>(address, interior);
+                    return char.IsControl(c) ? $"U+{(int)c:X4}" : $"'{c}'";
+                }
+
+                case ClrElementType.Int8: return EnumOr(f, Inv(f.Read<sbyte>(address, interior)));
+                case ClrElementType.UInt8: return EnumOr(f, Inv(f.Read<byte>(address, interior)));
+                case ClrElementType.Int16: return EnumOr(f, Inv(f.Read<short>(address, interior)));
+                case ClrElementType.UInt16: return EnumOr(f, Inv(f.Read<ushort>(address, interior)));
+                case ClrElementType.Int32: return EnumOr(f, Inv(f.Read<int>(address, interior)));
+                case ClrElementType.UInt32: return EnumOr(f, Inv(f.Read<uint>(address, interior)));
+                case ClrElementType.Int64: return EnumOr(f, Inv(f.Read<long>(address, interior)));
+                case ClrElementType.UInt64: return EnumOr(f, Inv(f.Read<ulong>(address, interior)));
+                case ClrElementType.Float: return Inv(f.Read<float>(address, interior));
+                case ClrElementType.Double: return Inv(f.Read<double>(address, interior));
+                case ClrElementType.NativeInt or ClrElementType.NativeUInt or ClrElementType.Pointer or ClrElementType.FunctionPointer:
+                    return "0x" + f.Read<ulong>(address, interior).ToString("X");
+                case ClrElementType.String:
+                {
+                    var s = f.ReadString(address, interior);
+                    return s == null ? "null" : Text(s);
+                }
+
+                case ClrElementType.Struct:
+                {
+                    var typeName = Format.Clip(f.Type?.Name ?? "struct", 100);
+                    if (f.Type == null) return $"{{{typeName}}} (its layout is not known: not read)";
+                    if (f.Type.IsEnum)
+                    {
+                        // Read by its size. Whether the enum's numbers are signed is not known here, so a value
+                        // with the top bit set is given both ways.
+                        var (signed, unsigned) = f.Size switch
+                        {
+                            1 => ((long)f.Read<sbyte>(address, interior), (ulong)f.Read<byte>(address, interior)),
+                            2 => (f.Read<short>(address, interior), f.Read<ushort>(address, interior)),
+                            8 => (f.Read<long>(address, interior), f.Read<ulong>(address, interior)),
+                            _ => (f.Read<int>(address, interior), (ulong)f.Read<uint>(address, interior)),
+                        };
+                        return EnumOr(f, signed >= 0 ? Inv(signed) : $"{Inv(signed)} (or {Inv(unsigned)} if the enum is unsigned)");
+                    }
+                    var inner = f.Type.Fields.Where(x => x.Name != null).ToList();
+                    if (depth >= 1 || inner.Count == 0 || inner.Count > 8) return $"{{{typeName}}}";
+                    var at = f.GetAddress(address, interior);
+                    return $"{{{typeName}: {string.Join(", ", inner.Select(x => FieldName(x.Name!) + " = " + Value(x, at, true, depth + 1)))}}}";
+                }
+
+                default:
+                {
+                    if (!f.IsObjectReference) return $"({f.ElementType}: not read)";
+                    var r = f.ReadObject(address, interior);
+                    if (r.IsNull) return "null";
+                    if (!r.IsValid || r.Type == null) return "(a reference that could not be followed)";
+                    if (r.Type.IsString)
+                    {
+                        return Text((string?)r ?? "");
+                    }
+
+                    var name = Format.Clip(r.Type.Name ?? "(unknown type)", 120);
+                    return r.IsArray ? $"{name} (length {r.AsArray().Length})" : name;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or ClrDiagnosticsException or IOException or NotSupportedException or OverflowException)
+        {
+            return $"(not readable: {ex.GetType().Name})";
+        }
+    }
+
+    /// <summary>A number, with the enum type it belongs to when the field is an enum (the number is what is stored; names are not looked up).</summary>
+    private static string EnumOr(ClrInstanceField f, string number) => f.Type is { IsEnum: true } e ? $"{number} ({Format.Clip(e.Name ?? "enum", 80)})" : number;
 
     /// <summary>True when <paramref name="typeName"/> is the type asked for: its full name, or its own name without namespace and generic arguments.</summary>
     private static bool IsType(string typeName, string asked)

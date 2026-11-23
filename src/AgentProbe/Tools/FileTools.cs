@@ -33,15 +33,24 @@ internal static partial class FileTools
             """, LsAsync) { Quiet = true },
         new("read", "Files", "Read a text file, or just the part you need",
             """
-            read <file> [--tail N] [--head N] [--lines 100-180] [--grep REGEX] [--new]
+            read <file> [--tail N] [--head N] [--lines 100-180] [--grep REGEX] [--between 12:02 12:05] [--new]
               --new    only complete lines appended since the last `read --new` of this file (first call: last 40 lines).
                        Ideal for following a log between test steps without re-reading it.
               --grep   matching lines with line numbers; the WHOLE file is searched whatever its size.
                        Without --head/--tail the last 300 matches are shown and the total is stated.
+              --between FROM TO   the log lines of a time span: from FROM up to, not including, TO (HH:MM or
+                       HH:MM:SS, 24-hour; a span may cross midnight). A line's time is the first HH:MM[:SS] that
+                       starts within its first 48 characters ("1:05:03 PM" is read as 13:05:03); a line without one
+                       (a stack trace) belongs to the line before it. It is the time of day only: in a log of several
+                       days, every day's span is shown. Combines with --grep and --lines, not with --new.
               Encoding is detected per line (UTF-8, UTF-16, ANSI). Big files without a filter return their last 200 lines.
             """, ReadAsync) { Quiet = true },
         new("stat", "Files", "Facts about a file: version, x86/x64, .NET or native, SHA-256, blocked-from-internet flag",
-            "stat <file> [more files...]", StatAsync) { Quiet = true },
+            """
+            stat <file> [more files...]
+              For a shortcut (.lnk) also what it starts: the target, its arguments and the "Start in" folder
+              (`start --lnk <shortcut>` starts exactly that).
+            """, StatAsync) { Quiet = true },
         new("locks", "Files", "Which processes keep a file open (why it cannot be deleted/replaced)",
             "locks <file> [more files...]", LocksAsync) { Quiet = true },
     ];
@@ -112,6 +121,26 @@ internal static partial class FileTools
     private static Task<int> ReadAsync(ToolContext ctx, string[] args)
     {
         var a = ArgParser.Parse(args, "new");
+        TimeSpan betweenFrom = default, betweenTo = default;
+        var between = a.Has("between");
+        if (between)
+        {
+            // --between 12:02 12:05 (the second time arrives as a plain word, before or after the file's name),
+            // or 12:02-12:05 / 12:02..12:05 in one.
+            var parts = (a.Get("between") ?? "").Split(["..", "-"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+            var second = parts.Count == 1 ? a.Positionals.FindIndex(x => TimeOfDay(x) != null) : -1;
+            if (second >= 0)
+            {
+                parts.Add(a.Positionals[second]);
+                a.Positionals.RemoveAt(second);
+            }
+
+            if (parts.Count != 2 || TimeOfDay(parts[0]) is not { } t0 || TimeOfDay(parts[1]) is not { } t1)
+                return Task.FromResult(ctx.Fail("read: --between wants two times of day: --between 12:02 12:05   (HH:MM or HH:MM:SS)"));
+            (betweenFrom, betweenTo) = (t0, t1);
+            if (a.Flag("new")) return Task.FromResult(ctx.Fail("read: --between goes through the whole file and does not combine with --new (which reads only what was appended)."));
+        }
+
         if (a.Positionals.Count == 0) return Task.FromResult(ctx.Fail("read: which file?"));
         var path = ctx.Runtime.ResolvePath(a.Positionals[0]);
         if (!File.Exists(path)) return Task.FromResult(ctx.Fail($"read: {path} does not exist."));
@@ -163,14 +192,14 @@ internal static partial class FileTools
                 note = cursor > length ? "[file was truncated/rotated; showing its end]" : "[first read: showing the end; later --new calls return only appended lines]";
             }
         }
-        else if (grep == null && head == null && tail == null && !hasRange && length > 2 * 1024 * 1024)
+        else if (grep == null && !between && head == null && tail == null && !hasRange && length > 2 * 1024 * 1024)
         {
             start = length - (512 * 1024);
             dropFirst = true;
             tail = 200;
             note = $"[file is {Format.Bytes(length)}; showing its last 200 lines. Use --grep/--lines/--head/--tail to look elsewhere, or `pull` it]";
         }
-        else if (tail != null && grep == null && !hasRange && head == null && length > 8 * 1024 * 1024)
+        else if (tail != null && grep == null && !between && !hasRange && head == null && length > 8 * 1024 * 1024)
         {
             // Only the end is wanted: do not read gigabytes to reach it.
             start = Math.Max(0, length - Math.Max(4L * 1024 * 1024, tail.Value * 8192L));
@@ -179,9 +208,12 @@ internal static partial class FileTools
 
         if (utf16 != null && start % 2 != 0) start--;
 
-        // With --grep, --lines or --head the file is scanned from its first byte to its last, whatever its size:
-        // "no matches" must mean there are none.
-        var numbered = (grep != null || hasRange) && start == 0;
+        // With --grep, --between, --lines or --head the file is scanned from its first byte to its last, whatever
+        // its size: "no matches" must mean there are none.
+        var numbered = (grep != null || between || hasRange) && start == 0;
+        var inSpan = false; // --between: the last line that had a time was inside the span
+        long timed = 0;
+        TimeSpan? firstTime = null, lastTime = null;
         const int maxShown = 5000;
         var window = new Queue<(long no, string text)>();
         var windowSize = tail ?? (head == null ? (grep != null ? 300 : maxShown) : int.MaxValue);
@@ -199,8 +231,21 @@ internal static partial class FileTools
             if (isNew && !complete) break; // still being written: it is returned whole by the next call
             consumed = end;
             lineNo++;
-            if (hasRange && lineNo < rangeFrom) continue;
             if (hasRange && lineNo > rangeTo) break;
+            if (between && TimeIn(text) is { } at)
+            {
+                inSpan = betweenFrom <= betweenTo ? at >= betweenFrom && at < betweenTo : at >= betweenFrom || at < betweenTo;
+                if (!hasRange || lineNo >= rangeFrom)
+                {
+                    timed++;
+                    firstTime ??= at;
+                    lastTime = at;
+                }
+            }
+
+            if (hasRange && lineNo < rangeFrom) continue;
+            if (between && !inSpan) continue;
+
             if (grep != null && !grep.IsMatch(text)) continue;
             matched++;
             if (head != null && tail == null)
@@ -221,6 +266,14 @@ internal static partial class FileTools
         var shown = result.ToList();
         if (tail == null && head == null && matched > shown.Count)
             note = grep != null ? $"[{matched} matches; showing the last {shown.Count}. Narrow the pattern or use --head/--tail]" : $"[{matched} lines; showing the last {shown.Count}. Use --lines/--head/--tail]";
+        if (between && shown.Count == 0)
+        {
+            static string Clock(TimeSpan t) => t.ToString(@"hh\:mm\:ss", System.Globalization.CultureInfo.InvariantCulture);
+            var where = hasRange ? $"of lines {rangeFrom}-{rangeTo}" : "of this file";
+            note = timed == 0
+                ? $"[no line {where} has a time of day (HH:MM or HH:MM:SS) within its first 48 characters: --between has nothing to go by]"
+                : $"[no {(grep != null ? "matching " : "")}line from {Clock(betweenFrom)} up to {Clock(betweenTo)}; the {timed} lines {where} that have a time run from {Clock(firstTime!.Value)} to {Clock(lastTime!.Value)}]";
+        }
 
         var sb = new StringBuilder();
         foreach (var (no, text) in shown)
@@ -234,6 +287,39 @@ internal static partial class FileTools
         else if (shown.Count == 0) ctx.Out.WriteLine(isNew ? "[no new lines]" : grep != null ? "[no matches]" : "[empty]");
         return Task.FromResult(0);
     }
+
+    /// <summary>"12:02", "12:02:30" or "12:02:30.250" as a time of day, or null.</summary>
+    private static TimeSpan? TimeOfDay(string text)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(text.Trim(), @"^([0-9]{1,2}):([0-9]{2})(?::([0-9]{2})(?:[.,]([0-9]{1,3}))?)?$");
+        return m.Success ? TimeFrom(m, null) : null;
+    }
+
+    private static TimeSpan? TimeFrom(System.Text.RegularExpressions.Match m, string? half)
+    {
+        int h = int.Parse(m.Groups[1].Value), min = int.Parse(m.Groups[2].Value), sec = m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : 0;
+        if (half != null)
+        {
+            // A 12-hour clock: 12 AM is midnight, 1 PM is 13.
+            if (h is < 1 or > 12) return null;
+            h = (h % 12) + (half is "P" or "p" ? 12 : 0);
+        }
+
+        if (h > 23 || min > 59 || sec > 59) return null;
+        var ms = m.Groups[4].Success ? int.Parse(m.Groups[4].Value.PadRight(3, '0')) : 0;
+        return new TimeSpan(0, h, min, sec, ms);
+    }
+
+    /// <summary>The time of day a log line starts with: the first HH:MM[:SS[.fff]] within its first 48 characters, or null.</summary>
+    private static TimeSpan? TimeIn(string line)
+    {
+        var m = LineTime().Match(line.Length > 80 ? line[..80] : line); // the time has to START within the first 48 characters
+        if (!m.Success || m.Index >= 48) return null;
+        return TimeFrom(m, m.Groups[5].Success ? m.Groups[5].Value : null);
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"(?<![0-9:.])([0-9]{1,2}):([0-9]{2})(?::([0-9]{2})(?:[.,]([0-9]{1,3}))?)?(?![0-9:])(?: ?([AaPp])[Mm]\b)?")]
+    private static partial System.Text.RegularExpressions.Regex LineTime();
 
     /// <summary>UTF-16 (with a BOM, or recognisable by its zero bytes), or null for byte-oriented text (UTF-8 / ANSI).</summary>
     private static Encoding? DetectUtf16(FileStream fs)
@@ -359,6 +445,31 @@ internal static partial class FileTools
             if (!string.IsNullOrEmpty(vi.FileVersion))
                 ctx.Out.WriteLine($"  version   file {vi.FileVersion}  product {vi.ProductVersion}  \"{Format.Clip(vi.FileDescription, 60)}\"  {Format.Clip(vi.CompanyName, 40)}");
             if (DescribePe(path) is { } pe) ctx.Out.WriteLine($"  image     {pe}");
+            if (path.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+            {
+                // What the shortcut starts, as Explorer would: the three things that decide how the app comes up.
+                if (Native.ShellLink.Read(path, out var why) is not { } link)
+                {
+                    ctx.Out.WriteLine($"  shortcut  (cannot be read: {why})");
+                }
+                else if (link.Target.Length == 0)
+                {
+                    ctx.Out.WriteLine("  shortcut  does not point to a file (a Store app, a web link or a shell folder)");
+                }
+                else if (link.Advertised)
+                {
+                    ctx.Out.WriteLine($"  shortcut  made by Windows Installer: the link holds no program path (Windows works it out when the shortcut is used), only its icon file {link.Target}");
+                    ctx.Out.WriteLine($"            arguments {(link.Arguments.Length > 0 ? link.Arguments : "(none)")}");
+                }
+                else
+                {
+                    ctx.Out.WriteLine($"  shortcut  target    {link.Target}{(File.Exists(link.Target) || Directory.Exists(link.Target) ? "" : "   (DOES NOT EXIST)")}");
+                    ctx.Out.WriteLine($"            arguments {(link.Arguments.Length > 0 ? link.Arguments : "(none)")}");
+                    ctx.Out.WriteLine("            start in  " + (link.WorkingDirectory.Length == 0 ? "(none named)"
+                        : link.WorkingDirectory + (Directory.Exists(link.WorkingDirectory) ? "" : "   (DOES NOT EXIST)")));
+                }
+            }
+
             try
             {
                 using var s = fi.OpenRead();

@@ -126,16 +126,16 @@ behind a router or on a larger VPN is not found that way; start it with the addr
 
 | Area | Commands |
 |---|---|
-| Run | `exec` (PowerShell, pwsh, 32-bit PowerShell, cmd; `exec -f script.ps1 -Arg value` sends a script with its arguments), `start` / `jobs` / `logs` / `kill` background jobs (`start --exe app.exe` tracks a GUI app itself), `wait` for a process, window, port, file, log line or idle CPU |
-| Files | `push`, `pull` (files and folders), `ls`, `read` (tail, grep, line ranges, only-new), `stat` (version, x86/x64, .NET or native, SHA-256, blocked-download flag), `locks` (who holds a file open) |
-| First look | `triage`: load, hung windows, recent crashes and errors, low disk, pending reboot, and what to try next |
-| Processes | `ps`, `top`, `proc`, `threads` (CPU per thread, wait reason, start module), `stacks` (call stacks of a live process, identical ones grouped), `modules` (loaded DLLs, versions, paths), `handles` (by type, and what grew), `vmmap` (which kind of memory grows: heaps, stacks, images, mapped files), `heap` (.NET objects by type, only the reachable ones on request, the window objects that are still alive and how many of them are shown, and the chain of references that keeps one alive; read on the tested PC from a snapshot), `dump` (small or full memory dump, fetched to your PC or kept there) |
+| Run | `exec` (PowerShell, pwsh, 32-bit PowerShell, cmd; `exec -f script.ps1 -Arg value` sends a script with its arguments), `start` / `jobs` / `logs` / `kill` background jobs (`start --exe app.exe` tracks a GUI app itself, `start --lnk` starts what a shortcut starts, `--env NAME=VALUE` sets its environment), `wait` for a process, window, port, file, log line or idle CPU |
+| Files | `push`, `pull` (files and folders), `ls`, `read` (tail, grep, line ranges, a time span of a log, only-new), `stat` (version, x86/x64, .NET or native, SHA-256, blocked-download flag, what a shortcut starts), `locks` (who holds a file open) |
+| First look | `triage`: load, hung windows, recent crashes and errors, low disk, pending reboot, and what to try next; for an app that is not running, where it is installed and how to start it |
+| Processes | `ps`, `top`, `proc`, `threads` (CPU per thread, wait reason, name, creation time, start module; threads per name), `stacks` (call stacks of a live process, identical ones grouped), `modules` (loaded DLLs, versions, paths), `handles` (by type, and what grew), `vmmap` (which kind of memory grows: heaps, stacks, images, mapped files), `heap` (.NET objects by type, only the reachable ones on request, the window objects that are still alive and how many of them are shown, the chain of references that keeps one alive, and the values in an object's fields; read on the tested PC from a snapshot), `dump` (small or full memory dump, fetched to your PC or kept there) |
 | System | `sys` (OS build, hardware, locale, GPU drivers, displays, .NET / VC++ runtimes), `mem` (commit, pools, standby lists, biggest consumers), `net` (listeners, connections per process, reachability checks), `svc`, `reg`, `firewall` (allow a program you pushed to accept connections for the session, or close the Windows Firewall prompt) |
-| Why only there? | `compare <pc> local` (differences in OS, drivers, runtimes, environment, PATH, installed programs, services, files), `envsnap --save/--diff` (what an installer or update changed), `deps` (missing DLLs, x86/x64 mismatch, missing exports, missing .NET runtime) |
+| Why only there? | `compare <pc> local` (differences in OS, drivers, runtimes, environment, PATH, installed programs, services, files), `envsnap --save/--diff` (what an installer or update changed), `deps` (missing DLLs, x86/x64 mismatch, missing exports, missing .NET runtime, and for a .NET app what its host needs: its DLL, `.deps.json` and the files that lists; `deps --run` starts it once with the host's tracing on and says why the host gave up) |
 | Logs | `events` (Windows event logs, filtered and de-duplicated), `crashes` (faulting module, exception code, dump files, blue screens), `dbg` (OutputDebugString capture, like DebugView) |
 | Monitor | `watch`: per-process private bytes, handles, GDI/USER objects, threads and CPU with growth rates and a leak verdict; start/exit of the watched processes and of what they start, with decoded exit codes; any crash; windows that stop responding. The noise of Windows starting its own helpers is counted, not listed |
 | Capture | `trace` (which file and registry accesses FAIL for a process, counted and grouped: Process Monitor's most useful view as a short table), `crashdumps on` (Windows saves a dump whenever the app crashes), `wpr start/stop` (Windows Performance Recorder traces: CPU, disk, file, registry, heap) |
-| Desktop | `ui` (a window's controls as text; click, read and fill them by name), `windows` (also flags a Windows prompt waiting for the person: firewall, UAC, credentials; and open menus), `screenshot` (screen, display or one window, scaled), `click`, `drag`, `scroll`, `type`, `key`, `focus` |
+| Desktop | `ui` (a window's controls as text with their state: selected, checked, expanded; click, tap, read and fill them by name), `windows` (also flags a Windows prompt waiting for the person: firewall, UAC, credentials; and open menus), `screenshot` (screen, display or one window, scaled), `click` (names the window that got the click, and refuses when another window is in front of the one you name), `touch` (tap, press and hold, drag as a finger does, also on a PC without a touch screen), `drag`, `scroll`, `type`, `key`, `focus` |
 | Session | `list`, `dashboard`, `name`, `history`, `result`, `reboot --wait`, `end` |
 
 `agentprobe help` lists everything; `agentprobe help <command>` shows the options.
@@ -165,7 +165,8 @@ agentprobe dump MyApp --full -o .\dumps\       # open in WinDbg / Visual Studio 
 ## Many PCs
 
 - `agentprobe name -t LAB-PC07 gpu-rig` gives a PC a short name. It is remembered on your developer PC.
-  A PC can also name itself: `agentprobe share --name gpu-rig`.
+  A PC can also name itself: `agentprobe share --name gpu-rig`. `agentprobe share --minimized` sends its window
+  to the taskbar once a developer PC is connected, so it does not lie over the app under test.
 - `-t gpu-rig`, `-t a,b,c`, `-t "LAB-*"`, `-t all`. With several targets, identical results are grouped:
   ```
   == 47 targets (exit 0): LAB-PC01, LAB-PC02, ... +35 more

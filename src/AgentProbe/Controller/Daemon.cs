@@ -27,6 +27,9 @@ internal sealed class TargetRecord
 
     public string Address { get; set; } = "";
 
+    /// <summary>IPv4 addresses the PC says it also has (its other adapters). Shown, never used to pick a target: it is the PC's own claim.</summary>
+    public List<string> OtherAddresses { get; set; } = [];
+
     public string Os { get; set; } = "";
 
     public string Version { get; set; } = "";
@@ -177,7 +180,7 @@ internal sealed partial class Daemon
 
                 // A target describes itself; treat that as untrusted text: known keys only, bounded length, no control characters.
                 hello = new Dictionary<string, string>();
-                foreach (var key in new[] { "name", "label", "user", "admin", "os", "arch", "ver", "machine", "started", "utc", "resumed" })
+                foreach (var key in new[] { "name", "label", "user", "admin", "os", "arch", "ver", "machine", "started", "utc", "resumed", "addrs" })
                 {
                     if (!info.TryGetValue(key, out var value) || value == null) continue;
                     var clean = new string(value.Where(ch => !char.IsControl(ch)).Take(120).ToArray()).Trim();
@@ -281,6 +284,9 @@ internal sealed partial class Daemon
             record.Machine = conn.Machine;
             record.User = conn.Info.GetValueOrDefault("user", "?");
             record.Address = conn.Address.ToString();
+            record.OtherAddresses = conn.Info.GetValueOrDefault("addrs", "").Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Select(a => IPAddress.TryParse(a, out var ip) && ip.AddressFamily == AddressFamily.InterNetwork ? ip.ToString() : "")
+                .Where(a => a.Length > 0 && a != record.Address).Distinct().Take(6).ToList();
             record.Os = conn.Info.GetValueOrDefault("os", "?");
             record.Version = conn.Info.GetValueOrDefault("ver", "?");
             record.Admin = conn.IsAdmin;
@@ -655,7 +661,12 @@ internal sealed partial class Daemon
             t.Add(r.Name, r.Machine == r.Name ? "=" : r.Machine, r.User, r.Address, r.Admin ? "admin" : "user", state, r.Os, Format.Clip(last, 50));
         }
 
-        return t.ToString() + UpdateNotes(ko);
+        // A PC with several adapters is often known by another address than the one it connects from.
+        var others = records.Where(r => r.Online && r.OtherAddresses.Count > 0).Select(r => $"{r.Name} {string.Join(", ", r.OtherAddresses)}").ToList();
+        var also = others.Count == 0 ? "" : (ko
+            ? "ADDRESS는 각 PC가 접속해 온 주소입니다. 그 PC가 알려 온 다른 주소: "
+            : "ADDRESS is the address each PC connects from. Other addresses it reports having: ") + string.Join("; ", others) + "\n";
+        return t.ToString() + also + UpdateNotes(ko);
     }
 
     /// <summary>One line per thing that can be updated: this PC from a newer release, a connected PC from this PC.</summary>

@@ -8,6 +8,7 @@ internal sealed class ArgParser
 {
     private readonly Dictionary<string, string> _options = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _flags = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, List<string>> _all = new(StringComparer.OrdinalIgnoreCase);
 
     public List<string> Positionals { get; } = [];
 
@@ -52,6 +53,8 @@ internal sealed class ArgParser
                 }
 
                 p._options[name] = value;
+                if (!p._all.TryGetValue(name, out var values)) p._all[name] = values = [];
+                values.Add(value);
                 continue;
             }
 
@@ -73,6 +76,9 @@ internal sealed class ArgParser
         if (alt != null && _options.TryGetValue(alt, out v)) return v;
         return null;
     }
+
+    /// <summary>Every value of an option that may be given more than once (<c>--env A=1 --env B=2</c>), in order.</summary>
+    public IReadOnlyList<string> GetAll(string name) => _all.TryGetValue(name, out var v) ? v : [];
 
     public int GetInt(string name, int fallback, string? alt = null)
         => int.TryParse(Get(name, alt), out var v) ? v : fallback;
