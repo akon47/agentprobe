@@ -443,6 +443,7 @@ public static class CredPrompt {
     Write-Host "`ndesktop and UI automation (a small test window appears)"
     $clickFile = Join-Path $work 'clicked.txt'
     $touchFile = Join-Path $work 'touched.txt'
+    $tapsFile = Join-Path $work 'taps.txt'
     $hwndFile = Join-Path $work 'hwnd.txt'
     $affinityFile = Join-Path $work 'affinity.txt'
     $formScript = @"
@@ -452,7 +453,9 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
 [Windows.Forms.Application]::EnableVisualStyles()
 `$neverShown = 1..3 | ForEach-Object { New-Object ApVerify.Views.EditorForm }
 `$wpfNeverShown = 1..2 | ForEach-Object { New-Object System.Windows.Window }
-`$wpfShown = New-Object System.Windows.Window; `$wpfShown.Title = 'ApWpf'; `$wpfShown.Width = 160; `$wpfShown.Height = 80; `$wpfShown.Left = 700; `$wpfShown.Top = 520; `$wpfShown.ShowInTaskbar = `$false; `$wpfShown.ShowActivated = `$false; `$wpfShown.Show()
+`$wpfShown = New-Object System.Windows.Window; `$wpfShown.Title = 'ApWpf'; `$wpfShown.Width = 160; `$wpfShown.Height = 80; `$wpfShown.Left = 700; `$wpfShown.Top = 520; `$wpfShown.ShowInTaskbar = `$false; `$wpfShown.ShowActivated = `$false
+`$wpfSlider = New-Object System.Windows.Controls.Slider; `$wpfSlider.Name = 'wpfSlider'; `$wpfSlider.Minimum = 0; `$wpfSlider.Maximum = 1; `$wpfSlider.Value = 0.25; `$wpfShown.Content = `$wpfSlider
+`$wpfShown.Show()
 `$formClosed = New-Object ApVerify.Views.EditorForm; `$formClosed.ShowInTaskbar = `$false; `$formClosed.StartPosition = 'Manual'; `$formClosed.Left = 700; `$formClosed.Top = 620; `$formClosed.Width = 120; `$formClosed.Height = 60; `$formClosed.Show(); `$formClosed.Close()
 `$wpfClosed = New-Object System.Windows.Window; `$wpfClosed.Width = 120; `$wpfClosed.Height = 60; `$wpfClosed.Left = 700; `$wpfClosed.Top = 620; `$wpfClosed.ShowInTaskbar = `$false; `$wpfClosed.ShowActivated = `$false; `$wpfClosed.Show(); `$wpfClosed.Close()
 `$secret = New-Object Windows.Forms.Form; `$secret.Text = 'AP Verify NoCapture'; `$secret.Width = 200; `$secret.Height = 70; `$secret.StartPosition = 'Manual'; `$secret.Left = 700; `$secret.Top = 420; `$secret.ShowInTaskbar = `$false; `$secret.TopMost = `$true
@@ -460,11 +463,12 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
 `$kept = if ([ApVerify.Views.Input]::SetWindowDisplayAffinity(`$secret.Handle, 0x11)) { 'left out' } elseif ([ApVerify.Views.Input]::SetWindowDisplayAffinity(`$secret.Handle, 1)) { 'shown black' } else { 'none' }
 [IO.File]::WriteAllText('$affinityFile', `$kept)
 `$f = New-Object Windows.Forms.Form; `$f.Text = 'AP Verify Window'; `$f.Width = 440; `$f.Height = 330; `$f.StartPosition = 'Manual'; `$f.Left = 160; `$f.Top = 160; `$f.TopMost = `$true
-`$f.Add_Shown({ [IO.File]::WriteAllText('$hwndFile', `$f.Handle.ToInt64().ToString('X')) })
+`$f.Add_Shown({ [IO.File]::WriteAllText('$hwndFile', `$f.Handle.ToInt64().ToString('X')); `$list.TopIndex = 30 })
+`$list = New-Object Windows.Forms.ListBox; `$list.Name = 'longList'; `$list.Left = 20; `$list.Top = 240; `$list.Width = 180; `$list.Height = 45; 1..60 | ForEach-Object { [void]`$list.Items.Add('item ' + `$_) }
 `$t = New-Object Windows.Forms.TextBox; `$t.Name = 'inputBox'; `$t.Left = 20; `$t.Top = 20; `$t.Width = 300
 `$b = New-Object Windows.Forms.Button; `$b.Name = 'pressButton'; `$b.Text = 'Press me'; `$b.Left = 20; `$b.Top = 60; `$b.Width = 120
 `$b.Add_Click({ [IO.File]::WriteAllText('$clickFile', 'clicked:' + `$t.Text) })
-`$b.Add_MouseDown({ [IO.File]::WriteAllText('$touchFile', `$(if ([ApVerify.Views.Input]::FromTouch()) { 'touch' } else { 'mouse' })) })
+`$b.Add_MouseDown({ [IO.File]::WriteAllText('$touchFile', `$(if ([ApVerify.Views.Input]::FromTouch()) { 'touch' } else { 'mouse' })); [IO.File]::AppendAllText('$tapsFile', 'x') })
 `$check = New-Object Windows.Forms.CheckBox; `$check.Name = 'checkBox'; `$check.Text = 'Check me'; `$check.Left = 300; `$check.Top = 62; `$check.Width = 110; `$check.Checked = `$true
 `$tabs = New-Object Windows.Forms.TabControl; `$tabs.Name = 'tabs'; `$tabs.Left = 20; `$tabs.Top = 100; `$tabs.Width = 380; `$tabs.Height = 90
 `$tabs.TabPages.Add('First tab'); `$tabs.TabPages.Add('Second tab')
@@ -477,7 +481,7 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
 `$c = New-Object Windows.Forms.Button; `$c.Name = 'closeDialog'; `$c.Text = 'Close dialog'; `$c.Left = 20; `$c.Top = 20; `$c.Width = 120; `$c.DialogResult = 'OK'; `$d.Controls.Add(`$c)
 `$o = New-Object Windows.Forms.Button; `$o.Name = 'openDialog'; `$o.Text = 'Open dialog'; `$o.Left = 160; `$o.Top = 60; `$o.Width = 120
 `$o.Add_Click({ [void]`$f.BeginInvoke([Action]{ [void]`$d.ShowDialog(`$f) }) })
-`$f.Controls.Add(`$t); `$f.Controls.Add(`$b); `$f.Controls.Add(`$o); `$f.Controls.Add(`$check); `$f.Controls.Add(`$tabs); `$f.Controls.Add(`$twinA); `$f.Controls.Add(`$twinB); `$f.Controls.Add(`$showCover); `$f.Controls.Add(`$hideCover)
+`$f.Controls.Add(`$t); `$f.Controls.Add(`$b); `$f.Controls.Add(`$o); `$f.Controls.Add(`$check); `$f.Controls.Add(`$tabs); `$f.Controls.Add(`$twinA); `$f.Controls.Add(`$twinB); `$f.Controls.Add(`$showCover); `$f.Controls.Add(`$hideCover); `$f.Controls.Add(`$list)
 [Windows.Forms.Application]::Run(`$f)
 "@
     $formFile = Join-Path $work 'form.ps1'; $formScript | Set-Content $formFile -Encoding UTF8   # too long for a command line
@@ -530,6 +534,22 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
     Check 'ui: tree shows the button by name' ($tree.Out -match 'Button "Press me" #pressButton') $tree.Out
     # What the controls report about themselves: the check box is checked, the first tab is the selected one.
     Check 'ui: state of a check box, of the tabs and of the window' ($tree.Out -match '(?m)CheckBox "Check me" #checkBox \(checked\)' -and $tree.Out -match '(?m)TabItem "First tab" \(selected\)' -and $tree.Out -match '(?m)TabItem "Second tab" @' -and $tree.Out -match '(?m)^Window "AP Verify Window" \(normal\)') $tree.Out
+    $sl = (AP -t local ui get '#wpfSlider' --window 'ApWpf').Out
+    Check 'ui: a slider gives its value with its range' ($sl -match '^Slider \[Slider\] #wpfSlider =0\.25 \(0\.\.1\)') $sl
+    $ls = (AP -t local ui get '#longList' --window 'AP Verify Window').Out
+    Check 'ui: a list that was scrolled says how far (item 31 of 60 on top is about half way)' ($ls -match '\(scroll v=(\d+(\.\d+)?)%\)' -and [double]$Matches[1] -gt 40 -and [double]$Matches[1] -lt 65 -and $ls -notmatch ' h=') $ls
+    $pos = if ((AP -t local windows 'AP Verify Window').Out -match '(?m)\s(-?\d+,-?\d+ \d+x\d+)\s.*AP Verify Window') { $Matches[1] } else { 'no position' }
+    Check 'ui: the window''s own line has the position and size that `windows` reports' ($tree.Out -match "(?m)^Window `"AP Verify Window`" \(normal\) $([regex]::Escape($pos)) ") "windows: $pos / ui: $(($tree.Out -split "`n")[1])"
+    $r = AP -t local ui 'AP Verify Window' --class --grep pressButton
+    Check 'ui --class adds each control''s class name' ($r.Out -match '(?m)^Button \[WindowsForms10\.BUTTON[^\]]*\] "Press me"') $r.Out
+    if ($r.Out -match '@(\d+),(\d+)') {
+        $r = AP -t local ui --at "@$($Matches[1]),$($Matches[2])"
+        Check 'ui --at: the control at a point, what it lies in and their classes' ($r.Code -eq 0 -and $r.Out -match '(?m)^> +Button \[[^\]]+\] "Press me"' -and $r.Out -match '(?m)^Window \[[^\]]+\] "AP Verify Window"') $r.Out
+    } else { Check 'ui: button position for --at' $false $r.Out }
+    $sr = AP -t local screenshot --scale 0.1
+    $savedAt = if ($sr.Out -match '(?m)^saved: (.+\.png)\s*$') { $Matches[1].Trim() } else { '' }
+    Check 'screenshot without -o goes to the temp folder, not into the current folder' ($savedAt.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase) -and $savedAt -match '\\agentprobe\\screenshots\\' -and (Test-Path $savedAt) -and @(Get-ChildItem $work -Filter 'screenshot-*.png').Count -eq 0) $sr.Out
+    if ($savedAt) { Remove-Item $savedAt -Force -ErrorAction SilentlyContinue }
     [void](AP -t local ui click 'Second tab' --window 'AP Verify Window'); [void](AP -t local ui click 'Check me' --window 'AP Verify Window'); Start-Sleep -Milliseconds 400
     $g1 = (AP -t local ui get 'Second tab' --window 'AP Verify Window').Out; $g2 = (AP -t local ui get 'First tab' --window 'AP Verify Window').Out; $g3 = (AP -t local ui get 'Check me' --window 'AP Verify Window').Out
     Check 'ui get: the state follows what was done (the other tab is selected, the box is unchecked)' ($g1 -match '^TabItem "Second tab" \(selected\)' -and $g2 -match '^TabItem "First tab" @' -and $g3 -match '\(unchecked\)') "$g1 / $g2 / $g3"
@@ -620,6 +640,9 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
             Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
             $r = AP -t local ui tap 'Press me' --window 'AP Verify Window'; Start-Sleep -Milliseconds 600
             Check 'ui tap taps a control by name, by touch' ($r.Code -eq 0 -and $r.Out -match 'tapped Button "Press me" by touch' -and (Test-Path $clickFile) -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch') "$($r.Code) $($r.Out) / seen as: $(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })"
+            Remove-Item $clickFile, $touchFile, $tapsFile -ErrorAction SilentlyContinue
+            $r = AP -t local ui dtap 'Press me' --window 'AP Verify Window'; Start-Sleep -Milliseconds 700
+            Check 'ui dtap taps twice within one command (the app sees two touches)' ($r.Code -eq 0 -and $r.Out -match 'tapped twice Button "Press me" by touch' -and (Get-Content $tapsFile -Raw -ErrorAction SilentlyContinue) -eq 'xx' -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch') "$($r.Code) $($r.Out) / taps: $(if (Test-Path $tapsFile) { Get-Content $tapsFile -Raw })"
             Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
             $r = AP -t local touch drag "@$px,$py" "@$([int]$px + 200),$([int]$py + 120)" --duration 200ms; Start-Sleep -Milliseconds 400
             Check 'touch drag that leaves the button does not press it' ($r.Code -eq 0 -and $r.Out -match 'dragged by touch' -and -not (Test-Path $clickFile)) "$($r.Code) $($r.Out)"
@@ -695,8 +718,55 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
             $myKey = [regex]::Match($existing, 'key ([0-9A-F]{4}(-[0-9A-F]{4}){3})').Groups[1].Value
             $share = Start-Process $Exe -ArgumentList 'share', '--trust', $myKey, '--name', 'verify' -WindowStyle Minimized -PassThru
             $up = $false; 1..30 | ForEach-Object { if (-not $up) { Start-Sleep -Milliseconds 700; if ((AP list).Out -match '(?m)^verify\s') { $up = $true } } }
+            $connectedAt = Get-Date
             Check 'a local target connects by discovery' $up (AP list).Out
             if ($up) {
+                # STATE is about commands (how long ago the last one ended), CONNECTED about the connection.
+                [void](AP exec 'Write-Output warm'); Start-Sleep 3
+                $listed = (AP list).Out
+                Check 'list: STATE is the time since the last command ended, CONNECTED the time the PC connected' ($listed -match '(?m)^verify\s.*\sidle (\d+(\.\d+)?)s\s+(\d\d:\d\d:\d\d)\s' -and [double]$Matches[1] -ge 2.5 -and [double]$Matches[1] -lt 30 -and [Math]::Abs(((Get-Date $Matches[3]) - $connectedAt).TotalSeconds) -lt 40) $listed
+
+                # A second PC connects in the middle of work that never named its target: that work keeps its target.
+                $env:AGENTPROBE_INSTANCE = 'verify2'   # another share on this PC; it finds the same developer PC (same port)
+                $second = Start-Process $Exe -ArgumentList 'share', '--trust', $myKey, '--name', 'second' -WindowStyle Minimized -PassThru
+                $env:AGENTPROBE_INSTANCE = 'verify'
+                $two = $false; 1..30 | ForEach-Object { if (-not $two) { Start-Sleep -Milliseconds 700; if ((AP list).Out -match '(?m)^second\s') { $two = $true } } }
+                if (-not $two) { Check 'a second target connects to the same developer PC' $false (AP list).Out }
+                else {
+                    $r = AP exec 'Write-Output "ran-on-$env:AGENTPROBE_INSTANCE"'
+                    Check 'a command without -t keeps going to the target in use when another PC connects, and says so' ($r.Code -eq 0 -and $r.Out -match '(?m)^ran-on-verify$' -and $r.Out -match '2 targets are connected and none was named: this went to verify' -and $r.Out -match 'Also connected: second \(connected ') "$($r.Code) $($r.Out)"
+                    $env:AGENTPROBE_TARGET = 'second'
+                    $r = AP exec 'Write-Output "ran-on-$env:AGENTPROBE_INSTANCE"'
+                    Remove-Item Env:AGENTPROBE_TARGET
+                    Check 'AGENTPROBE_TARGET names the target for commands without -t' ($r.Code -eq 0 -and $r.Out -match '(?m)^ran-on-verify2$' -and $r.Out -notmatch 'none was named') "$($r.Code) $($r.Out)"
+                    [void](AP -t second end)
+                    1..20 | ForEach-Object { if ((AP list).Out -match '(?m)^second\s') { Start-Sleep -Milliseconds 500 } }
+                }
+                if (-not $second.HasExited) { Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue }
+
+                # The person at the target presses the space bar in agentprobe's window: commands are refused until Enter is pressed there.
+                # (That window gets a real key press, so this is left out on a PC someone is using.)
+                if (-not $SkipInput) {
+                    $shareTitle = @('sharing this PC', '이 PC 공유 중') | Where-Object { (AP -t local windows $_).Out -match 'agentprobe - ' } | Select-Object -First 1
+                    if ($shareTitle) { [void](AP -t local focus $shareTitle); Start-Sleep -Milliseconds 700 }
+                    if (-not $shareTitle -or (AP -t local windows $shareTitle).Out -notmatch '(?m)\sforeground\b') {
+                        Write-Host '  skipped: the sharing window could not be brought to the front here, so the space bar cannot be pressed in it.' -ForegroundColor Yellow
+                    } else {
+                        [void](AP -t local key space)
+                        $pausedSeen = $false; 1..24 | ForEach-Object { if (-not $pausedSeen) { Start-Sleep -Milliseconds 500; $pausedSeen = (AP list).Out -match '(?m)^verify\s.*\spaused idle ' } }
+                        $r = AP -t verify exec 'Write-Output should-not-run'
+                        Check 'the space bar in the sharing window pauses: the next command is refused (exit 5) and says why; list shows paused' ($pausedSeen -and $r.Code -eq 5 -and $r.Out -match 'paused by the person at the target' -and $r.Out -notmatch '(?m)^should-not-run') "$pausedSeen / $($r.Code) $($r.Out)`n$((AP list).Out)"
+                        [void](AP -t local focus $shareTitle); Start-Sleep -Milliseconds 500; [void](AP -t local key space)   # a second space bar must not undo the pause
+                        Start-Sleep 1; $still = AP -t verify exec 'Write-Output should-not-run-either'
+                        Check 'pressing the space bar again does not resume (a key held too long must not undo the pause)' ($still.Code -eq 5) "$($still.Code) $($still.Out)"
+                        $pr = AP -t verify push $file 'paused.txt'
+                        Check 'a push while paused is refused with the same exit code' ($pr.Code -eq 5 -and $pr.Out -match 'paused by the person at the target') "$($pr.Code) $($pr.Out)"
+                        [void](AP -t local focus $shareTitle); Start-Sleep -Milliseconds 500; [void](AP -t local key enter)
+                        $r = $null; 1..10 | ForEach-Object { if (-not $r -or $r.Code -ne 0) { Start-Sleep -Milliseconds 400; $r = AP -t verify exec 'Write-Output runs-again' } }
+                        Check 'Enter resumes: commands run' ($r.Code -eq 0 -and $r.Out -match 'runs-again') "$($r.Code) $($r.Out)"
+                    }
+                }
+
                 # A PC with several adapters: the list also gives the addresses it does not connect from.
                 $listed = (AP list).Out
                 $from = if ($listed -match '(?m)^verify\s+\S+\s+\S+\s+(\d+\.\d+\.\d+\.\d+)\s') { $Matches[1] } else { '' }
@@ -785,6 +855,29 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
                 Check 'start --exe: the job is the app itself (its pid, still running)' ($guiProc -and $guiProc.ProcessName -eq 'winver' -and (AP -t verify jobs).Out -match "(?m)^\s*\d+\s+gui\s+$guiPid\s+running") "$($r.Out)`n$((AP -t verify jobs).Out)"
                 [void](AP -t verify kill gui); Start-Sleep 1
                 Check 'kill <job> closes an app started with --exe, and jobs shows its exit' (-not (Get-Process -Id $guiPid -ErrorAction SilentlyContinue) -and (AP -t verify jobs).Out -match "(?m)^\s*\d+\s+gui\s+$guiPid\s+exit ") (AP -t verify jobs).Out
+
+                # Swapping a running app for another start of it: the running one is closed by its window, not killed.
+                $r = AP -t verify start --name old --exe $gui
+                $oldPid = if ($r.Out -match 'job \d+ started \(pid (\d+)\)') { [int]$Matches[1] } else { 0 }
+                Start-Sleep 2   # its window is up
+                $r = AP -t verify start --name new --replace winver.exe --exe $gui
+                $newPid = if ($r.Out -match 'job \d+ started \(pid (\d+)\)') { [int]$Matches[1] } else { 0 }
+                Check 'start --replace closes the running instance by its window, waits for it, then starts' ($oldPid -and $newPid -and $newPid -ne $oldPid -and $r.Out -match "closed winver\.exe \(pid $oldPid\) by closing its window" -and -not (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) -and (Get-Process -Id $newPid -ErrorAction SilentlyContinue) -and (AP -t verify jobs).Out -match "(?m)^\s*\d+\s+old\s+$oldPid\s+exit 0\b") "$($r.Out)`n$((AP -t verify jobs).Out)"
+                [void](AP -t verify kill new); Start-Sleep 1
+                $r = AP -t verify start --name none --replace NoSuchAppForVerifyZz.exe --exe $gui
+                Check 'start --replace with nothing to close says so and starts' ($r.Out -match 'no NoSuchAppForVerifyZz\.exe was running' -and $r.Out -match 'job \d+ started') $r.Out
+                [void](AP -t verify kill none); Start-Sleep 1
+
+                # A script that launches a program and ends: what that program writes later is not the command's output.
+                $childScript = Join-Path $work 'child.ps1'
+                @'
+$psi = New-Object System.Diagnostics.ProcessStartInfo 'cmd.exe', '/c ping -n 9 127.0.0.1 >nul & echo late-child-output'
+$psi.UseShellExecute = $false
+[void][System.Diagnostics.Process]::Start($psi)
+Write-Output 'script-done'
+'@ | Set-Content $childScript -Encoding UTF8
+                $sw = [Diagnostics.Stopwatch]::StartNew(); $r = AP -t verify exec -f $childScript; $sw.Stop()
+                Check 'exec ends with the script: a program it left running is named, and its later output is not taken' ($r.Code -eq 0 -and $r.Out -match '(?m)^script-done$' -and $r.Out -notmatch 'late-child-output' -and $r.Out -match 'cmd\.exe\(\d+\), which it started, is still running and writes to the same output' -and $sw.Elapsed.TotalSeconds -lt 6) "$($r.Code) after $([int]$sw.Elapsed.TotalSeconds)s: $($r.Out)"
                 $r = AP -t verify start --name viashell "& '$gui'"
                 Check 'start <command> that only launches a GUI app says the job is not the app' ($r.Out -match 'already ended' -and $r.Out -match 'start --exe') $r.Out
                 [void](AP -t verify kill --name winver.exe)
@@ -922,6 +1015,11 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
                     Check 'firewall allow switches off a block rule for the same program (a block would win)' ($r.Code -eq 0 -and $r.Out -match 'switched off the block rule' -and "$($block.Enabled)" -eq 'False') "$($r.Code) $($r.Out)"
                 }
                 Check 'firewall dismiss refuses a pid that shows no system dialog' ((AP -t verify firewall dismiss $PID).Code -ne 0 -and (AP -t verify firewall dismiss $PID).Out -match 'shows no system dialog') ''
+                if ((AP -t local windows).Out -notmatch 'SYSTEM PROMPT') {
+                    $r = AP -t verify firewall dismiss
+                    Check 'firewall dismiss without a pid, with no prompt on the screen: says so, closes nothing' ($r.Code -eq 0 -and $r.Out -match 'no prompt of the firewall''s host program .* is on the screen; nothing to close') "$($r.Code) $($r.Out)"
+                    Check 'firewall dismiss with a pid that is not a prompt says whose pid it wants' ((AP -t verify firewall dismiss $PID).Out -match 'No prompt of the firewall''s host program is on the screen') ''
+                }
 
                 # Closing the start screen's window asks for this: it must never cut off a connected PC,
                 # and with nothing connected it must leave no process behind (the exe stays locked otherwise).
@@ -1016,6 +1114,8 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
                 Check 'target update: the PC restarts from this PC''s exe and reconnects' ($r.Code -eq 0 -and $r.Out -match 'updtgt is back on agentprobe' -and (Get-FileHash "$u\target\agentprobe.exe" -Algorithm SHA256).Hash -eq $released) "$($r.Code) $($r.Out)"
                 $r = AP -t updtgt exec 'Get-Content kept.txt; Write-Output after'
                 Check 'target update: no new approval, and the workspace is still there' ($r.Code -eq 0 -and $r.Out -match 'kept' -and $r.Out -match 'after') "$($r.Code) $($r.Out)"
+                $h = (AP -t updtgt history --last 30).Out
+                Check 'target update: history still lists the commands from before the update' ($h -match "(?m)exit 0 \(before the update\)\s+exec 'kept' \| Set-Content kept\.txt" -and $h -match '(?m)\supdated\s+selfupdate ') $h
                 Start-Sleep 2
                 Check 'target update: nothing is left next to the target''s exe' (@(Get-ChildItem "$u\target" -Filter 'agentprobe.exe*').Count -eq 1) ((Get-ChildItem "$u\target").Name -join ', ')
                 [void](AP -t updtgt end); Start-Sleep 2

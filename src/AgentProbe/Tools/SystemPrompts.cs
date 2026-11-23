@@ -94,7 +94,8 @@ internal static partial class SystemPrompts
             var names = ProcessSnapshot.Take().ToDictionary(p => p.Pid, p => p.Name);
             var prompts = Find(windows, names);
             foreach (var p in prompts)
-                err.WriteLine($"[a system dialog is waiting on the target's screen: {p.Describe()}. The person there has to answer it; `windows` shows it. {Effect}]");
+                err.WriteLine($"[a system dialog is waiting on the target's screen: {p.Describe()}. The person there has to answer it; `windows` shows it. " +
+                              (p.Process.Equals("PickerHost.exe", StringComparison.OrdinalIgnoreCase) ? $"If it is the firewall's question, `firewall dismiss {p.Pid}` closes it as its Cancel would. " : "") + $"{Effect}]");
 
             // A fact rather than a possibility: which windows take no input at this moment.
             if (prompts.Count > 0)

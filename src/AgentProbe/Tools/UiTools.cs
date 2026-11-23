@@ -43,7 +43,8 @@ internal static partial class UiTools
         new("screenshot", "Desktop", "Capture the screen (or one display/window) to a PNG on the developer PC",
             """
             screenshot [-o file.png] [--display N] [--window TITLE|HWND] [--scale 0.5]
-              Saved on the developer PC; open the file to look at it. --window crops to one window and --scale shrinks
+              Saved on the developer PC, in its temp folder unless -o says where (the path is printed); open the
+              file to look at it. --window crops to one window and --scale shrinks
               the image: both make it much cheaper to read. click/drag coordinates refer to the latest screenshot.
             """, ScreenshotAsync),
         new("click", "Desktop", "Click at a position of the latest screenshot",
@@ -63,13 +64,16 @@ internal static partial class UiTools
         new("touch", "Desktop", "Touch the screen: tap, press and hold, drag (what a finger does, not the mouse)",
             """
             touch tap <x> <y> [--hold 60ms] [--screen] [--window TITLE [--raise]]
+            touch dtap <x> <y> ...                       tap twice (a double tap), with the timing a finger has
             touch hold <x> <y> [--for 1200ms] ...        press and hold (the touch way to open a context menu)
             touch drag <x1> <y1> <x2> <y2> [--duration 400ms] [--screen] [--window TITLE [--raise]]
             touch tap @<x>,<y> ...                       screen coordinates, exactly as `ui` prints them
               Real touch input (pointer messages, as from a touch screen), for bugs that a mouse click does not
               show: an app that ignores touch, touch-only gestures, press and hold. It works on a PC without a
               touch screen too. Coordinates are those of `click`: pixels of your latest screenshot, or @x,y /
-              --screen for screen coordinates; --window and --raise as for `click`. By name: ui tap <name>.
+              --screen for screen coordinates; --window and --raise as for `click`. By name: ui tap <name>,
+              ui dtap <name>. A gesture is one command because its timing matters: two `touch tap` calls are
+              seconds apart and never a double tap.
               Windows shows its touch feedback at the point, and hides the mouse pointer until the mouse moves.
             """, TouchAsync),
         new("drag", "Desktop", "Drag from one position to another", "drag <x1> <y1> <x2> <y2> [--screen]", DragAsync),
@@ -304,6 +308,10 @@ internal static partial class UiTools
             ? $"{x},{y} is not on {Describe(meant)}: {Describe(root)} is in front of it there; nothing was done. {hint}".TrimEnd()
             : $"{x},{y} is outside {Describe(meant)}, which is at {rect.Left},{rect.Top} {rect.Width}x{rect.Height}; nothing was done.";
     }
+
+    /// <summary>Asks a window to close, as its close button does (the program may ask about unsaved work, or refuse).</summary>
+    /// <returns>False when Windows did not deliver the request (a window of a program with higher rights).</returns>
+    internal static bool Close(nint hwnd) => PostMessageW(hwnd, 0x0010, 0, 0) != 0; // WM_CLOSE
 
     /// <summary>Brings a window to the foreground (restoring it when minimized). False when Windows refused.</summary>
     internal static bool BringToFront(nint hwnd)
@@ -736,11 +744,26 @@ internal static partial class UiTools
         return failure;
     }
 
+    /// <summary>
+    /// One tap, or several in a row with the pause a finger makes between them (two = a double tap), all on the
+    /// calling thread. Null when Windows accepted them all, else why not.
+    /// </summary>
+    internal static string? TouchTaps(int x, int y, int count, CancellationToken ct)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            if (i > 0) Thread.Sleep(90);
+            if (TouchGesture([(x, y)], TimeSpan.FromMilliseconds(50), ct) is { } failure) return count > 1 ? $"tap {i + 1} of {count}: {failure}" : failure;
+        }
+
+        return null;
+    }
+
     private static async Task<int> TouchAsync(ToolContext ctx, string[] args)
     {
         var a = ArgParser.Parse(args, "screen", "raise");
         var verb = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "";
-        if (verb is not ("tap" or "hold" or "drag")) return ctx.Fail("touch: tap, hold or drag? e.g. touch tap 640 400   (see `help touch`)");
+        if (verb is not ("tap" or "dtap" or "hold" or "drag")) return ctx.Fail("touch: tap, dtap, hold or drag? e.g. touch tap 640 400   (see `help touch`)");
         a.Positionals.RemoveAt(0);
         var raw = ExpandAt(a) | a.Flag("screen");
         var points = verb == "drag" ? 2 : 1;
@@ -765,7 +788,7 @@ internal static partial class UiTools
         if (path.Count > 1 && IsOwnWindow(RootAt(path[^1].x, path[^1].y))) return ctx.Fail($"touch: {path[^1].x},{path[^1].y}, where the drag would end, is on agentprobe's own window on the target; nothing was done.");
         var onWhat = Describe(RootAt(path[0].x, path[0].y));
         var blocked = DisabledWindowAt(path[0].x, path[0].y);
-        var failure = await Task.Run(() => TouchGesture(path, duration, ctx.Ct), ctx.Ct);
+        var failure = await Task.Run(() => verb == "dtap" ? TouchTaps(path[0].x, path[0].y, 2, ctx.Ct) : TouchGesture(path, duration, ctx.Ct), ctx.Ct);
         if (failure != null) return ctx.Fail("touch: " + failure);
 
         var where = $"{path[0].x},{path[0].y}";
@@ -773,12 +796,14 @@ internal static partial class UiTools
         {
             "drag" => $"touch drag {where} -> {path[1].x},{path[1].y}",
             "hold" => $"touch press and hold at {where}",
+            "dtap" => $"touch double tap at {where}",
             _ => $"touch tap at {where}",
         });
         ctx.Out.WriteLine(verb switch
         {
             "drag" => $"dragged by touch from screen {where} to {path[1].x},{path[1].y} in {Format.Duration(duration)}, starting on {onWhat}",
             "hold" => $"pressed and held by touch at screen {where} for {Format.Duration(duration)} on {onWhat}",
+            "dtap" => $"tapped twice by touch at screen {where} on {onWhat}",
             _ => $"tapped by touch at screen {where} on {onWhat}",
         });
         if (blocked != null) ctx.Out.WriteLine(blocked.Replace("The click did nothing there", "The touch did nothing there"));
@@ -861,14 +886,29 @@ internal static partial class UiTools
         ? "the keyboard is on agentprobe's own window on the target (it is the foreground window); nothing was typed. Bring the app to the front first: `focus <its title>`."
         : null;
 
+    /// <summary>Why typing must not go on, asked before every key: the person paused, or agentprobe's own window came to the front. Null to go on.</summary>
+    private static string? StopTyping(ToolContext ctx) => ctx.Runtime.Paused
+        ? "the person at the target paused remote commands."
+        : IsOwnWindow(Win32.GetAncestor(Win32.GetForegroundWindow(), 2)) ? "agentprobe's own window on the target came to the front." : null;
+
     private static async Task<int> TypeAsync(ToolContext ctx, string[] args)
     {
         // Literal text only: a path like C:\temp\new.txt must arrive as typed, not as "C:<Tab>emp<Enter>ew.txt".
         var text = string.Join(' ', args);
         if (text.Length == 0) return ctx.Fail("type: no text.");
         if (KeyboardOnOwnWindow() is { } own) return ctx.Fail("type: " + own);
+        var typed = 0;
         foreach (var ch in text)
         {
+            // Before every character: the person at the PC may bring agentprobe's window forward (to pause) while
+            // this is typing, and none of it may land there.
+            if (StopTyping(ctx) is { } stop)
+            {
+                ctx.Runtime.Audit.Write($"type stopped after {typed} of {text.Length} characters");
+                return ctx.Fail($"type: stopped after {typed} of {text.Length} characters: {stop}");
+            }
+
+            typed++;
             if (ch == '\n')
             {
                 Key(0x0D, 0, 0);
@@ -931,8 +971,16 @@ internal static partial class UiTools
             combos.Add(keys);
         }
 
+        var pressed = 0;
         foreach (var keys in combos)
         {
+            if (StopTyping(ctx) is { } stop)
+            {
+                ctx.Runtime.Audit.Write("key " + string.Join(' ', args.Take(pressed)) + $" (stopped after {pressed} of {combos.Count})");
+                return ctx.Fail($"key: stopped after {pressed} of {combos.Count}: {stop}");
+            }
+
+            pressed++;
             var down = new List<ushort>();
             try
             {
@@ -977,6 +1025,9 @@ internal static partial class UiTools
 
     [LibraryImport("kernel32.dll")]
     private static partial nint GetConsoleWindow();
+
+    [LibraryImport("user32.dll")]
+    private static partial int PostMessageW(nint hwnd, uint message, nint wParam, nint lParam);
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

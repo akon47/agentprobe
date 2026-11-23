@@ -27,8 +27,14 @@ internal sealed class RunRecord
     /// <summary>True when the connection dropped while this was running, so the developer PC never saw the end.</summary>
     public bool Orphaned { get; set; }
 
-    /// <summary>Carried over from before a reboot: the command line and result are known, the output is not.</summary>
+    /// <summary>
+    /// Carried over from before agentprobe restarted on this PC (a reboot, or an update of agentprobe itself): the
+    /// command line and result are known, the output is not.
+    /// </summary>
     public bool BeforeReboot { get; init; }
+
+    /// <summary>What the restart was: "reboot" or "update".</summary>
+    public string Restart { get; init; } = "reboot";
 
     public long OutputChars { get; private set; }
 
@@ -150,6 +156,12 @@ internal sealed class TargetRuntime
 
     public bool RebootPending { get; set; }
 
+    /// <summary>
+    /// The person at this PC has paused remote commands (the space bar in agentprobe's window; Enter resumes): every new command is refused
+    /// until they resume. What is already running goes on.
+    /// </summary>
+    public volatile bool Paused;
+
     private readonly List<(string what, Action undo)> _undo = [];
 
     /// <summary>Registers how to revert a change a tool made to this PC; run (newest first) when the session ends.</summary>
@@ -207,28 +219,33 @@ internal sealed class TargetRuntime
         lock (_history)
         {
             return _history.Where(r => r.Tool is not ("history" or "result")).TakeLast(max)
-                .Select(r => string.Join('\t', r.No, r.StartUtc.Ticks, (r.EndUtc ?? DateTime.UtcNow).Ticks, r.ExitCode?.ToString() ?? "", r.CommandLine.Replace('\t', ' ').Replace('\n', ' ')))
+                .Select(r => string.Join('\t', r.No, r.StartUtc.Ticks, (r.EndUtc ?? DateTime.UtcNow).Ticks, r.ExitCode?.ToString() ?? "", r.BeforeReboot ? r.Restart : "", r.CommandLine.Replace('\t', ' ').Replace('\n', ' ')))
                 .ToList();
         }
     }
 
-    /// <summary>Restores runs exported before a reboot; numbering continues after them.</summary>
-    public void SeedHistory(IEnumerable<string> lines)
+    /// <summary>Restores runs exported before a restart ("reboot" or "update"); numbering continues after them.</summary>
+    public void SeedHistory(IEnumerable<string> lines, string restart = "reboot")
     {
         lock (_history)
         {
             foreach (var line in lines)
             {
-                var f = line.Split('\t', 5);
+                // number, start, end, exit code, [the restart an older record was already carried over], command.
+                // (Lines written by agentprobe 0.2.4 and older have no restart field.)
+                var f = line.Split('\t');
                 if (f.Length < 5 || !int.TryParse(f[0], out var no) || !long.TryParse(f[1], out var start) || !long.TryParse(f[2], out var end)) continue;
+                var carried = f.Length >= 6 && f[4] is "" or "reboot" or "update";
+                var earlier = carried && f[4].Length > 0 ? f[4] : null;
                 _history.Add(new RunRecord
                 {
                     No = no,
-                    Tool = f[4],
+                    Tool = string.Join(' ', f[(carried ? 5 : 4)..]),
                     StartUtc = new DateTime(start, DateTimeKind.Utc),
                     EndUtc = new DateTime(end, DateTimeKind.Utc),
                     ExitCode = int.TryParse(f[3], out var code) ? code : null,
                     BeforeReboot = true,
+                    Restart = earlier ?? restart,
                 });
                 _runNo = Math.Max(_runNo, no);
             }

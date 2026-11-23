@@ -97,6 +97,9 @@ internal sealed class ResumeState
     /// <summary>Sharing was started with --minimized: the next instance keeps its window out of the way too.</summary>
     public bool Minimized { get; set; }
 
+    /// <summary>The person at the PC had paused remote commands: the next instance starts paused.</summary>
+    public bool Paused { get; set; }
+
     /// <summary>Shown in the banner and the log after the reboot, before discovery has seen the developer PC again.</summary>
     public string ControllerName { get; set; } = "";
 

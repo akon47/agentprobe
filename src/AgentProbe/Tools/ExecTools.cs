@@ -99,13 +99,23 @@ internal static class Shell
     }
 
     /// <summary>Runs to completion, streaming decoded lines. Returns the exit code, or 124 on timeout, 130 when cancelled.</summary>
-    public static async Task<int> RunAsync(ProcessStartInfo psi, Action<string, bool> onText, TimeSpan? timeout, CancellationToken ct, Action<Process>? onStarted = null)
+    /// <param name="onNote">Gets what this method itself has to say (output that was not taken); without it that goes to the error text.</param>
+    public static async Task<int> RunAsync(ProcessStartInfo psi, Action<string, bool> onText, TimeSpan? timeout, CancellationToken ct, Action<Process>? onStarted = null, Action<string>? onNote = null)
     {
         using var p = new Process { StartInfo = psi };
         p.Start();
+        var startedAt = DateTime.UtcNow.AddSeconds(-2).ToFileTimeUtc(); // what it starts is younger than this
         onStarted?.Invoke(p);
         p.StandardInput.Close(); // anything that prompts fails fast instead of hanging forever
 
+        // Once the command has ended and its own output is in, nothing more is passed on: a program it started
+        // and left running holds the same pipes and may write for as long as it lives.
+        var closed = 0;
+        var forward = onText;
+        onText = (text, isError) =>
+        {
+            if (Volatile.Read(ref closed) == 0) forward(text, isError);
+        };
         var outTask = PumpAsync(p.StandardOutput.BaseStream, s => onText(s, false));
         var errTask = PumpAsync(p.StandardError.BaseStream, s => onText(s, true));
 
@@ -115,7 +125,24 @@ internal static class Shell
         try
         {
             await p.WaitForExitAsync(linked.Token);
-            await Task.WhenAll(outTask, errTask).WaitAsync(TimeSpan.FromSeconds(3));
+
+            // What the command itself wrote is in the pipes by now. When it left a program running (an app a
+            // script launched), that program keeps the pipes open: its output is taken for a moment longer, so
+            // that the command's last lines are not cut, and then no more. Without such a program the pipes
+            // close by themselves.
+            var pumps = Task.WhenAll(outTask, errTask);
+            var left = LeftRunning(p.Id, startedAt);
+            if (await Task.WhenAny(pumps, Task.Delay(left.Count > 0 ? 1000 : 3000)) != pumps)
+            {
+                Volatile.Write(ref closed, 1);
+                var who = left.Count > 0
+                    ? $"{string.Join(", ", left.Take(4))}{(left.Count > 4 ? $" and {left.Count - 4} more" : "")}, which it started, is still running and writes"
+                    : "something it started (not one of its direct child processes) is still running and holds";
+                var note = $"[the command ended, but {who} to the same output: that is not shown from here on. Start an app with `start --exe` to keep its output apart.]\n";
+                if (onNote != null) onNote(note);
+                else forward(note, true);
+            }
+
             return p.ExitCode;
         }
         catch (OperationCanceledException)
@@ -134,7 +161,23 @@ internal static class Shell
         catch (TimeoutException)
         {
             // A grandchild still holds the pipes open; the exit code is already known.
+            Volatile.Write(ref closed, 1);
             return p.ExitCode;
+        }
+    }
+
+    /// <summary>"name.exe(pid)" of the processes that a process which has just ended started and left running (the console host is not one).</summary>
+    private static List<string> LeftRunning(int parentPid, long startedAfter)
+    {
+        try
+        {
+            // Younger than the command: a pid is reused, and an older process with that parent pid is nobody's child here.
+            return Native.ProcessSnapshot.Take().Where(c => c.ParentPid == parentPid && c.CreateTime >= startedAfter && !c.Name.Equals("conhost.exe", StringComparison.OrdinalIgnoreCase))
+                .Select(c => $"{c.Name}({c.Pid})").ToList();
+        }
+        catch (InvalidOperationException)
+        {
+            return [];
         }
     }
 
@@ -364,8 +407,8 @@ internal static class ExecTools
         new("start", "Run", "Start a long-running command in the background",
             """
             start [--name NAME] [--shell ..] [--cwd DIR] [--env NAME=VALUE]... <command>
-            start [--name NAME] [--cwd DIR] [--env NAME=VALUE]... --exe <path> [arguments for the program]
-            start [--name NAME] [--cwd DIR] [--env NAME=VALUE]... --lnk <shortcut.lnk> [more arguments]
+            start [--name NAME] [--cwd DIR] [--env NAME=VALUE]... [--replace IMAGE] [--dismiss-firewall] --exe <path> [arguments for the program]
+            start [--name NAME] [--cwd DIR] [--env NAME=VALUE]... [--replace IMAGE] [--dismiss-firewall] --lnk <shortcut.lnk> [more arguments]
               Returns a job id. The job keeps running if the connection drops. Read it with `logs`, stop it with `kill`.
               --exe starts the program itself, with no shell in between: use it for an app with a window. The job
               is then that app (its pid, its exit code with crash codes and .NET host errors named, `kill <job>`
@@ -378,6 +421,15 @@ internal static class ExecTools
               the person at the PC starts the app from the desktop or the Start menu. `stat <shortcut.lnk>` shows
               those three without starting anything.
               --env sets an environment variable for the job; repeat it for more (--env COREHOST_TRACE=1).
+              --replace IMAGE first closes the running instances of that program (MyApp.exe) the way a person
+              does, by closing their windows, and waits for them to end (--replace-wait 15s): "swap the installed
+              app for the build under test" in one command. When one does not close in time (an unsaved-changes
+              question?) nothing is started and nothing is killed; `kill --name` is the forceful way.
+              --dismiss-firewall closes a Windows Firewall prompt that appears within a minute of the start, as
+              its "Cancel" would (the program stays reachable on 127.0.0.1 only): for a target without
+              administrator rights, where `firewall allow` cannot prevent the prompt. `logs <job>` says when it did.
+              What it closes is any new prompt of the program Windows shows that question with (PickerHost.exe),
+              whichever program it is about; that program also shows the file picker of a Store app.
               The answer names the folder the job started in (cwd=): an app can behave differently from another
               folder. A program started with --exe or --lnk that is gone within moments is reported with its exit code.
             """, StartAsync),
@@ -418,6 +470,7 @@ internal static class ExecTools
         {
             var squeeze = new Squeezer();
             var stderr = new StringBuilder();
+            var notes = new StringBuilder();
             var code = await Shell.RunAsync(psi, (text, err) =>
             {
                 if (err)
@@ -428,9 +481,10 @@ internal static class ExecTools
                     }
                 }
                 else ctx.Out.Write(squeeze.Apply(text));
-            }, a.GetDuration("timeout"), ctx.Ct);
+            }, a.GetDuration("timeout"), ctx.Ct, onNote: n => notes.Append(n));
             var errorText = PsErrors.ToPlainText(stderr.ToString());
             if (errorText.Length > 0) ctx.Err.Write(new Squeezer().Apply(errorText));
+            if (notes.Length > 0) ctx.Err.Write(notes.ToString()); // after the error text: PowerShell's error format would swallow it
 
             // A crash exit code reads better with its meaning next to it.
             if (Native.ProcessDetails.IsFailureCode((uint)code)) ctx.Err.WriteLine($"[exit code {Native.ProcessDetails.ExitCodeName((uint)code)}]");
@@ -446,6 +500,52 @@ internal static class ExecTools
     private static Task<int> StartAsync(ToolContext ctx, string[] args)
     {
         return StartCoreAsync(ctx, args);
+    }
+
+    /// <summary>
+    /// <c>start --replace</c>: closes every running instance of a program the way a person would, by closing its
+    /// windows, and waits for the processes to end. False when one is still there afterwards: nothing is killed.
+    /// </summary>
+    private static async Task<(bool ok, string report)> CloseRunningAsync(ToolContext ctx, string image, TimeSpan wait)
+    {
+        wait = TimeSpan.FromSeconds(Math.Clamp(wait.TotalSeconds, 1, 300));
+        image = Path.GetFileName(image.Trim('"')); // a path is taken as the program's file name
+        var bare = image.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? image[..^4] : image;
+        if (bare.Length == 0) return (false, "--replace needs the image name of the program to close first (MyApp.exe).");
+
+        // The instances on this desktop: one in another logon session (a service, another user) has no window
+        // here and is not this session's to close.
+        int session;
+        using (var self = Process.GetCurrentProcess()) session = self.SessionId;
+        var all = Native.ProcessSnapshot.Take().Where(p => p.Name.Equals(bare + ".exe", StringComparison.OrdinalIgnoreCase) && p.Pid != Environment.ProcessId).ToList();
+        var running = all.Where(p => p.SessionId == session).ToList();
+        var elsewhere = all.Count > running.Count ? $" ({all.Count - running.Count} more run in another logon session and were left alone)" : "";
+        if (running.Count == 0) return (true, $"  no {bare}.exe was running here{elsewhere}");
+
+        var windows = UiTools.EnumerateWindows().Where(w => w.Visible && w.Title.Length > 0 && running.Any(p => p.Pid == w.Pid)).ToList();
+        if (windows.Any(w => UiTools.IsOwnWindow(w.Hwnd)))
+            return (false, $"--replace: {bare}.exe is what shows agentprobe's own window on the target; that is not closed remotely.");
+        var windowless = running.Where(p => windows.All(w => w.Pid != p.Pid)).ToList();
+        if (windowless.Count > 0)
+            return (false, $"--replace: {bare}.exe (pid {string.Join(", ", windowless.Select(p => p.Pid))}) has no window to close, so it cannot be asked to end like a person would; `kill --name {bare}.exe` ends it by force.");
+
+        ctx.Runtime.Audit.Write($"start --replace: closing the windows of {bare}.exe (pid {string.Join(", ", running.Select(p => p.Pid))})");
+        var refused = windows.Where(w => !UiTools.Close(w.Hwnd)).Select(w => w.Pid).Distinct().ToList();
+        if (refused.Count > 0)
+            return (false, $"--replace: Windows did not let agentprobe ask {bare}.exe (pid {string.Join(", ", refused)}) to close: it runs with higher rights than agentprobe on the target (run agentprobe elevated there).");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        List<int> still;
+        do
+        {
+            await Task.Delay(250, ctx.Ct);
+            var now = Native.ProcessSnapshot.Take();
+            still = running.Where(p => now.Any(x => x.Pid == p.Pid && x.CreateTime == p.CreateTime)).Select(p => p.Pid).ToList();
+        }
+        while (still.Count > 0 && sw.Elapsed < wait);
+
+        return still.Count == 0
+            ? (true, $"  closed {bare}.exe (pid {string.Join(", ", running.Select(p => p.Pid))}) by closing its window{(running.Count == 1 ? "" : "s")}; it ended after {Format.Duration(sw.Elapsed)}")
+            : (false, $"--replace: {bare}.exe (pid {string.Join(", ", still)}) was asked to close and is still running after {Format.Duration(sw.Elapsed)} (a question about unsaved changes? `windows` shows what is open). It was not killed; `kill --name {bare}.exe` does that.");
     }
 
     /// <summary><c>--env NAME=VALUE</c>, any number of times. Null (after saying why) when one of them is not of that form.</summary>
@@ -469,11 +569,27 @@ internal static class ExecTools
 
     private static async Task<int> StartCoreAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "as-file");
+        var a = ArgParser.Parse(args, "as-file", "dismiss-firewall");
         var cwd = a.Get("cwd") is { } c ? ctx.Runtime.ResolvePath(c) : null;
         if (cwd != null && !Directory.Exists(cwd)) return ctx.Fail($"start: the folder {cwd} does not exist on the target.");
         var env = ParseEnv(ctx, "start", a);
         if (env == null) return 2;
+        if ((a.Has("replace") || a.Flag("dismiss-firewall")) && !(a.Has("exe") || a.Has("lnk")))
+            return ctx.Fail("start: --replace and --dismiss-firewall go with --exe or --lnk (a program that is started itself).");
+        if (a.Has("replace") && string.IsNullOrWhiteSpace(a.Get("replace"))) return ctx.Fail("start: --replace needs the image name of the program to close first (MyApp.exe).");
+        if (a.Has("replace-wait") && a.GetDuration("replace-wait") == null) return ctx.Fail($"start: --replace-wait wants a time like 15s, got '{a.Get("replace-wait")}'.");
+
+        // Only once the program to start is known to be there: a mistyped path must not leave the app closed.
+        async Task<string?> ReplaceFirstAsync()
+        {
+            if (a.Get("replace") is not { } image) return null;
+            var (closedAll, report) = await CloseRunningAsync(ctx, image, a.GetDuration("replace-wait") ?? TimeSpan.FromSeconds(15));
+            if (!closedAll) return "start: " + report + " Nothing was started.";
+            ctx.Out.WriteLine(report);
+            return null;
+        }
+
+        var promptsBefore = a.Flag("dismiss-firewall") ? FirewallTools.PromptPids() : null;
         var envNote = env.Count > 0 ? "  env: " + string.Join(' ', env.Select(e => $"{e.name}={Format.Clip(e.value, 60)}")) : "";
         try
         {
@@ -499,6 +615,7 @@ internal static class ExecTools
                 var startIn = cwd ?? (link.WorkingDirectory.Length > 0 ? link.WorkingDirectory : null);
                 if (startIn != null && !Directory.Exists(startIn))
                     return ctx.Fail($"start: the shortcut's \"Start in\" folder {startIn} does not exist on the target: nothing was started.");
+                if (await ReplaceFirstAsync() is { } notReplaced) return ctx.Fail(notReplaced);
                 job = ctx.Runtime.Jobs.StartExe(link.Target, a.Positionals, startIn, a.Get("name"), env, link.Arguments);
                 var folderNote = cwd != null ? " (--cwd, not the shortcut's)"
                     : link.WorkingDirectory.Length > 0 ? " (the shortcut's \"Start in\")"
@@ -512,6 +629,7 @@ internal static class ExecTools
             {
                 var path = ctx.Runtime.ResolvePath(exe);
                 if (!File.Exists(path)) return ctx.Fail($"start: {path} does not exist on the target.");
+                if (await ReplaceFirstAsync() is { } notReplaced) return ctx.Fail(notReplaced);
                 job = ctx.Runtime.Jobs.StartExe(path, a.Positionals, cwd, a.Get("name"), env);
                 ctx.Out.WriteLine($"job {job.Id} started (pid {job.Pid}): {Path.GetFileName(path)}  cwd={job.Process.StartInfo.WorkingDirectory}" +
                                   (a.Positionals.Count > 0 ? "  args: " + Format.Clip(string.Join(' ', a.Positionals.Select(JobManager.QuoteArgument)), 200) : "") + envNote);
@@ -529,6 +647,12 @@ internal static class ExecTools
             // did not start: its exit code is the first clue, so it is given right away.
             // (The process is asked directly: the job's own exit code is set only after its output has been read,
             // and an app the shell launched keeps that output open.)
+            if (promptsBefore != null)
+            {
+                FirewallTools.DismissNewPrompts(ctx.Runtime, job, promptsBefore, TimeSpan.FromSeconds(60));
+                ctx.Out.WriteLine($"  a new prompt of PickerHost.exe (the Windows Firewall question) within 60s, while the job runs, is closed like its Cancel (127.0.0.1 keeps working, other PCs cannot connect): `logs {job.Id}` says when");
+            }
+
             await Task.WhenAny(job.Process.WaitForExitAsync(ctx.Ct), Task.Delay(direct ? 1500 : 2500, ctx.Ct));
             if (job.Process.HasExited)
             {

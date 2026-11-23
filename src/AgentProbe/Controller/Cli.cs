@@ -45,6 +45,15 @@ internal static class Cli
 
         var args = ExtractGlobals(command, rest, ref target, ref full, ref outPath);
 
+        // AGENTPROBE_TARGET names the PC for commands that run on one, when -t is not given: a piece of work then
+        // keeps its target whatever else connects. (Not for `update`, where -t changes what is updated.)
+        var targetFromEnvironment = false;
+        if (target == null && (command is "name" or "push" || ToolRegistry.Find(command) != null) && DefaultTarget() is { } fromEnvironment)
+        {
+            target = fromEnvironment;
+            targetFromEnvironment = true;
+        }
+
         switch (command)
         {
             case "help" or "--help" or "-h" or "/?":
@@ -133,6 +142,19 @@ internal static class Cli
             toolArgs = [toolArgs[0], .. toolArgs[2..]];
         }
 
+        // A screenshot nobody gave a place for goes to the temp folder, not into whatever folder the agent
+        // happens to work in (a project folder would collect PNGs). Its path is printed.
+        if (tool.Name == "screenshot" && outPath == null)
+        {
+            outPath = Path.Combine(Path.GetTempPath(), AppInfo.Name, "screenshots");
+            Directory.CreateDirectory(outPath);
+
+            // One target: a file name of its own, so that two screenshots in the same second (of two PCs, by two
+            // agents) are never one file. Several targets: the folder, where each file gets its PC's name.
+            if (target == null || !(target.Contains(',') || target.Contains('*') || target.Equals("all", StringComparison.OrdinalIgnoreCase)))
+                outPath = Path.Combine(outPath, $"screenshot-{DateTime.Now:yyyyMMdd-HHmmss-fff}-{Environment.ProcessId}.png");
+        }
+
         if (string.Equals(target, "local", StringComparison.OrdinalIgnoreCase))
             return await LocalRunner.RunAsync(tool, toolArgs, Console.Out, Console.Error, outPath);
 
@@ -151,8 +173,13 @@ internal static class Cli
             req.TimeoutSec = (int)(a.GetDuration("timeout")?.TotalSeconds ?? 0);
         }
 
-        return await DaemonAsync(req, tool.Name, full);
+        var answered = await DaemonAsync(req, tool.Name, full);
+        if (answered == 3 && targetFromEnvironment) Console.Error.WriteLine($"(the target name '{target}' came from the environment variable AGENTPROBE_TARGET)");
+        return answered;
     }
+
+    /// <summary>AGENTPROBE_TARGET: the target for commands that name none, or null.</summary>
+    public static string? DefaultTarget() => Environment.GetEnvironmentVariable("AGENTPROBE_TARGET") is { } t && t.Trim().Length > 0 ? t.Trim() : null;
 
     /// <summary>Pulls -t/--target, --full and -o/--out out of the arguments (for exec/start only before the command text).</summary>
     private static string[] ExtractGlobals(string command, string[] args, ref string? target, ref bool full, ref string? outPath)
@@ -258,7 +285,13 @@ internal static class Cli
 
             if (wholeScript && a == "--") break; // the script's arguments start here
 
-            if (a is "--shell" or "--cwd" or "--timeout" or "--name")
+            if (a == "--dismiss-firewall" && tool == "start")
+            {
+                options.Add(a);
+                continue;
+            }
+
+            if (a is "--shell" or "--cwd" or "--timeout" or "--name" || (tool == "start" && a is "--replace" or "--replace-wait"))
             {
                 if (i + 1 >= args.Length)
                 {
@@ -508,6 +541,7 @@ internal static class Cli
                             연결된 대상이 하나면 -t를 생략할 수 있습니다. 여러 대상의 같은 결과는 묶어서 보여 줍니다.
                 출력:       긴 출력은 앞뒤만 보여 주고 전체를 이 PC의 파일로 저장합니다. --full은 전부 출력합니다.
                             -o <경로>는 받아 온 파일(screenshot, dump, pull)을 저장할 위치입니다.
+                            AGENTPROBE_TARGET 환경 변수는 -t를 생략했을 때 쓸 대상 PC입니다.
 
                 아래 명령들의 설명과 출력은 에이전트가 읽는 글이라 영어입니다. 자세히: agentprobe help <명령>
 
@@ -545,6 +579,7 @@ internal static class Cli
                       With one connected target, -t can be omitted. Several targets: identical results are grouped.
             Output:   long output is cut to head+tail and saved to a local file; --full prints everything.
                       -o <path> chooses where files sent back (screenshot, dump, pull) are saved.
+                      The environment variable AGENTPROBE_TARGET names the target for commands without -t.
 
             {ToolRegistry.HelpList()}
             Details: agentprobe help <command>

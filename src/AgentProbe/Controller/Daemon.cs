@@ -336,12 +336,26 @@ internal sealed partial class Daemon
         }
     }
 
+    // The target that commands without -t have been going to. When a second PC connects in the middle of a
+    // piece of work, those commands keep going there instead of being refused half way through it.
+    private string _implicitKey = "";
+    private DateTime _implicitUtc;
+    private static readonly TimeSpan ImplicitFor = TimeSpan.FromMinutes(30);
+
     /// <summary>Resolves -t: nothing (the only target), a name, a comma list, a * wildcard, or "all".</summary>
     /// <param name="ko">A person on a Korean Windows asked (see <see cref="PipeMsg.Lang"/>): the error is in Korean.</param>
-    private List<TargetConnection> Resolve(string? spec, out string error, bool ko = false)
+    private List<TargetConnection> Resolve(string? spec, out string error, bool ko = false) => Resolve(spec, out error, out _, ko);
+
+    /// <param name="notice">Something the caller should be told although the command goes ahead (which PC it went to, when that was not named).</param>
+    /// <param name="inUseCounts">
+    /// The caller is a command for a target (not `name`, not `update`, and not one that ends or reboots a PC):
+    /// only those keep going to the target in use, and only those make a target the one in use.
+    /// </param>
+    private List<TargetConnection> Resolve(string? spec, out string error, out string notice, bool ko = false, bool inUseCounts = false)
     {
         string L(string english, string korean) => ko ? korean : english;
         error = "";
+        notice = "";
         var online = _targets.Values.Where(r => r.Online).OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase).ToList();
         if (online.Count == 0)
         {
@@ -355,7 +369,36 @@ internal sealed partial class Daemon
 
         if (string.IsNullOrEmpty(spec))
         {
-            if (online.Count == 1) return [online[0].Connection!];
+            var remembered = inUseCounts && _implicitKey.Length > 0 && DateTime.UtcNow - _implicitUtc < ImplicitFor;
+            if (online.Count == 1)
+            {
+                // The PC that unnamed commands were going to is gone and another one is the only one left: the
+                // work in progress must not move to it without anyone saying so.
+                if (remembered && online[0].Key != _implicitKey)
+                {
+                    var gone = _targets.Values.FirstOrDefault(r => r.Key == _implicitKey)?.Name ?? "the target in use";
+                    error = L(
+                        $"{gone}, the target in use without -t until now, is not connected any more; {online[0].Name} is. Nothing was run. To run there, name it: -t {online[0].Name}",
+                        $"지금까지 -t 없이 쓰던 {gone}의 연결이 끊겼고, 연결된 PC는 {online[0].Name}입니다. 아무것도 실행하지 않았습니다. 그 PC에서 실행하려면 이름을 지정하세요: -t {online[0].Name}");
+                    return [];
+                }
+
+                if (inUseCounts) (_implicitKey, _implicitUtc) = (online[0].Key, DateTime.UtcNow);
+                return [online[0].Connection!];
+            }
+
+            // Several PCs, none named. The one this PC has been working with (commands without -t, while it was
+            // the only one) keeps getting them, and the answer says so; only without such a PC is it an error.
+            if (remembered && online.FirstOrDefault(r => r.Key == _implicitKey) is { } inUse)
+            {
+                _implicitUtc = DateTime.UtcNow;
+                var others = string.Join(", ", online.Where(r => r != inUse).Select(r => $"{r.Name} (connected {Format.Duration(DateTime.UtcNow - r.Connection!.ConnectedUtc)} ago)"));
+                notice = L(
+                    $"[{online.Count} targets are connected and none was named: this went to {inUse.Name}, the one in use without -t until now. Say -t {inUse.Name} from here on. Also connected: {others}]",
+                    $"[대상 PC {online.Count}대가 연결되어 있고 이름을 지정하지 않았습니다. 지금까지 -t 없이 쓰던 {inUse.Name}에서 실행했습니다. 이제부터 -t {inUse.Name}을(를) 붙이세요. 함께 연결된 PC: {others}]");
+                return [inUse.Connection!];
+            }
+
             error = L(
                 $"{online.Count} targets are connected; pick one with -t <name> (or -t all):\n  ",
                 $"대상 PC {online.Count}대가 연결되어 있습니다. -t <이름>으로 하나를 고르세요 (또는 -t all):\n  ") + string.Join(", ", online.Select(r => r.Name));
@@ -593,12 +636,19 @@ internal sealed partial class Daemon
 
             case "run" or "push":
             {
-                var targets = Resolve(req.Target, out var error, ko);
+                // Ending or rebooting a PC is never done on a remembered target: with several connected it needs a name.
+                var targets = Resolve(req.Target, out var error, out var notice, ko, inUseCounts: req.Tool is not ("end" or "reboot" or "selfupdate"));
                 if (targets.Count == 0)
                 {
                     await Err(error);
                     return 3;
                 }
+
+                // Naming another PC ends "the target in use": the next unnamed command has to choose again.
+                if (!string.IsNullOrEmpty(req.Target) && targets.Any(t => t.RecordKey != _implicitKey)) _implicitKey = "";
+                if (req.Tool == "end" && targets.Any(t => t.RecordKey == _implicitKey)) _implicitKey = "";
+
+                if (notice.Length > 0) await Err(notice);
 
                 if (targets.Count == 1)
                 {
@@ -650,15 +700,18 @@ internal sealed partial class Daemon
                    "This PC's addresses: " + string.Join(", ", LocalAddresses()) + "\n" + UpdateNotes(ko);
         }
 
-        var t = new Table("NAME", "MACHINE", "USER", "ADDRESS", "RIGHTS", "STATE", "OS", "LAST COMMAND");
+        // STATE is about commands: how long the oldest running one has been running, or how long ago the last
+        // one ended. CONNECTED is when the PC connected (a PC that appears in the middle of work shows here).
+        var t = new Table("NAME", "MACHINE", "USER", "ADDRESS", "RIGHTS", "STATE", "CONNECTED", "OS", "LAST COMMAND");
         foreach (var r in records)
         {
             var c = r.Connection;
-            var state = r.Online
-                ? (c!.Busy > 0 ? $"busy({c.Busy})" : "idle") + " " + Format.Duration(DateTime.UtcNow - c.ConnectedUtc)
-                : "offline " + Format.Duration(DateTime.UtcNow - r.LastSeenUtc);
+            var now = DateTime.UtcNow;
+            var state = !r.Online ? "offline " + Format.Duration(now - r.LastSeenUtc)
+                : (c!.Paused ? "paused " : "") + (c.BusySinceUtc is { } since && c.Busy is > 0 and var running ? $"busy({running}) {Format.Duration(now - since)}" : "idle " + Format.Duration(now - c.LastActivityUtc));
+            var connected = !r.Online ? "" : c!.ConnectedUtc.ToLocalTime() is var at && at.Date == DateTime.Now.Date ? at.ToString("HH:mm:ss", CultureInfo.InvariantCulture) : Format.Time(c.ConnectedUtc);
             var last = r.Online && c!.LastCommand.Length > 0 ? c.LastCommand : r.LastCommand;
-            t.Add(r.Name, r.Machine == r.Name ? "=" : r.Machine, r.User, r.Address, r.Admin ? "admin" : "user", state, r.Os, Format.Clip(last, 50));
+            t.Add(r.Name, r.Machine == r.Name ? "=" : r.Machine, r.User, r.Address, r.Admin ? "admin" : "user", state, connected, r.Os, Format.Clip(last, 50));
         }
 
         // A PC with several adapters is often known by another address than the one it connects from.
@@ -666,7 +719,11 @@ internal sealed partial class Daemon
         var also = others.Count == 0 ? "" : (ko
             ? "ADDRESS는 각 PC가 접속해 온 주소입니다. 그 PC가 알려 온 다른 주소: "
             : "ADDRESS is the address each PC connects from. Other addresses it reports having: ") + string.Join("; ", others) + "\n";
-        return t.ToString() + also + UpdateNotes(ko);
+        var paused = records.Where(r => r.Online && r.Connection!.Paused).Select(r => r.Name).ToList();
+        var pausedNote = paused.Count == 0 ? "" : (ko
+            ? $"paused: {string.Join(", ", paused)}의 사용자가 원격 명령을 잠시 멈췄습니다. 그 PC에서 다시 풀 때까지 명령은 거절됩니다 (종료 코드 5).\n"
+            : $"paused: the person at {string.Join(", ", paused)} has paused remote commands there. They are refused (exit 5) until that person resumes.\n");
+        return t.ToString() + pausedNote + also + UpdateNotes(ko);
     }
 
     /// <summary>One line per thing that can be updated: this PC from a newer release, a connected PC from this PC.</summary>

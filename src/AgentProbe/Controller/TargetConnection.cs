@@ -15,7 +15,7 @@ internal sealed class TargetConnection(SecureChannel channel, IPAddress address,
     private const int MaxQueuedReplies = 20000;
 
     private readonly ConcurrentDictionary<int, Channel<Reply>> _pending = new();
-    private readonly ConcurrentDictionary<int, bool> _isForeground = new();
+    private readonly ConcurrentDictionary<int, DateTime> _isForeground = new(); // when each command someone asked for began
     private readonly CancellationTokenSource _abort = new();
     private int _nextId;
     private int _foreground;
@@ -53,6 +53,12 @@ internal sealed class TargetConnection(SecureChannel channel, IPAddress address,
     /// <summary>Commands in flight that someone asked for (dashboard refreshes do not count as "busy").</summary>
     public int Busy => _foreground;
 
+    /// <summary>When the oldest command still running began; null when none is.</summary>
+    public DateTime? BusySinceUtc => _isForeground.IsEmpty ? null : _isForeground.Values.DefaultIfEmpty(DateTime.UtcNow).Min();
+
+    /// <summary>The person at the target has paused remote commands there (the target says so in its heartbeat).</summary>
+    public bool Paused => Info.GetValueOrDefault("paused") == "1";
+
     public bool Alive { get; private set; } = true;
 
     public bool IsAdmin => Info.GetValueOrDefault("admin") == "1";
@@ -68,7 +74,7 @@ internal sealed class TargetConnection(SecureChannel channel, IPAddress address,
         _pending[id] = ch;
         if (!background)
         {
-            _isForeground[id] = true;
+            _isForeground[id] = DateTime.UtcNow;
             Interlocked.Increment(ref _foreground);
             LastActivityUtc = DateTime.UtcNow;
             if (description.Length > 0) LastCommand = description;
@@ -114,7 +120,7 @@ internal sealed class TargetConnection(SecureChannel channel, IPAddress address,
                 {
                     // Only the two numbers the dashboard shows, and only if they really are numbers:
                     // nothing a target sends is trusted to be harmless text.
-                    foreach (var key in new[] { "cpu", "mem" })
+                    foreach (var key in new[] { "cpu", "mem", "paused" })
                         if (stat.TryGetValue(key, out var value) && int.TryParse(value, out var n) && n is >= 0 and <= 100) Info[key] = n.ToString();
                     continue;
                 }

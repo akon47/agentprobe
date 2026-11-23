@@ -28,6 +28,7 @@ internal sealed partial class ShareHost
     private Identity _identity = null!;
     private string? _trustedFingerprint;
     private bool _minimized;
+    private bool _resumePaused;
     private int _minimizedDone;
     private byte[]? _trustedKey;
     private IPEndPoint? _lastEndpoint;
@@ -147,6 +148,7 @@ internal sealed partial class ShareHost
             _resumedAfterUpdate = state.Reason == "update";
             _continueRunsAfter = state.LastRun;
             _minimized |= state.Minimized;
+            _resumePaused = state.Paused;
         }
         else
         {
@@ -162,7 +164,14 @@ internal sealed partial class ShareHost
         _instance = this;
         WatchLogoffAndShutdown();
         ConsoleLog.Start();
-        if (resumedHistory != null) _runtime.SeedHistory(resumedHistory);
+        if (resumedHistory != null) _runtime.SeedHistory(resumedHistory, _resumedAfterUpdate ? "update" : "reboot");
+        if (_resumePaused)
+        {
+            _runtime.Paused = true; // paused before the restart: still paused
+            _runtime.Audit.Write("still PAUSED by the person at this PC (from before the restart): Enter in this window resumes");
+        }
+
+        WatchPauseKey();
         _runtime.ContinueRunsAfter(_continueRunsAfter); // a run number printed before an update never comes to mean another command
         _runtime.Audit.Line += line => ConsoleLog.Write("  " + line[11..]); // time of day is enough on screen
 
@@ -200,6 +209,7 @@ internal sealed partial class ShareHost
             Console.WriteLine($"agentprobe {AppInfo.Version}  -  이 PC 공유 중: {name}, 사용자 {Environment.UserName} ({who})");
             Console.WriteLine($"  원격에서 하는 모든 일이 아래에 나오고 여기에 남습니다: {log}");
             Console.WriteLine("  멈추려면 이 창을 닫으세요. 설치되는 것은 없습니다.");
+            Console.WriteLine("  잠깐만 멈추려면 이 창에서 스페이스바를 누르세요: Enter를 누를 때까지 원격 명령을 받지 않습니다.");
         }
         else
         {
@@ -207,6 +217,7 @@ internal sealed partial class ShareHost
             Console.WriteLine($"agentprobe {AppInfo.Version}  -  sharing this PC: {name}, user {Environment.UserName} ({who})");
             Console.WriteLine($"  Everything the remote side does is listed below and saved to {log}");
             Console.WriteLine("  Close this window to stop. Nothing is installed.");
+            Console.WriteLine("  To pause only, press the space bar in this window: remote commands are refused until you press Enter.");
         }
 
         Console.WriteLine();
@@ -320,8 +331,10 @@ internal sealed partial class ShareHost
 
                 _runtime.Audit.Write($"connected to {_controllerName} at {endpoint.Address}  key {channel.PeerFingerprint}");
                 Badge.Show(
-                    Lang.T($"Remote control active  -  {_controllerName}", $"원격 제어 중  -  {_controllerName}"),
-                    Lang.T("agentprobe: this PC is being controlled remotely. Close its window to stop.", "agentprobe: 이 PC가 원격으로 제어되고 있습니다. 멈추려면 agentprobe 창을 닫으세요."));
+                    _runtime.Paused ? Lang.T($"Remote control PAUSED  -  {_controllerName}", $"원격 제어 일시 멈춤  -  {_controllerName}")
+                        : Lang.T($"Remote control active  -  {_controllerName}", $"원격 제어 중  -  {_controllerName}"),
+                    _runtime.Paused ? Lang.T("agentprobe: paused here. Press Enter in its window to resume.", "agentprobe: 여기서 일시 멈춤. 계속하려면 agentprobe 창에서 Enter를 누르세요.")
+                        : Lang.T("agentprobe: this PC is being controlled remotely. Close its window to stop.", "agentprobe: 이 PC가 원격으로 제어되고 있습니다. 멈추려면 agentprobe 창을 닫으세요."));
                 var session = new TargetSession(channel, _runtime, _controllerName, a => Badge.SetDetail(DateTime.Now.ToString("HH:mm:ss") + "  " + a));
                 _connected = true;
                 MinimizeOnce();
@@ -529,6 +542,62 @@ internal sealed partial class ShareHost
         if (console != 0) ShowWindow(console, 6); // SW_MINIMIZE
     }
 
+    /// <summary>
+    /// The space bar in this window pauses remote commands and Enter resumes them: the person at the PC can say
+    /// "not now" (someone else needs the PC for a moment) without ending the session.
+    /// Two keys, not one that toggles: a key held a moment too long, pressed twice, or pressed while the
+    /// connection was down and read later can then only pause again, never undo the pause. And keys without a
+    /// letter: with a Korean (or other composing) input method on, a letter key starts a composition and does
+    /// not arrive until the next key is pressed.
+    /// </summary>
+    private void WatchPauseKey()
+    {
+        if (Console.IsInputRedirected) return;
+        _ = Task.Run(async () =>
+        {
+            while (!_stop.IsCancellationRequested)
+            {
+                try
+                {
+                    // Only while a developer PC is connected: before that, this window's keys answer its own questions.
+                    if (_connected && Console.KeyAvailable)
+                    {
+                        var key = Console.ReadKey(true);
+                        if (key.Key == ConsoleKey.Spacebar || key.KeyChar == ' ') SetPaused(true);
+                        else if (key.Key == ConsoleKey.Enter) SetPaused(false);
+                        continue; // the next key right away: a held key must not be worked off for seconds
+                    }
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or IOException)
+                {
+                    return; // no keyboard to read
+                }
+
+                await Task.Delay(150);
+            }
+        });
+    }
+
+    private void SetPaused(bool paused)
+    {
+        if (_runtime.Paused == paused) return;
+        _runtime.Paused = paused;
+        _runtime.Audit.Write(paused
+            ? "PAUSED by the person at this PC: remote commands are refused until Enter is pressed here"
+            : "resumed by the person at this PC: remote commands are accepted again");
+        ConsoleLog.Write(paused
+            ? Lang.T("  == PAUSED: remote commands are refused. Press Enter to resume. ==", "  == 일시 멈춤: 원격 명령을 받지 않습니다. 계속하려면 Enter를 누르세요. ==")
+            : Lang.T("  == Resumed. ==", "  == 다시 받습니다. =="));
+        if (_connected)
+        {
+            Badge.Show(
+                paused ? Lang.T($"Remote control PAUSED  -  {_controllerName}", $"원격 제어 일시 멈춤  -  {_controllerName}")
+                    : Lang.T($"Remote control active  -  {_controllerName}", $"원격 제어 중  -  {_controllerName}"),
+                paused ? Lang.T("agentprobe: paused here. Press Enter in its window to resume.", "agentprobe: 여기서 일시 멈춤. 계속하려면 agentprobe 창에서 Enter를 누르세요.")
+                    : Lang.T("agentprobe: this PC is being controlled remotely. Close its window to stop.", "agentprobe: 이 PC가 원격으로 제어되고 있습니다. 멈추려면 agentprobe 창을 닫으세요."));
+        }
+    }
+
     private Dictionary<string, string> BuildHello()
     {
         using var os = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
@@ -600,10 +669,11 @@ internal sealed partial class ShareHost
             TargetKey = Convert.ToBase64String(_identity.ExportPrivateKey()),
             WorkDir = _runtime.HasWorkDir ? _runtime.WorkDir : "",
             ControllerName = _controllerName,
-            // Only a reboot's history is carried over: its entries read "before reboot", which would be false here.
-            History = reason.Length == 0 ? _runtime.ExportHistory(60) : [],
+            // The commands so far, so that `history` still shows where the work stood (their output is not carried).
+            History = _runtime.ExportHistory(60),
             LastRun = _runtime.LastRunNumber,
             Minimized = _minimized,
+            Paused = _runtime.Paused,
             ExpiresUtc = DateTime.UtcNow.Add(validFor),
         };
     }
@@ -648,7 +718,7 @@ internal sealed partial class ShareHost
             await Task.Delay(700); // let the answer reach the developer PC first
             End(false);
         });
-        return $"agentprobe on this PC is now {version} (was {AppInfo.Version}); restarting from it, the session resumes by itself. Run numbers continue; `history` starts empty." +
+        return $"agentprobe on this PC is now {version} (was {AppInfo.Version}); restarting from it, the session resumes by itself. Run numbers continue and `history` keeps the commands so far (not their output)." +
                (reverted.Count > 0 ? " Stopped or reverted before the restart: " + string.Join(", ", reverted) + " (turn on again afterwards if needed)." : "");
     }
 

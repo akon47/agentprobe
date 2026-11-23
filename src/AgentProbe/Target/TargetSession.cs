@@ -33,6 +33,7 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
                         case "cancel":
                             if (_running.TryGetValue(m.Id, out var cts)) cts.Cancel();
                             if (_uploads.TryRemove(m.Id, out var cancelled)) cancelled.Abort(); // a push that was interrupted: drop its temp file
+                            _pausedUploads.TryRemove(m.Id, out _);
                             break;
                         case "upload":
                             BeginUpload(m);
@@ -73,6 +74,7 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
                 {
                     ["cpu"] = cpu.ToString("0", System.Globalization.CultureInfo.InvariantCulture),
                     ["mem"] = Tools.SystemTools.Memory().dwMemoryLoad.ToString(),
+                    ["paused"] = runtime.Paused ? "1" : "0",
                 };
                 if (!await TrySendAsync(new Msg { Type = "stat", Info = info })) return;
             }
@@ -83,6 +85,11 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
         }
     }
 
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, bool> _pausedUploads = new(); // pushes refused because the person paused
+
+    private const string PausedText = "paused by the person at the target: they have paused remote commands in agentprobe's window on that PC (Enter there resumes). " +
+                                      "Nothing was run. Commands and jobs that were already running go on. Ask the user before trying again.";
+
     private async Task HandleRunAsync(Msg m)
     {
         var args = m.Args ?? [];
@@ -91,6 +98,14 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
         {
             await TrySendAsync(new Msg { Type = "out", Id = m.Id, Err = true, Text = $"unknown command '{m.Tool}'. Run `agentprobe help`.\n" });
             await TrySendAsync(new Msg { Type = "exit", Id = m.Id, Code = 127 });
+            return;
+        }
+
+        // The person at this PC has said "not now": nothing new is run, whoever asks and whatever it is.
+        if (runtime.Paused)
+        {
+            await TrySendAsync(new Msg { Type = "out", Id = m.Id, Err = true, Text = PausedText + "\n" });
+            await TrySendAsync(new Msg { Type = "exit", Id = m.Id, Code = 5 });
             return;
         }
 
@@ -232,6 +247,12 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
     {
         try
         {
+            if (runtime.Paused)
+            {
+                _pausedUploads[m.Id] = true; // its data is let pass, and the answer comes when it has all arrived
+                return;
+            }
+
             var dest = runtime.ResolvePath(m.Path ?? "");
             var upload = new Upload(dest, m.Zip, m.Name);
             _uploads[m.Id] = upload;
@@ -246,6 +267,15 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
 
     private async Task HandleDataAsync(Frame frame)
     {
+        if (_pausedUploads.ContainsKey(frame.DataId))
+        {
+            if (!frame.Eof) return;
+            _pausedUploads.TryRemove(frame.DataId, out _);
+            await TrySendAsync(new Msg { Type = "out", Id = frame.DataId, Err = true, Text = PausedText + "\n" });
+            await TrySendAsync(new Msg { Type = "exit", Id = frame.DataId, Code = 5 });
+            return;
+        }
+
         if (!_uploads.TryGetValue(frame.DataId, out var upload)) return;
         upload.Write(frame.Data!);
         if (!frame.Eof) return;

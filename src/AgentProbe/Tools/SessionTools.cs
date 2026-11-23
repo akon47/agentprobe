@@ -11,7 +11,8 @@ internal static class SessionTools
             """
             history [--last 20]
               One line per command: run number, start time, duration, exit code, command.
-              After a reboot the earlier commands are still listed ("before reboot" / "cut off by reboot").
+              After a reboot, or an update of agentprobe on that PC, the earlier commands are still listed
+              ("before reboot" / "cut off by reboot", "before the update"); their output is not kept.
               "running" = still going; "orphaned" = it finished (or is still running) after the connection dropped,
               so its result was never delivered. Fetch that result with `result <#>`.
               Use this first after a reconnect to see how far the previous work got.
@@ -56,8 +57,9 @@ internal static class SessionTools
         {
             var result = r.ExitCode is { } code
                 ? (r.Orphaned ? $"orphaned exit {code}" : $"exit {code}")
-                : r.BeforeReboot ? (r.Tool.StartsWith("reboot", StringComparison.Ordinal) ? "rebooted" : "cut off by reboot") : "running";
-            if (r.BeforeReboot && r.ExitCode != null) result += " (before reboot)";
+                : r.BeforeReboot ? (r.Restart == "update" ? (r.Tool.StartsWith("selfupdate", StringComparison.Ordinal) ? "updated" : "no longer followed after the update")
+                    : r.Tool.StartsWith("reboot", StringComparison.Ordinal) ? "rebooted" : "cut off by reboot") : "running";
+            if (r.BeforeReboot && r.ExitCode != null) result += r.Restart == "update" ? " (before the update)" : " (before reboot)";
             t.Add(r.No, r.StartUtc.ToLocalTime().ToString("HH:mm:ss"), Format.Duration((r.EndUtc ?? DateTime.UtcNow) - r.StartUtc), result, Format.Clip(r.CommandLine, 110));
         }
 
@@ -76,7 +78,9 @@ internal static class SessionTools
 
         if (run.BeforeReboot)
         {
-            ctx.Out.WriteLine($"[run #{run.No} ran before the reboot: {(run.ExitCode is { } c ? $"exit {c}" : "it was cut off by the reboot")}. Its output was not kept across the reboot.]");
+            ctx.Out.WriteLine(run.Restart == "update"
+                ? $"[run #{run.No} ran before agentprobe was updated on that PC: {(run.ExitCode is { } u ? $"exit {u}" : "it was still running then, and is not followed any more")}. Its output was not kept across the update.]"
+                : $"[run #{run.No} ran before the reboot: {(run.ExitCode is { } c ? $"exit {c}" : "it was cut off by the reboot")}. Its output was not kept across the reboot.]");
             return Task.FromResult(run.ExitCode ?? 0);
         }
 

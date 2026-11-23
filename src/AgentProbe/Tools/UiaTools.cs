@@ -20,13 +20,21 @@ internal static unsafe partial class UiaTools
     [
         new("ui", "Desktop", "Read a window's controls as text and act on them by name (UI Automation)",
             """
-            ui [window] [--grep REGEX] [--depth 12] [--max 300] [--all]
+            ui [window] [--grep REGEX] [--depth 12] [--max 300] [--all] [--class]
+            ui --at @<x>,<y> [--depth 6]         what is at that point of the screen: the control there, the ones it
+                                                 lies in (up to its window) and the ones inside it, each with its class
                  The control tree of a window (default: the foreground window; give part of its title or an HWND).
                  One line per control: type, "name", #automation-id, =value, state, and its center point on screen.
                  State is what the control reports: (selected) on the tab, list item or radio button that is the
                  selected one, (checked) / (unchecked) for a check box or toggle button, (expanded) / (collapsed),
                  (disabled), and (maximized) / (minimized) / (normal) on the window's own line. Without such a
                  word the control is not selected, or does not report that kind of state at all.
+                 What can scroll says how far it is scrolled: (scroll v=52.8%), with h= when it scrolls sideways.
+                 A slider, progress bar or spinner that reports a range gives its value with it: =0.739 (0..1)
+                 (WPF and most modern controls do; an old Win32 trackbar only gives a bare number, its percentage).
+                 The window's own line also has its position and size, so a window that moved or resized shows.
+                 --class adds each control's class name in [brackets] ([ListBoxItem], [HwndHost]: a control that
+                 is a native child window inside a WPF window takes input differently from the rest).
                  Unnamed layout containers are folded away. --all also lists off-screen controls.
                  --grep searches the WHOLE tree, off-screen controls included (to depth 40 unless --depth says
                  otherwise), and prints the matching lines; --max then limits how many of them are printed, and
@@ -35,6 +43,7 @@ internal static unsafe partial class UiaTools
             ui rclick <name|#id> [--window W]    right-click it (opens its context menu; `windows` then shows a popup)
             ui dblclick <name|#id> [--window W]  double-click it
             ui tap <name|#id> [--window W]       tap it by touch, as a finger on a touch screen would (see `touch`)
+            ui dtap <name|#id> [--window W]      tap it twice by touch (a double tap)
             ui set <name|#id> <text> [--window W]  put text into an edit field
             ui get <name|#id> [--window W]       one control's line: value and state (compare before and after an action)
               Works with WPF, WinForms, Win32, UWP/WinUI and most browsers/Electron apps. Read the tree once, then act
@@ -43,7 +52,7 @@ internal static unsafe partial class UiaTools
               --nth 2 takes the second. They count in the order `ui` lists them, panes and groups after the
               controls (a tab and the page it shows have the same name: the tab is the first). --nth works
               with every action.
-              An action that needs the mouse or touch (rclick, dblclick, tap, and click on a control without an
+              An action that needs the mouse or touch (rclick, dblclick, tap, dtap, and click on a control without an
               action of its own) is not done when another window covers the control: the answer names it.
             """, UiAsync) { Quiet = true },
     ];
@@ -132,15 +141,58 @@ internal static unsafe partial class UiaTools
         return value;
     }
 
+    /// <summary>A number that only some controls have (a scroll position, a slider's value), or null when this control does not report it.</summary>
+    private static double? NumberProperty(nint element, int propertyId)
+    {
+        var variant = stackalloc byte[24];
+        new Span<byte>(variant, 24).Clear();
+        if (((delegate* unmanaged[Stdcall]<nint, int, int, byte*, int>)(*(void***)element)[11])(element, propertyId, 1, variant) < 0) return null; // GetCurrentPropertyValueEx
+        double? value = *(ushort*)variant switch
+        {
+            5 => *(double*)(variant + 8), // VT_R8
+            4 => *(float*)(variant + 8), // VT_R4
+            3 => *(int*)(variant + 8), // VT_I4
+            _ => null, // VT_UNKNOWN: the "not supported" marker
+        };
+        VariantClear(variant);
+        return value is { } v && double.IsFinite(v) ? v : null;
+    }
+
+    private static string Number(double v) => v.ToString(Math.Abs(v) >= 100 ? "0.#" : "0.###", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>"0.739 (0..1)" for a control with a value in a range (slider, progress bar, spinner, scroll bar); "" for one without.</summary>
+    private static string RangeOf(Node n)
+    {
+        if (n.Type is not (50015 or 50012 or 50016 or 50014)) return "";
+        if (NumberProperty(n.Element, 30047) is not { } value) return ""; // RangeValue.Value
+        var (min, max) = (NumberProperty(n.Element, 30049), NumberProperty(n.Element, 30050)); // Minimum, Maximum
+        return min != null && max != null ? $"{Number(value)} ({Number(min.Value)}..{Number(max.Value)})" : Number(value);
+    }
+
+    [ThreadStatic]
+    private static bool _withClass; // --class, --at and `ui get`: lines carry the control's class name
+
     /// <summary>" (selected)", " (checked)", " (expanded)"... as the control reports them; "" for one that reports none.</summary>
     private static string StateOf(Node n)
     {
-        // Controls that never have such a state are not asked: every question is a call into the other process.
-        if (n.Type is 50020 or 50006 or 50033 or 50038 or 50027 or 50014 or 50037 or 50022 or 50017 or 50012 or 50004 or 50030) return "";
         var sb = new StringBuilder();
+
+        // How far something that scrolls is scrolled, in each direction it can scroll in (asked first: a
+        // direction that cannot scroll answers 0 or -1 for its position, depending on the framework).
+        if (n.Type is 50008 or 50023 or 50028 or 50036 or 50033 or 50030 or 50025 or 50026 or 50004) // List, Tree, DataGrid, Table, Pane, Document, Custom, Group, Edit
+        {
+            var parts = new List<string>();
+            if (StateProperty(n.Element, 30058) == 1 && NumberProperty(n.Element, 30055) is >= 0 and var v) parts.Add($"v={Number(v)}%"); // Scroll.VerticallyScrollable, VerticalScrollPercent
+            if (StateProperty(n.Element, 30057) == 1 && NumberProperty(n.Element, 30053) is >= 0 and var h) parts.Add($"h={Number(h)}%"); // Scroll.HorizontallyScrollable, HorizontalScrollPercent
+            if (parts.Count > 0) sb.Append(" (scroll ").Append(string.Join(' ', parts)).Append(')');
+        }
+
+        // Controls that never have such a state are not asked: every question is a call into the other process.
+        if (n.Type is 50020 or 50006 or 50033 or 50038 or 50027 or 50014 or 50037 or 50022 or 50017 or 50012 or 50004 or 50030) return sb.ToString();
         if (n.Type == 50032)
         {
             sb.Append(StateProperty(n.Element, 30075) switch { 0 => " (normal)", 1 => " (maximized)", 2 => " (minimized)", _ => "" }); // Window.WindowVisualState
+            if (n.Rect.Width > 0) sb.Append($" {n.Rect.Left},{n.Rect.Top} {n.Rect.Width}x{n.Rect.Height}"); // where it is and how big: a window that moved shows
             return sb.ToString();
         }
 
@@ -296,9 +348,11 @@ internal static unsafe partial class UiaTools
     {
         var sb = new StringBuilder();
         sb.Append(' ', indent * 2).Append(TypeName(n.Type));
+        if (_withClass && Bstr(n.Element, 30) is { Length: > 0 } cls) sb.Append(" [").Append(Format.Clip(cls, 40)).Append(']'); // get_CurrentClassName
         if (n.Name.Length > 0) sb.Append(" \"").Append(Format.Clip(n.Name, 70)).Append('"');
         if (n.Id.Length > 0 && !n.Id.All(char.IsDigit)) sb.Append(" #").Append(Format.Clip(n.Id, 40));
-        if (n.Value.Length > 0) sb.Append(" =").Append(Format.Clip(n.Value, 60));
+        if (RangeOf(n) is { Length: > 0 } range) sb.Append(" =").Append(range);
+        else if (n.Value.Length > 0) sb.Append(" =").Append(Format.Clip(n.Value, 60));
         sb.Append(StateOf(n));
         if (!n.Enabled) sb.Append(" (disabled)");
         if (n.Offscreen) sb.Append(" (off-screen)");
@@ -334,9 +388,24 @@ internal static unsafe partial class UiaTools
 
     private static Task<int> UiAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "all");
+        var a = ArgParser.Parse(args, "all", "class");
         var verb = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "";
-        var isAction = verb is "click" or "rclick" or "dblclick" or "tap" or "set" or "get";
+        var isAction = verb is "click" or "rclick" or "dblclick" or "tap" or "dtap" or "set" or "get";
+        var withClass = a.Flag("class") || verb == "get" || a.Has("at");
+        if (a.Has("at"))
+        {
+            var point = (a.Get("at") ?? "").TrimStart('@').Split(',');
+            if (point.Length != 2 || !int.TryParse(point[0], out var ax) || !int.TryParse(point[1], out var ay))
+                return Task.FromResult(ctx.Fail("ui --at: which point? Screen coordinates as `ui` prints them: ui --at @342,1156"));
+            var (atCode, atText) = OnComThread(automation =>
+            {
+                _withClass = true;
+                return At(automation, ax, ay, Math.Clamp(a.GetInt("depth", 6), 0, 40));
+            });
+            (atCode == 0 ? ctx.Out : ctx.Err).WriteLine(atText.TrimEnd());
+            return Task.FromResult(atCode);
+        }
+
         var window = isAction ? a.Get("window") : (a.Positionals.Count > 0 ? string.Join(' ', a.Positionals) : null);
         if (isAction && a.Positionals.Count < 2) return Task.FromResult(ctx.Fail($"ui {verb}: which control? Give its name or #id (see `ui`)."));
         if (verb == "set" && a.Positionals.Count < 3) return Task.FromResult(ctx.Fail("ui set: usage: ui set <name|#id> <text>"));
@@ -361,6 +430,7 @@ internal static unsafe partial class UiaTools
         if (nth is < 1) return Task.FromResult(ctx.Fail("ui: --nth wants a number from 1."));
         var (code, text) = OnComThread(automation =>
         {
+            _withClass = withClass;
             var root = RootFor(automation, window, out var title, out var error, out var hwnd);
             if (root == 0) return (2, error);
             var nodes = Walk(automation, root, a.GetInt("depth", isAction || grep != null ? 40 : 12), walkLimit, a.Flag("all") || isAction || grep != null, out var deeper);
@@ -376,6 +446,69 @@ internal static unsafe partial class UiaTools
 
         (code == 0 ? ctx.Out : ctx.Err).WriteLine(text.TrimEnd());
         return Task.FromResult(code);
+    }
+
+    /// <summary>
+    /// <c>ui --at</c>: the control at a point of the screen, the controls it lies in (outermost first, up to its
+    /// window) and what is inside it. For "what did that tap land on?".
+    /// </summary>
+    private static (int, string) At(nint automation, int x, int y, int depth)
+    {
+        if (UiTools.IsOwnWindow(UiTools.RootAt(x, y)))
+            return (2, $"ui --at: {x},{y} is on agentprobe's own window on the target; its controls are not read remotely.");
+        nint element = 0;
+        var found = ((delegate* unmanaged[Stdcall]<nint, long, nint*, int>)(*(void***)automation)[7])(automation, (uint)x | ((long)y << 32), &element); // ElementFromPoint (the POINT goes by value)
+        if (found < 0) return (1, $"ui --at: UI Automation could not look at {x},{y} (0x{found:X8}); that is not the same as nothing being there.");
+        if (element == 0) return (1, $"ui --at: UI Automation finds no control at {x},{y}.");
+
+        var walker = ControlViewWalker(automation);
+        var above = new List<nint>();
+        var inside = new List<Node>();
+        try
+        {
+            // Upwards: its parents. The last one is the desktop itself, which is not listed (unless the chain
+            // was cut before it got there, which the answer then says).
+            const int most = 60;
+            var cutAbove = false;
+            if (walker != 0)
+            {
+                var up = Out(walker, 3, element); // GetParentElement
+                while (up != 0 && above.Count < most)
+                {
+                    above.Add(up);
+                    up = Out(walker, 3, up);
+                }
+
+                cutAbove = up != 0;
+                Release(up);
+                if (!cutAbove && above.Count > 0)
+                {
+                    Release(above[^1]);
+                    above.RemoveAt(above.Count - 1);
+                }
+            }
+
+            above.Reverse();
+            var sb = new StringBuilder();
+            for (var i = 0; i < above.Count; i++) sb.Append(Line(Describe(above[i], 0), i)).Append('\n');
+
+            inside = Walk(automation, element, depth, 400, true, out var deeper);
+            for (var i = 0; i < inside.Count; i++)
+            {
+                var line = Line(inside[i], above.Count + inside[i].Depth);
+                sb.Append(i == 0 ? "> " + line.TrimStart().PadLeft(line.TrimStart().Length + Math.Max(0, (above.Count * 2) - 2)) : line).Append('\n');
+            }
+
+            var note = (cutAbove ? $" (only the nearest {most} of what it lies in)" : "") + (inside.Count >= 400 ? " (stopped at 400 controls inside it)" : deeper ? $" (more below depth {depth}: raise --depth)" : "");
+            return (0, $"at {x},{y}: '>' marks the control there; above it the {above.Count} it lies in, below it the {Math.Max(0, inside.Count - 1)} inside it{note}; [class] after each type\n" + sb);
+        }
+        finally
+        {
+            foreach (var n in inside) Release(n.Element); // the walk hands back the element it started from as its first node
+            if (inside.Count == 0) Release(element);
+            foreach (var e in above) Release(e);
+            Release(walker);
+        }
     }
 
     private static string Render(List<Node> nodes, string title, Regex? grep, bool all, int max, int walkLimit, bool deeper)
@@ -461,17 +594,17 @@ internal static unsafe partial class UiaTools
             case "get":
                 return (0, Line(node, 0));
 
-            case "tap":
+            case "tap" or "dtap":
             {
                 // Touch has no action of its own in UI Automation either: a finger does it, at the control's centre.
-                if (node.Offscreen || node.Rect.Width <= 0) return (1, $"ui tap: {label} is not visible on screen.");
+                if (node.Offscreen || node.Rect.Width <= 0) return (1, $"ui {verb}: {label} is not visible on screen.");
                 var x = (node.Rect.Left + node.Rect.Right) / 2;
                 var y = (node.Rect.Top + node.Rect.Bottom) / 2;
                 if (Covered(verb, label, x, y, hwnd, title) is { } covered) return (1, covered);
                 var blocked = UiTools.DisabledWindowAt(x, y);
-                ctx.Runtime.Audit.Write($"ui tap {label} at {x},{y}");
-                if (UiTools.TouchGesture([(x, y)], TimeSpan.FromMilliseconds(60), ctx.Ct) is { } failure) return (1, $"ui tap: {label} at {x},{y}: {failure}");
-                return (0, $"tapped {label} by touch at {x},{y}" + (blocked != null ? "\n" + blocked.Replace("The click did nothing there", "The touch did nothing there") : ""));
+                ctx.Runtime.Audit.Write($"ui {verb} {label} at {x},{y}");
+                if (UiTools.TouchTaps(x, y, verb == "dtap" ? 2 : 1, ctx.Ct) is { } failure) return (1, $"ui {verb}: {label} at {x},{y}: {failure}");
+                return (0, $"{(verb == "dtap" ? "tapped twice" : "tapped")} {label} by touch at {x},{y}" + (blocked != null ? "\n" + blocked.Replace("The click did nothing there", "The touch did nothing there") : ""));
             }
 
             case "set":

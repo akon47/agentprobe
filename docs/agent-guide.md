@@ -8,7 +8,12 @@ If `agentprobe` is not found, it is not on PATH yet: call the exe by its full pa
 
 ## Rules of thumb
 
-1. **Look before you run.** `agentprobe list` shows connected targets. With one target you can omit `-t`.
+1. **Look before you run.** `agentprobe list` shows connected targets. With one target you can omit `-t`, but for
+   work of more than a few commands name it from the start (`-t <name>`, or set `AGENTPROBE_TARGET=<name>`): another
+   PC may connect while you work. When that happens, commands without `-t` keep going to the PC you were using and
+   say so in a `[...]` line (for half an hour after the last one; `end` and `reboot` always need the name then).
+   When the PC you were using drops and another is connected, an unnamed command is refused rather than run there.
+   `list` shows when each PC connected.
 2. **Start with `agentprobe triage`** (add the app's name: `triage MyApp`). It tells you which tool to use next.
 3. **Prefer a built-in tool over `exec`.** Built-ins answer in a few compact lines; a PowerShell pipeline that does the
    same costs several times more tokens and is easy to get subtly wrong.
@@ -17,9 +22,12 @@ If `agentprobe` is not found, it is not on PATH yet: call the exe by its full pa
 6. **Long output is cut for you** (first 200 + last 100 lines) and saved to a local file whose path is printed.
    Search that file locally instead of re-running with `--full`.
 7. **After a dropped connection or a new session, run `agentprobe history`** to see how far the work got.
-   `orphaned` runs finished after the connection dropped; `agentprobe result <#>` returns their output.
+   `orphaned` runs finished after the connection dropped; `agentprobe result <#>` returns their output. History
+   also survives a reboot of the target and an update of agentprobe there (those entries have no output any more).
 8. Leave the target as you found it. Things agentprobe itself changed (jobs, workspace, crash-dump settings,
    a running trace) are undone by `agentprobe end`; things you changed with `exec` are yours to undo.
+9. **`paused by the person at the target` (exit 5) means stop.** Someone at that PC pressed the space bar in agentprobe's window (Enter there resumes)
+   because they need the PC. Nothing was run. Do not retry in a loop: tell the user, and go on when they say so.
 
 ## Which tool for which question
 
@@ -43,7 +51,8 @@ If `agentprobe` is not found, it is not on PATH yet: call the exe by its full pa
 | Can it reach the server? Who listens on the port? | `net check host:port`, `net --listen`, `net --name <app>` |
 | What did the installer / update change? | `envsnap --save before` ... `envsnap --diff before` (`--dir`, `--reg`) |
 | What is in this window? Press a button, fill a field | `ui <window>` (controls as text, with their state: selected, checked, expanded), `ui click <name>`, `ui rclick <name>` (context menu), `ui dblclick <name>`, `ui set <name> <text>`, `ui get <name>` (one control's line: compare before and after) |
-| Does it work by touch? | `touch tap <x> <y>`, `touch hold`, `touch drag`, `ui tap <name>`: real touch input, also on a PC without a touch screen |
+| Does it work by touch? | `touch tap <x> <y>`, `touch dtap` (double tap), `touch hold`, `touch drag`, `ui tap <name>`, `ui dtap <name>`: real touch input, also on a PC without a touch screen |
+| What did that tap or click land on? Did the list scroll, the slider move? | `ui --at @x,y` (the control at that point, what it lies in and what is inside it, with class names), `ui <window> --grep <name>` before and after: a list says `(scroll v=52.8%)`, a slider `=0.739 (0..1)`, the window line has its position and size |
 | What does the screen show? Is a menu open? | `windows` first (cheap; an open menu or drop-down is a `popup` line), `ui` for the controls; `screenshot --window <title> --scale 0.5` when you need pixels |
 | Where is the time going (deep)? | `wpr start cpu file` ... `wpr stop` (needs an elevated target) |
 
@@ -83,7 +92,9 @@ agentprobe kill app
 - A program that opens a network port from a new path (anything you `push` and run) makes Windows Firewall ask
   the person at the target to allow it. On an elevated target run `firewall allow <exe>` BEFORE starting it: that is
   the prompt's "Allow" as a rule for this session, and the prompt never appears. If one is already up,
-  `firewall dismiss <pid>` closes it like "Cancel" (its buttons cannot be pressed remotely). `windows`, `triage` and the end of `exec`/`start` output report such a
+  `firewall dismiss <pid>` closes it like "Cancel" (its buttons cannot be pressed remotely); the pid is the
+  PROMPT's (the warning line gives the exact command), and `firewall dismiss` alone closes every such prompt.
+  Where the target is not elevated, `start --dismiss-firewall --exe <app>` closes the prompt by itself when it appears. `windows`, `triage` and the end of `exec`/`start` output report such a
   SYSTEM PROMPT with its title (also UAC, credentials, SmartScreen, a packaged app's file picker); you cannot answer
   it remotely, so tell the user. This is found by the system process that shows the dialog, as Windows 11 does it:
   on a Windows that shows the firewall question another way it is not reported, so a silent stall after starting
@@ -95,6 +106,14 @@ agentprobe kill app
   (its own, or one of Windows). `click` on such a window says so instead of silently doing nothing. Close the
   dialog first; `ui click` goes through UI Automation instead of the mouse where the control allows it, and may
   still work.
+- Swapping the installed app for a build under test: `start --replace MyApp.exe --exe <new build>` closes the
+  running one by closing its windows, waits for it to end, then starts the other. Where Program Files cannot be
+  written (a target without administrator rights), copy the installed folder into the workspace on the target and
+  push only what changed over it: `exec 'Copy-Item -Recurse "C:\Program Files\MyApp" app'`, then
+  `push .\fixed app` (a push into an existing folder merges), then `start --exe app\MyApp.exe`.
+- An app that a script launches with `exec` keeps writing into that command's output for as long as it runs. `exec`
+  stops listening when the script itself has ended and says so; start the app with `start --exe` to get its output
+  apart (`logs <job>`).
 - stdin is closed: anything that prompts fails immediately instead of hanging. Pass `-Force`/`-Confirm:$false`/`/quiet`.
 - Commands run as the logged-on user **in their desktop session**: a GUI app you start is visible there.
 - The default folder is the session workspace. `agentprobe push .\bin\Release build` puts a folder there;
@@ -146,7 +165,8 @@ Fall back to `screenshot` → `click <x> <y>` (coordinates of that image; `--hov
 tooltips and hover states). The `@x,y` that `ui` prints are SCREEN coordinates, not screenshot pixels: pass them as
 `click @x,y`, never as two plain numbers after a scaled screenshot (a point outside the desktop is refused), `type <text>` (typed literally; use
 `key enter` / `key tab` for those keys), `key ctrl+s`, `focus <title>` when a control has no name. Prefer `windows`
-and `wait --window` over screenshots when you only need to know that something appeared.
+and `wait --window` over screenshots when you only need to know that something appeared. A screenshot is saved in
+the developer PC's temp folder unless `-o` names a place; its path is printed.
 
 A click goes to whatever window is in front at that point, which need not be the one you read the coordinates
 from: agentprobe's own window on the target often lies over the app. `click` and `touch` say which window got the
@@ -181,6 +201,8 @@ module+offset unless a PDB is present, and cannot walk managed/JIT frames. `trac
 with the list of targets that produced them. `agentprobe name -t LAB-PC07 gpu-rig` gives a target a short name.
 `agentprobe list --all` also shows targets that went offline, with their last command. ADDRESS is the address
 the PC connects from; a PC with several network adapters is listed with its other addresses below the table.
+STATE is about commands (`busy(1) 42m` = one has been running that long, `idle 12s` = the last one ended then, or the PC connected then and has run none,
+`paused` = the person there paused remote commands); CONNECTED is when the PC connected.
 `-t local` runs a tool on the developer PC itself.
 
 ## Versions and updates
@@ -196,7 +218,8 @@ agentprobe's own messages come out in Korean, set `AGENTPROBE_LANG=en`.
 ## Exit codes
 
 The remote command's own exit code for `exec`; `0` success; `2` usage; `3` no such target; `4` an update held back
-because something is running (`--force` goes ahead); `75` connection lost
+because something is running (`--force` goes ahead); `5` paused by the person at the target (nothing was run: ask
+the user); `75` connection lost
 (the command may still be running: see `history`); `124` timeout; `130` cancelled. Crash codes are decoded, e.g.
 `0xC0000005 access violation`, `0xC0000135 DLL not found`, `0xC000007B x86/x64 mismatch`, `0xE0434352 .NET exception`.
 Codes from `0x80008081` to `0x800080A7` come from the .NET host, which gave up before the app's own code ran

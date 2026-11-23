@@ -22,11 +22,21 @@ internal static class CommandLine
             // Options first, then the rest of the line verbatim so quotes reach the shell untouched.
             var options = new List<string>();
             var i = 1;
-            while (i + 1 < tokens.Count && (tokens[i].text is "--shell" or "--cwd" or "--timeout" or "--name" || (tool.Name == "start" && tokens[i].text == "--env")))
+            while (i < tokens.Count)
             {
-                options.Add(tokens[i].text);
-                options.Add(tokens[i + 1].text);
-                i += 2;
+                var word = tokens[i].text;
+                if (tool.Name == "start" && word == "--dismiss-firewall")
+                {
+                    options.Add(word);
+                    i++;
+                }
+                else if (i + 1 < tokens.Count && (word is "--shell" or "--cwd" or "--timeout" or "--name" || (tool.Name == "start" && word is "--env" or "--replace" or "--replace-wait")))
+                {
+                    options.Add(word);
+                    options.Add(tokens[i + 1].text);
+                    i += 2;
+                }
+                else break;
             }
 
             if (i >= tokens.Count) return (tool, [], $"{tool.Name}: no command given.");
@@ -304,13 +314,13 @@ internal static class McpServer
                     }
 
                     var local = Path.GetFullPath(toolArgs[0]);
-                    var (pushCode, pushText) = await DaemonAsync(new PipeMsg { Op = "push", Target = Arg(args, "target"), LocalPath = local, RemotePath = toolArgs.Length == 2 ? toolArgs[1] : Path.GetFileName(local.TrimEnd('\\', '/')) });
+                    var (pushCode, pushText) = await DaemonAsync(new PipeMsg { Op = "push", Target = Arg(args, "target") ?? Cli.DefaultTarget(), LocalPath = local, RemotePath = toolArgs.Length == 2 ? toolArgs[1] : Path.GetFileName(local.TrimEnd('\\', '/')) });
                     await TextAsync(id, pushText, pushCode != 0);
                     return;
                 }
 
                 // Files a command sends back (dump, pull, wpr stop) land in the agent's working folder, like the CLI does.
-                var (code, text) = await DaemonAsync(new PipeMsg { Op = "run", Target = Arg(args, "target"), Tool = parsed.Name, Args = toolArgs, LocalPath = Environment.CurrentDirectory });
+                var (code, text) = await DaemonAsync(new PipeMsg { Op = "run", Target = Arg(args, "target") ?? Cli.DefaultTarget(), Tool = parsed.Name, Args = toolArgs, LocalPath = Environment.CurrentDirectory });
                 text = Limit(text, parsed.Name);
                 if (code != 0) text = text.TrimEnd() + $"\n[exit {code}]";
                 // For exec/start a non-zero code is the remote program's own result, not a failure of this tool.
@@ -325,7 +335,7 @@ internal static class McpServer
                 if (Arg(args, "window") is { } window) shotArgs.AddRange(["--window", window]);
                 try
                 {
-                    var (code, text) = await DaemonAsync(new PipeMsg { Op = "run", Target = Arg(args, "target"), Tool = "screenshot", Args = [.. shotArgs], LocalPath = file });
+                    var (code, text) = await DaemonAsync(new PipeMsg { Op = "run", Target = Arg(args, "target") ?? Cli.DefaultTarget(), Tool = "screenshot", Args = [.. shotArgs], LocalPath = file });
                     if (code != 0 || !File.Exists(file))
                     {
                         await TextAsync(id, text, true);
