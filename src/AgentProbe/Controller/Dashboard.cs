@@ -154,7 +154,7 @@ internal sealed class Dashboard(Daemon daemon)
                 }
 
                 case "/guide":
-                    await RespondAsync(stream, 200, "text/plain; charset=utf-8", Encoding.UTF8.GetBytes(Cli.Guide()));
+                    await RespondAsync(stream, 200, "text/plain; charset=utf-8", Encoding.UTF8.GetBytes(Cli.Guide("all", out var _)));
                     break;
 
                 case "/api/targets":

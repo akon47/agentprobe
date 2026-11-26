@@ -45,9 +45,20 @@ internal static partial class UiTools
         new("screenshot", "Desktop", "Capture the screen (or one display/window) to a PNG on the developer PC",
             """
             screenshot [-o file.png] [--display N] [--window TITLE|HWND [--raise]] [--scale 0.5]
+                       [--control NAME|#ID [--nth N]] [--region X,Y,W,H] [--diff] [--stats]
               Saved on the developer PC, in its temp folder unless -o says where (the path is printed); open the
-              file to look at it. --window gives one window and --scale shrinks the image: both make it much
-              cheaper to read. click/drag coordinates refer to the latest screenshot.
+              file to look at it. click/drag coordinates refer to the latest screenshot.
+              What an image costs to read depends on how many pixels it has, not on its file size: ask for the
+              part you need. --window gives one window, --scale shrinks it, and:
+              --control NAME  only that control (found by name or #id as `ui click` finds it, in --window or
+                              the foreground window), with a small margin
+              --region X,Y,W,H  only that rectangle of the screen (screen coordinates, as `windows` and
+                              `ui --pos` give them)
+              --diff          only the part that changed since the previous screenshot of the same area and
+                              scale. Nothing changed: one line of text and no image at all.
+              --stats         no image: the average color, how much is near black or near white and how much
+                              the most common color covers. Answers "is it black?", "is anything drawn?"; with
+                              --diff also how many pixels changed ("is the video moving?").
               Without --window the picture is the screen as the person at the PC sees it: whatever lies in front
               is in it, agentprobe's own window included. --window asks that window to draw ITSELF, together with
               the dialogs it owns, so it comes out whole even when other windows cover it; the answer says when
@@ -67,6 +78,10 @@ internal static partial class UiTools
               nothing is clicked and the answer says what it is; --raise brings TITLE to the front first.
               A point on agentprobe's own window on the target is never clicked.
               --hover only moves the pointer there (tooltips, hover states, menus that open on hover).
+              The answer also says what changed on the screen in the moment after the click (a window that
+              opened, with its text; one that closed; controls of that window that read differently), so no
+              `windows`, `ui` or screenshot is needed to see its effect; --no-watch leaves that out. The
+              same goes for touch, drag, scroll, type and key.
               --screen means raw desktop coordinates instead. Windows of elevated apps ignore input unless
               agentprobe itself runs elevated on the target.
             """, ClickAsync),
@@ -269,7 +284,7 @@ internal static partial class UiTools
     /// An open menu, context menu or drop-down: a visible untitled window that belongs to another window (or is a
     /// Win32 menu). Shadows, tooltips and input-method helpers are owned and untitled too, and are left out.
     /// </summary>
-    private static bool IsPopup(WindowInfo w)
+    internal static bool IsPopup(WindowInfo w)
     {
         if (!w.Visible || w.Minimized || w.Title.Length > 0 || w.Rect.Width < 16 || w.Rect.Height < 8) return false;
         if (w.Class == "#32768") return true; // a Win32 menu
@@ -627,12 +642,35 @@ internal static partial class UiTools
 
     private static async Task<int> ScreenshotAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "raise");
+        var a = ArgParser.Parse(args, "raise", "diff", "stats");
         var monitors = Monitors();
         RECT area;
         string what;
         List<WindowInfo>? itself = null; // --window: the window and the dialogs it owns, back to front
-        if (a.Get("window") is { } spec)
+        var windowSpec = a.Get("window");
+        RECT? region = null;
+        var regionName = "";
+        if (a.Has("thumb") && (a.Has("control") || a.Has("region") || a.Flag("diff") || a.Flag("stats"))) return ctx.Fail("screenshot: --control, --region, --diff and --stats are not for the dashboard's preview.");
+        if (a.Get("control") is { } controlSpec)
+        {
+            // The control's own rectangle, in the window it is in: found as `ui click` finds it.
+            var probe = await Task.Run(() => UiaTools.Probe(windowSpec, controlSpec, Math.Max(1, a.GetInt("nth", 1))));
+            if (probe.status != 0) return ctx.Fail("screenshot --control: " + probe.text + (probe.status == 1 ? " (`ui --grep` shows what is there)." : ""));
+            if (probe.offscreen) return ctx.Fail($"screenshot --control: {probe.text} is not visible on screen (scrolled away, or on a page that is not shown): there is nothing to take a picture of.");
+            region = new RECT { Left = probe.rect.Left - 6, Top = probe.rect.Top - 6, Right = probe.rect.Right + 6, Bottom = probe.rect.Bottom + 6 };
+            regionName = probe.text;
+            windowSpec = "0x" + ((long)probe.hwnd).ToString("X");
+        }
+        else if (a.Get("region") is { } regionText)
+        {
+            var n = regionText.Split([',', ' ', 'x'], StringSplitOptions.RemoveEmptyEntries);
+            if (n.Length != 4 || !int.TryParse(n[0], out var rx) || !int.TryParse(n[1], out var ry) || !int.TryParse(n[2], out var rw) || !int.TryParse(n[3], out var rh) || rw <= 0 || rh <= 0)
+                return ctx.Fail("screenshot: --region wants X,Y,W,H in screen coordinates, for example --region 160,160,440,375.");
+            region = new RECT { Left = rx, Top = ry, Right = rx + rw, Bottom = ry + rh };
+            regionName = $"the region {rx},{ry} {rw}x{rh}";
+        }
+
+        if (windowSpec is { } spec)
         {
             var w = FindWindow(spec);
             if (w == null) return ctx.Fail($"screenshot: no window matches '{spec}' (see `windows`).");
@@ -726,6 +764,114 @@ internal static partial class UiTools
 
         if (pixels == null) return ctx.Fail("screenshot: capture failed (secure desktop such as UAC or the lock screen is showing?).");
 
+        // --control / --region: that part of the picture only. The place it has on the screen stays known, so
+        // click coordinates in the smaller image still land where they should.
+        if (region is { } wanted)
+        {
+            var clip = new RECT { Left = Math.Max(wanted.Left, area.Left), Top = Math.Max(wanted.Top, area.Top), Right = Math.Min(wanted.Right, area.Right), Bottom = Math.Min(wanted.Bottom, area.Bottom) };
+            if (clip.Width <= 0 || clip.Height <= 0)
+                return ctx.Fail($"screenshot: {regionName} (at {wanted.Left},{wanted.Top} {wanted.Width}x{wanted.Height}) lies outside {what}, which is at {area.Left},{area.Top} {area.Width}x{area.Height}; no picture was taken.");
+            var cx = Math.Clamp((int)((clip.Left - area.Left) * scale), 0, width - 1);
+            var cy = Math.Clamp((int)((clip.Top - area.Top) * scale), 0, height - 1);
+            var cw = Math.Clamp((int)Math.Ceiling(clip.Width * scale), 1, width - cx);
+            var ch = Math.Clamp((int)Math.Ceiling(clip.Height * scale), 1, height - cy);
+            pixels = Crop(pixels, width, cx, cy, cw, ch);
+            (width, height, area) = (cw, ch, clip);
+            what = $"{regionName} in {what}";
+        }
+
+        // --diff: against the previous screenshot of exactly this area and scale, kept on this PC.
+        var diffNote = "";
+        var changedShare = -1.0;
+        if (!thumb)
+        {
+            var key = $"{what}|{area.Left},{area.Top},{area.Width},{area.Height}|{scale.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
+            var previous = _lastShot;
+            _lastShot = (key, pixels, width, height, DateTime.UtcNow);
+            if (a.Flag("diff"))
+            {
+                if (previous is { } p && p.key == key && p.width == width && p.height == height)
+                {
+                    var ago = Format.Duration(DateTime.UtcNow - p.at);
+                    int minX = width, minY = height, maxX = -1, maxY = -1;
+                    long changed = 0;
+                    for (var y = 0; y < height; y++)
+                    {
+                        var row = y * width * 4;
+                        for (var x = 0; x < width; x++)
+                        {
+                            var i = row + (x * 4);
+                            if (pixels[i] == p.pixels[i] && pixels[i + 1] == p.pixels[i + 1] && pixels[i + 2] == p.pixels[i + 2]) continue;
+                            changed++;
+                            if (x < minX) minX = x;
+                            if (x > maxX) maxX = x;
+                            if (y < minY) minY = y;
+                            if (y > maxY) maxY = y;
+                        }
+                    }
+
+                    if (changed == 0)
+                    {
+                        ctx.Runtime.Audit.Write($"screenshot of {what} (compared with the one before: no change)");
+                        ctx.Out.WriteLine($"no change: {what} looks exactly as in the screenshot taken {ago} ago ({width}x{height} pixels compared). No image was sent.");
+                        return 0;
+                    }
+
+                    changedShare = 100.0 * changed / ((long)width * height);
+                    var share = changedShare < 0.1 ? "under 0.1" : Format.Pct(changedShare);
+                    var (bx, by) = (Math.Max(0, minX - 8), Math.Max(0, minY - 8));
+                    var (bw, bh) = (Math.Min(width, maxX + 9) - bx, Math.Min(height, maxY + 9) - by);
+                    if (a.Flag("stats"))
+                    {
+                        diffNote = $"{share}% of the pixels differ from the screenshot taken {ago} ago, all of them within {bx},{by} {bw}x{bh} of the image";
+                    }
+                    else if ((long)bw * bh * 100 >= (long)width * height * 70)
+                    {
+                        diffNote = $"--diff: {share}% of the pixels differ from the screenshot taken {ago} ago, spread over most of it: this is the whole picture.";
+                    }
+                    else
+                    {
+                        diffNote = $"--diff: this is only the part that changed since the screenshot taken {ago} ago: {bx},{by} {bw}x{bh} of that {width}x{height} image ({share}% of its pixels differ). Everything outside it is as it was.";
+                        pixels = Crop(pixels, width, bx, by, bw, bh);
+                        area = new RECT { Left = area.Left + (int)Math.Round(bx / scale), Top = area.Top + (int)Math.Round(by / scale), Right = area.Left + (int)Math.Round((bx + bw) / scale), Bottom = area.Top + (int)Math.Round((by + bh) / scale) };
+                        (width, height) = (bw, bh);
+                    }
+                }
+                else
+                {
+                    diffNote = a.Flag("stats")
+                        ? "--diff: no earlier screenshot of exactly this area and scale in this session to compare with"
+                        : "--diff: there is no earlier screenshot of exactly this area and scale in this session to compare with, so this is the whole picture.";
+                }
+            }
+        }
+
+        if (a.Flag("stats"))
+        {
+            // Numbers instead of a picture: enough for "is it black?", "is anything drawn there?".
+            long sumR = 0, sumG = 0, sumB = 0, black = 0, white = 0;
+            var buckets = new int[4096];
+            for (var i = 0; i + 2 < pixels.Length; i += 4)
+            {
+                int b = pixels[i], g = pixels[i + 1], r = pixels[i + 2];
+                sumR += r;
+                sumG += g;
+                sumB += b;
+                if (r < 24 && g < 24 && b < 24) black++;
+                else if (r > 231 && g > 231 && b > 231) white++;
+                buckets[((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4)]++;
+            }
+
+            long count = Math.Max(1, pixels.Length / 4);
+            var top = Array.IndexOf(buckets, buckets.Max());
+            static string Share(long part, long whole) => (100.0 * part / whole).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture);
+            ctx.Runtime.Audit.Write($"screenshot of {what} (statistics only, no image)");
+            ctx.Out.WriteLine($"{width}x{height} pixels of {what}{(scale < 1 ? $" at {scale:0.##}x" : "")}, no image sent: average color #{sumR / count:X2}{sumG / count:X2}{sumB / count:X2}; " +
+                              $"{Share(black, count)}% near black, {Share(white, count)}% near white; the most common color, about #{((top >> 8) << 4) + 8:X2}{(((top >> 4) & 15) << 4) + 8:X2}{((top & 15) << 4) + 8:X2}, covers {Share(buckets[top], count)}%" +
+                              (diffNote.Length > 0 ? "; " + diffNote : ""));
+            return 0;
+        }
+
         var file = Path.Combine(Path.GetTempPath(), $"{AppInfo.Name}-shot-{Guid.NewGuid():N}.png");
         await using (var fs = File.Create(file)) PngWriter.Write(fs, pixels, width, height);
         if (thumb)
@@ -739,6 +885,7 @@ internal static partial class UiTools
             (_shotX, _shotY, _shotScale) = (area.Left, area.Top, scale); // click coordinates follow the agent's own screenshots only
             ctx.Runtime.Audit.Write($"screenshot of {what}");
             ctx.Out.WriteLine($"{width}x{height} PNG of {what}" + (scale < 1 ? $" at {scale:0.##}x" : "") + "; click/drag take coordinates in this image");
+            if (diffNote.Length > 0) ctx.Out.WriteLine(diffNote);
             if (itself != null)
             {
                 // What is in front of it on the screen. A disabled window cannot be asked about (Windows skips
@@ -789,6 +936,17 @@ internal static partial class UiTools
         return 0;
     }
 
+    /// <summary>The last screenshot an agent took, for <c>--diff</c>: which area it was of, and its pixels.</summary>
+    private static (string key, byte[] pixels, int width, int height, DateTime at)? _lastShot;
+
+    /// <summary>A rectangle out of top-down BGRA pixels.</summary>
+    private static byte[] Crop(byte[] pixels, int width, int x, int y, int w, int h)
+    {
+        var result = new byte[w * h * 4];
+        for (var row = 0; row < h; row++) Buffer.BlockCopy(pixels, (((y + row) * width) + x) * 4, result, row * w * 4, w * 4);
+        return result;
+    }
+
     // ------------------------------------------------------------------ input
 
     private static (int x, int y) ToScreen(double x, double y, bool raw)
@@ -832,7 +990,7 @@ internal static partial class UiTools
 
     private static async Task<int> ClickAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "double", "screen", "hover", "raise");
+        var a = ArgParser.Parse(args, "double", "screen", "hover", "raise", "no-watch");
         var raw = ExpandAt(a) | a.Flag("screen");
         if (!Coordinates(ctx, a, 2, out var v)) return 2;
         var (x, y) = ToScreen(v[0], v[1], raw);
@@ -857,6 +1015,7 @@ internal static partial class UiTools
             _ => (0x0002u, 0x0004u),
         };
         var blocked = DisabledWindowAt(x, y); // looked at before the click: the click itself may change what is open
+        var watch = await WatchAsync(a.Flag("no-watch"), RootAt(x, y));
         Mouse(x, y, 0x0001); // move
         await Task.Delay(40, ctx.Ct);
         for (var i = 0; i < (a.Flag("double") ? 2 : 1); i++)
@@ -868,9 +1027,19 @@ internal static partial class UiTools
 
         ctx.Runtime.Audit.Write($"click at {x},{y}");
         ctx.Out.WriteLine($"clicked at screen {x},{y} on {onWhat}");
+        await ReportAsync(ctx, watch);
         if (blocked != null) ctx.Out.WriteLine(blocked);
         SystemPrompts.Warn(ctx.Err);
         return 0;
+    }
+
+    /// <summary>The screen right before an input action (see <see cref="UiaTools.Watch"/>); null when not asked for.</summary>
+    private static Task<UiWatch?> WatchAsync(bool off, nint window) => off ? Task.FromResult<UiWatch?>(null) : Task.Run(() => (UiWatch?)UiaTools.Watch(window));
+
+    /// <summary>Adds what changed on the screen since <paramref name="watch"/> to the answer.</summary>
+    private static async Task ReportAsync(ToolContext ctx, UiWatch? watch)
+    {
+        if (watch != null) ctx.Out.WriteLine(await Task.Run(() => UiaTools.Report(watch)));
     }
 
     /// <summary>
@@ -1027,7 +1196,7 @@ internal static partial class UiTools
 
     private static async Task<int> TouchAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "screen", "raise");
+        var a = ArgParser.Parse(args, "screen", "raise", "no-watch");
         var verb = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "";
         if (verb is not ("tap" or "dtap" or "hold" or "drag")) return ctx.Fail("touch: tap, dtap, hold or drag? e.g. touch tap 640 400   (see `help touch`)");
         a.Positionals.RemoveAt(0);
@@ -1054,6 +1223,7 @@ internal static partial class UiTools
         if (path.Count > 1 && IsOwnWindow(RootAt(path[^1].x, path[^1].y))) return ctx.Fail($"touch: {path[^1].x},{path[^1].y}, where the drag would end, is on agentprobe's own window on the target; nothing was done.");
         var onWhat = Describe(RootAt(path[0].x, path[0].y));
         var blocked = DisabledWindowAt(path[0].x, path[0].y);
+        var watch = await WatchAsync(a.Flag("no-watch"), RootAt(path[0].x, path[0].y));
         var failure = await Task.Run(() => verb == "dtap" ? TouchTaps(path[0].x, path[0].y, 2, ctx.Ct) : TouchGesture(path, duration, ctx.Ct), ctx.Ct);
         if (failure != null) return ctx.Fail("touch: " + failure);
 
@@ -1072,6 +1242,7 @@ internal static partial class UiTools
             "dtap" => $"tapped twice by touch at screen {where} on {onWhat}",
             _ => $"tapped by touch at screen {where} on {onWhat}",
         });
+        await ReportAsync(ctx, watch);
         if (blocked != null) ctx.Out.WriteLine(blocked.Replace("The click did nothing there", "The touch did nothing there"));
         SystemPrompts.Warn(ctx.Err);
         return 0;
@@ -1079,7 +1250,7 @@ internal static partial class UiTools
 
     private static async Task<int> DragAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "screen");
+        var a = ArgParser.Parse(args, "screen", "no-watch");
         var raw = ExpandAt(a) | a.Flag("screen"); // both ends in the same kind of coordinates
         if (!Coordinates(ctx, a, 4, out var v)) return 2;
         var (x1, y1) = ToScreen(v[0], v[1], raw);
@@ -1087,6 +1258,7 @@ internal static partial class UiTools
         if ((OutsideDesktop(x1, y1, raw) ?? OutsideDesktop(x2, y2, raw)) is { } outside) return ctx.Fail("drag: " + outside);
         if (WrongTarget(x1, y1, 0, "Bring the app to the front first (`focus <its title>`).") is { } wrong) return ctx.Fail("drag: " + wrong);
         if (IsOwnWindow(RootAt(x2, y2))) return ctx.Fail($"drag: {x2},{y2}, where the drag would end, is on agentprobe's own window on the target; nothing was done.");
+        var watch = await WatchAsync(a.Flag("no-watch"), RootAt(x1, y1));
         Mouse(x1, y1, 0x0001);
         await Task.Delay(50, ctx.Ct);
         Mouse(x1, y1, 0x0002);
@@ -1107,12 +1279,13 @@ internal static partial class UiTools
 
         ctx.Runtime.Audit.Write($"drag {x1},{y1} -> {x2},{y2}");
         ctx.Out.WriteLine($"dragged {x1},{y1} -> {x2},{y2}");
+        await ReportAsync(ctx, watch);
         return 0;
     }
 
     private static unsafe Task<int> ScrollAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "screen");
+        var a = ArgParser.Parse(args, "screen", "no-watch");
         var raw = ExpandAt(a) | a.Flag("screen");
         if (a.Positionals.Count == 0 || !int.TryParse(a.Positionals[0], out var notches)) return Task.FromResult(ctx.Fail("scroll: how many notches? (negative = down)"));
         if (a.Positionals.Count >= 3 && double.TryParse(a.Positionals[1], out var px) && double.TryParse(a.Positionals[2], out var py))
@@ -1128,12 +1301,14 @@ internal static partial class UiTools
             return Task.FromResult(ctx.Fail("scroll: the pointer is on agentprobe's own window on the target; nothing was done. Give a position: scroll <notches> <x> <y>."));
         }
 
+        var watch = !a.Flag("no-watch") && GetCursorPos(out var pointer) ? UiaTools.Watch(RootAt(pointer.X, pointer.Y)) : null;
         var input = default(INPUT);
         input.type = 0;
         input.mi.mouseData = unchecked((uint)(notches * 120));
         input.mi.dwFlags = 0x0800; // WHEEL
         Win32.SendInput(1, &input, sizeof(INPUT));
         ctx.Out.WriteLine($"scrolled {notches}");
+        if (watch != null) ctx.Out.WriteLine(UiaTools.Report(watch));
         return Task.FromResult(0);
     }
 
@@ -1163,6 +1338,7 @@ internal static partial class UiTools
         var text = string.Join(' ', args);
         if (text.Length == 0) return ctx.Fail("type: no text.");
         if (KeyboardOnOwnWindow() is { } own) return ctx.Fail("type: " + own);
+        var watch = await WatchAsync(false, Win32.GetForegroundWindow());
         var typed = 0;
         foreach (var ch in text)
         {
@@ -1196,6 +1372,7 @@ internal static partial class UiTools
 
         ctx.Runtime.Audit.Write($"type {text.Length} characters");
         ctx.Out.WriteLine($"typed {text.Length} characters");
+        await ReportAsync(ctx, watch);
         return 0;
     }
 
@@ -1211,6 +1388,8 @@ internal static partial class UiTools
 
     private static async Task<int> KeyAsync(ToolContext ctx, string[] args)
     {
+        var noWatch = args.Contains("--no-watch");
+        args = [.. args.Where(x => x != "--no-watch")];
         if (args.Length == 0) return ctx.Fail("key: which key? e.g. key ctrl+s");
         if (KeyboardOnOwnWindow() is { } own) return ctx.Fail("key: " + own);
         var extended = new HashSet<ushort> { 0x2E, 0x2D, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x5B, 0x5D };
@@ -1237,6 +1416,7 @@ internal static partial class UiTools
             combos.Add(keys);
         }
 
+        var watch = await WatchAsync(noWatch, Win32.GetForegroundWindow());
         var pressed = 0;
         foreach (var keys in combos)
         {
@@ -1269,6 +1449,7 @@ internal static partial class UiTools
 
         ctx.Runtime.Audit.Write("key " + string.Join(' ', args));
         ctx.Out.WriteLine("pressed " + string.Join(' ', args));
+        await ReportAsync(ctx, watch);
         return 0;
     }
 

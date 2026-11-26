@@ -20,6 +20,12 @@ internal static class Cli
         Console.OutputEncoding = new UTF8Encoding(false);
         Console.Out.NewLine = "\n"; // one byte per line break is enough for an agent
         Console.Error.NewLine = "\n";
+        return await DispatchAsync(argv);
+    }
+
+    /// <summary>One command line, already split into words. Also what each step of `run` goes through.</summary>
+    public static async Task<int> DispatchAsync(string[] argv)
+    {
         var command = argv[0].ToLowerInvariant();
         var rest = argv[1..];
 
@@ -48,7 +54,7 @@ internal static class Cli
         // AGENTPROBE_TARGET names the PC for commands that run on one, when -t is not given: a piece of work then
         // keeps its target whatever else connects. (Not for `update`, where -t changes what is updated.)
         var targetFromEnvironment = false;
-        if (target == null && (command is "name" or "push" || ToolRegistry.Find(command) != null) && DefaultTarget() is { } fromEnvironment)
+        if (target == null && (command is "name" or "push" or "run" || ToolRegistry.Find(command) != null) && DefaultTarget() is { } fromEnvironment)
         {
             target = fromEnvironment;
             targetFromEnvironment = true;
@@ -62,8 +68,13 @@ internal static class Cli
                 Console.WriteLine(AppInfo.Version);
                 return 0;
             case "guide":
-                Console.Write(Guide());
-                return 0;
+            {
+                var text = Guide(args.FirstOrDefault(), out var known);
+                (known ? Console.Out : Console.Error).Write(text);
+                return known ? 0 : 2;
+            }
+            case "run":
+                return await Steps.RunAsync(args, target, Console.Out);
             case "setup":
             {
                 var result = Setup.Run(args);
@@ -132,7 +143,8 @@ internal static class Cli
             return 0;
         }
 
-        var toolArgs = ExecLikeTools.Contains(tool.Name) ? BuildExecArgs(tool.Name, args) : args;
+        var quietOk = false;
+        var toolArgs = ExecLikeTools.Contains(tool.Name) ? BuildExecArgs(tool.Name, args, out quietOk) : args;
         if (toolArgs == null) return 2;
 
         // `pull` takes the local destination as its optional second argument.
@@ -173,7 +185,7 @@ internal static class Cli
             req.TimeoutSec = (int)(a.GetDuration("timeout")?.TotalSeconds ?? 0);
         }
 
-        var answered = await DaemonAsync(req, tool.Name, full);
+        var answered = await DaemonAsync(req, tool.Name, full, quietOk: quietOk);
         if (answered == 3 && targetFromEnvironment) Console.Error.WriteLine($"(the target name '{target}' came from the environment variable AGENTPROBE_TARGET)");
         return answered;
     }
@@ -215,8 +227,9 @@ internal static class Cli
     /// exec/start: options are only read up to the first word of the command, so
     /// <c>exec Get-Process -Name foo</c> reaches PowerShell intact. -f and - (stdin) are read here, on the developer PC.
     /// </summary>
-    private static string[]? BuildExecArgs(string tool, string[] args)
+    private static string[]? BuildExecArgs(string tool, string[] args, out bool quietOk)
     {
+        quietOk = false;
         var options = new List<string>();
         string? script = null;
         var wholeScript = false; // -f or stdin: a script of its own, with its own arguments after it
@@ -233,6 +246,12 @@ internal static class Cli
             }
 
             if (!a.StartsWith('-')) break;
+            if (a == "--quiet-ok" && tool == "exec")
+            {
+                quietOk = true; // read here, on the developer PC: it is about what is printed, not about what runs
+                continue;
+            }
+
             if (a is "-f" or "--file")
             {
                 if (++i >= args.Length || !File.Exists(args[i]))
@@ -327,7 +346,7 @@ internal static class Cli
         // (Only the options that are hardly anything but agentprobe's: --name, --out or -t after a quoted
         // command are as likely the program's own.)
         if (args.Length - i >= 2 && args[i].Any(char.IsWhiteSpace) &&
-            args[(i + 1)..].FirstOrDefault(x => x is "--full" or "--timeout" or "--shell" or "--cwd" or "--target" ||
+            args[(i + 1)..].FirstOrDefault(x => x is "--full" or "--timeout" or "--shell" or "--cwd" or "--target" or "--quiet-ok" ||
                                                 x.StartsWith("--timeout=", StringComparison.Ordinal) || x.StartsWith("--shell=", StringComparison.Ordinal) || x.StartsWith("--cwd=", StringComparison.Ordinal) || x.StartsWith("--target=", StringComparison.Ordinal)) is { } late)
         {
             Console.Error.WriteLine($"{tool}: '{late}' comes after the command, where it would be sent to the target as part of the command. Nothing was run. " +
@@ -414,7 +433,7 @@ internal static class Cli
         }
     }
 
-    public static async Task<int> DaemonAsync(PipeMsg req, string tool, bool full, TextWriter? capture = null)
+    public static async Task<int> DaemonAsync(PipeMsg req, string tool, bool full, TextWriter? capture = null, bool quietOk = false)
     {
         var pipe = await ConnectOrStartAsync();
         if (pipe == null)
@@ -423,10 +442,10 @@ internal static class Cli
                 ? "agentprobe's background process is running with different rights (started from an administrator terminal, or the other way round). Run `agentprobe stop` from that kind of terminal, then try again."
                 : "Could not start the agentprobe background process. Try `agentprobe daemon` to see why.");
         }
-        return await RequestAsync(pipe, req, tool, full, capture);
+        return await RequestAsync(pipe, req, tool, full, capture, quietOk);
     }
 
-    private static async Task<int> RequestAsync(NamedPipeClientStream pipe, PipeMsg req, string tool, bool full, TextWriter? capture = null)
+    private static async Task<int> RequestAsync(NamedPipeClientStream pipe, PipeMsg req, string tool, bool full, TextWriter? capture = null, bool quietOk = false)
     {
         await using var _ = pipe;
         if (Util.Lang.Korean && Util.Lang.Person) req.Lang = "ko";
@@ -435,7 +454,7 @@ internal static class Cli
         pipe.WriteByte((byte)'\n');
         await pipe.FlushAsync();
 
-        var limiter = new OutputLimiter(tool, full || capture != null);
+        var limiter = new OutputLimiter(tool, full || capture != null, quietOk: quietOk);
         var reader = new StreamReader(pipe, Encoding.UTF8);
         var code = 75;
         var gotExit = false;
@@ -466,7 +485,7 @@ internal static class Cli
             if (gotExit) break;
         }
 
-        limiter.Finish();
+        limiter.Finish(gotExit ? code : 1);
         if (!gotExit) Console.Error.WriteLine("[agentprobe daemon closed the connection]");
         return code;
     }
@@ -527,6 +546,12 @@ internal static class Cli
                 return 0;
             }
 
+            if (args[0].Equals("run", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine(Steps.Usage.TrimEnd());
+                return 0;
+            }
+
             return Fail(Util.Lang.P($"No command '{args[0]}'.", $"'{args[0]}' 명령은 없습니다."));
         }
 
@@ -545,7 +570,7 @@ internal static class Cli
                   name <새 이름>     대상 PC에 짧은 이름을 붙입니다. 그 뒤로 -t에 그 이름을 씁니다
                   setup [--remove]   개발 PC 설정(한 번): 이 폴더를 PATH에 추가하고 방화벽 포트를 엽니다
                                      (관리자 권한을 한 번 묻습니다)
-                  guide              AI 에이전트용 사용 안내 (영어)
+                  guide [주제]       AI 에이전트용 사용 안내 (영어). 짧은 핵심과, 필요할 때 읽는 주제들 (guide all: 전부)
                   mcp                MCP 서버(stdio)로 실행: claude mcp add agentprobe -- "<경로>\agentprobe.exe" mcp
                   stop [--if-idle]   이 PC의 백그라운드 프로세스 종료 (--if-idle: 연결된 PC와 열린 대시보드가 없을 때만)
                   update [--check]   이 PC의 agentprobe를 최신 릴리스로 교체하고 백그라운드 프로세스를 다시 시작 (--check: 확인만)
@@ -553,6 +578,8 @@ internal static class Cli
 
                 대상 지정:  -t <이름>  |  -t a,b  |  -t "LAB-*"  |  -t all  |  -t local (이 PC)
                             연결된 대상이 하나면 -t를 생략할 수 있습니다. 여러 대상의 같은 결과는 묶어서 보여 줍니다.
+                여러 단계:  run <파일|->       한 줄에 하나씩 적은 명령을 순서대로 실행하고 실패한 곳에서 멈춥니다.
+                                               모두 성공하면 한 줄, 실패하면 그 단계와 대상 PC의 화면 상태를 보여 줍니다 (run --help)
                 출력:       긴 출력은 앞뒤만 보여 주고 전체를 이 PC의 파일로 저장합니다. --full은 전부 출력합니다.
                             -o <경로>는 받아 온 파일(screenshot, dump, pull)을 저장할 위치입니다.
                             AGENTPROBE_TARGET 환경 변수는 -t를 생략했을 때 쓸 대상 PC입니다.
@@ -579,7 +606,8 @@ internal static class Cli
               name <new-name>    give a target a short name; -t accepts that name from then on
               setup [--remove]   one-time setup of the developer PC: adds this folder to your PATH and opens the
                                  firewall port (asks for admin once). Until then, call the exe by its full path.
-              guide              how an AI agent should use this tool (workflow + cheap ways to look)
+              guide [topic]      how an AI agent should use this tool: the short core, and topics to read when
+                                 needed (guide ui, guide exec, ...; guide all is everything)
               mcp                run as an MCP server (stdio), for agents that are set up through MCP:
                                  claude mcp add agentprobe -- "<path>\agentprobe.exe" mcp
               stop [--if-idle]   stop the background process on this PC (--if-idle: only when no PC is connected and
@@ -591,6 +619,8 @@ internal static class Cli
 
             Targets:  -t <name>  |  -t a,b  |  -t "LAB-*"  |  -t all  |  -t local (this PC)
                       With one connected target, -t can be omitted. Several targets: identical results are grouped.
+            Steps:    run <file|->       several commands in one go, one per line, until one fails: one line when all
+                                         went well, the failed step with what the target shows when not (run --help)
             Output:   long output is cut to head+tail and saved to a local file; --full prints everything.
                       -o <path> chooses where files sent back (screenshot, dump, pull) are saved.
                       The environment variable AGENTPROBE_TARGET names the target for commands without -t.
@@ -602,11 +632,50 @@ internal static class Cli
         return 0;
     }
 
-    public static string Guide()
+    /// <summary>
+    /// The guide is one file, cut into a core and topics by marker lines (<c>&lt;!-- topic: name | what it covers --&gt;</c>).
+    /// An agent reads the core once and it stays in its context for the whole session: so the core is short, and
+    /// what is needed only now and then is a topic, read when it is needed.
+    /// No topic: the core and the list of topics. A topic's name: that part. "all": everything.
+    /// </summary>
+    public static string Guide(string? topic, out bool known)
     {
+        known = true;
         using var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("agent-guide.md");
         if (s == null) return "guide not embedded in this build\n";
-        return new StreamReader(s, Encoding.UTF8).ReadToEnd();
+        var text = new StreamReader(s, Encoding.UTF8).ReadToEnd().Replace("\r\n", "\n");
+
+        var core = new StringBuilder();
+        var topics = new List<(string name, string summary, StringBuilder body)>();
+        foreach (var line in text.Split('\n'))
+        {
+            if (line.StartsWith("<!-- topic:", StringComparison.Ordinal) && line.TrimEnd().EndsWith("-->", StringComparison.Ordinal))
+            {
+                var parts = line.Trim()[11..^3].Split('|', 2);
+                topics.Add((parts[0].Trim().ToLowerInvariant(), parts.Length > 1 ? parts[1].Trim() : "", new StringBuilder()));
+                continue;
+            }
+
+            (topics.Count > 0 ? topics[^1].body : core).Append(line).Append('\n');
+        }
+
+        var list = new StringBuilder();
+        foreach (var (name, summary, _) in topics) list.Append("  guide ").Append(name.PadRight(9)).Append(summary).Append('\n');
+        topic = topic?.Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(topic))
+        {
+            return topics.Count == 0 ? core.ToString()
+                : core.ToString().TrimEnd() + "\n\n## More, read when you need it\n\n`agentprobe guide <topic>` (`guide all` is everything at once):\n\n```\n" + list + "```\n";
+        }
+
+        if (topic == "all") return core.ToString().TrimEnd() + "\n\n" + string.Join("\n", topics.Select(t => t.body.ToString().Trim() + "\n"));
+        foreach (var (name, _, body) in topics)
+        {
+            if (name == topic) return body.ToString().Trim() + "\n";
+        }
+
+        known = false;
+        return $"guide: no topic '{topic}'. Topics:\n{list}  guide all      everything\n";
     }
 
     private static int Fail(string message)
@@ -635,6 +704,7 @@ internal static class LocalRunner
         var stateful = tool.Name is "watch" or "dbg" or "trace" or "start" or "jobs" or "logs" or "history" or "result" or "crashdumps" or "wpr"
                        || (tool.Name == "read" && args.Contains("--new"))
                        || (tool.Name == "envsnap" && (args.Contains("--save") || args.Contains("--diff")))
+                       || (tool.Name is "ui" or "screenshot" && args.Contains("--diff"))
                        || (tool.LoudWhen?.Invoke(args) == true)
                        || (tool.Name == "firewall" && args.Contains("--auto"))
                        || (tool.Name == "kill" && args.Length > 0 && !args[0].StartsWith('-'));

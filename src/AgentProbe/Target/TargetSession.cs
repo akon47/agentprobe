@@ -151,6 +151,14 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
                 code = 1;
             }
 
+            // A crash or hang that Windows logged since the last command is said now, whatever this command
+            // was about: otherwise an agent only learns of it by asking (`crashes`) after every step.
+            if (!background && tool.Name is not ("history" or "result" or "events" or "end" or "reboot" or "selfupdate"))
+            {
+                if (tool.Name is "crashes" or "triage") runtime.CrashesSeenUtc = DateTime.UtcNow; // those list them themselves
+                else CrashNotes.Report(runtime, ctx.Err);
+            }
+
             _running.TryRemove(m.Id, out _);
             await sink.CompleteAsync();
         }

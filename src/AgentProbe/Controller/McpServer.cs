@@ -30,6 +30,11 @@ internal static class CommandLine
                     options.Add(word);
                     i++;
                 }
+                else if (tool.Name == "exec" && word == "--quiet-ok")
+                {
+                    options.Insert(0, word); // first, where the caller takes it out again: it is not sent to the target
+                    i++;
+                }
                 else if (i + 1 < tokens.Count && (word is "--shell" or "--cwd" or "--timeout" or "--name" || (tool.Name == "start" && word is "--env" or "--replace" or "--replace-wait")))
                 {
                     options.Add(word);
@@ -212,9 +217,10 @@ internal static class McpServer
         Tool(w, "run",
             "Run one agentprobe command on a shared PC and return its compact text output. " +
             "Examples: 'triage', 'ps --top 10', 'proc MyApp', 'events --since 30m', 'watch start MyApp', 'exec Get-Service Spooler', 'help exec'. " +
-            "Call `guide` first to learn which command answers which question.", s =>
+            "Call `guide` first to learn which command answers which question. " +
+            "Several lines are run as steps, stopping at the first that fails: only the output of steps that start with 'show ' and of the failed one comes back ('help run').", s =>
         {
-            Prop(s, "command", "string", "The command line, without the leading 'agentprobe'.");
+            Prop(s, "command", "string", "The command line, without the leading 'agentprobe'. One per line for several steps.");
             Prop(s, "target", "string", "Target name (see list_targets). Omit when only one PC is shared. 'all' or 'LAB-*' run on several and group identical results.");
         }, "command");
         Tool(w, "screenshot", "Capture a shared PC's screen and return it as an image. Use `run` with 'windows' first when you only need to know which windows exist.", s =>
@@ -222,8 +228,12 @@ internal static class McpServer
             Prop(s, "target", "string", "Target name. Omit when only one PC is shared.");
             Prop(s, "window", "string", "Capture just the window whose title contains this text.");
             Prop(s, "scale", "number", "Shrink factor, 0.1 to 1. Default 0.5; smaller images cost less to read.");
+            Prop(s, "diff", "boolean", "Only the part that changed since the previous screenshot of the same area; no image at all when nothing changed.");
         });
-        Tool(w, "guide", "How to use agentprobe: which command answers which question, typical debugging sessions, exit codes.", _ => { });
+        Tool(w, "guide", "How to use agentprobe: which command answers which question, and the rules. Short; it lists topics to read when needed.", s =>
+        {
+            Prop(s, "topic", "string", "A topic the guide lists (ui, exec, ...), or 'all'. Omit for the core guide.");
+        });
         w.WriteEndArray();
     }
 
@@ -262,8 +272,11 @@ internal static class McpServer
         switch (name)
         {
             case "guide":
-                await TextAsync(id, Cli.Guide(), false);
+            {
+                var guide = Cli.Guide(Arg(args, "topic"), out var known);
+                await TextAsync(id, guide, !known);
                 return;
+            }
 
             case "list_targets":
             {
@@ -275,11 +288,21 @@ internal static class McpServer
 
             case "run":
             {
-                var command = Arg(args, "command") ?? "";
+                var command = (Arg(args, "command") ?? "").Trim();
+                if (command.Contains('\n'))
+                {
+                    // Several lines: steps, run in order until one fails.
+                    var report = new StringWriter { NewLine = "\n" };
+                    var stepsCode = await Steps.RunTextAsync(command, Arg(args, "target") ?? Cli.DefaultTarget(), report);
+                    await TextAsync(id, report.ToString().TrimEnd() + (stepsCode != 0 ? $"\n[exit {stepsCode}]" : ""), stepsCode is 2 or 3 or 75);
+                    return;
+                }
+
                 var first = command.TrimStart().Split(' ', 2)[0].ToLowerInvariant();
                 if (first is "guide")
                 {
-                    await TextAsync(id, Cli.Guide(), false);
+                    var guide = Cli.Guide(command.Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1).FirstOrDefault(), out var known);
+                    await TextAsync(id, guide, !known);
                     return;
                 }
 
@@ -294,7 +317,9 @@ internal static class McpServer
                 {
                     var topic = command.TrimStart().Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1).FirstOrDefault();
                     var tool = topic != null ? ToolRegistry.Find(topic) : null;
-                    await TextAsync(id, tool != null ? $"{tool.Name} - {tool.Summary}\n\n{tool.Usage.TrimEnd()}" : ToolRegistry.HelpList() + "\nhelp <command> shows options.", false);
+                    await TextAsync(id, tool != null ? $"{tool.Name} - {tool.Summary}\n\n{tool.Usage.TrimEnd()}"
+                        : topic == "run" ? Steps.Usage.TrimEnd()
+                        : ToolRegistry.HelpList() + "\nhelp <command> shows options.", false);
                     return;
                 }
 
@@ -320,8 +345,10 @@ internal static class McpServer
                 }
 
                 // Files a command sends back (dump, pull, wpr stop) land in the agent's working folder, like the CLI does.
+                var quietOk = parsed.Name == "exec" && toolArgs.Length > 0 && toolArgs[0] == "--quiet-ok";
+                if (quietOk) toolArgs = toolArgs[1..];
                 var (code, text) = await DaemonAsync(new PipeMsg { Op = "run", Target = Arg(args, "target") ?? Cli.DefaultTarget(), Tool = parsed.Name, Args = toolArgs, LocalPath = Environment.CurrentDirectory });
-                text = Limit(text, parsed.Name);
+                text = OutputLimiter.Cut(text, parsed.Name, quietOk, code);
                 if (code != 0) text = text.TrimEnd() + $"\n[exit {code}]";
                 // For exec/start a non-zero code is the remote program's own result, not a failure of this tool.
                 await TextAsync(id, text, code == 75 || (parsed.Name is not ("exec" or "start") && code is 2 or 3));
@@ -333,12 +360,13 @@ internal static class McpServer
                 var file = Path.Combine(Path.GetTempPath(), $"{AppInfo.Name}-mcp-{Guid.NewGuid():N}.png");
                 var shotArgs = new List<string> { "--scale", (args.ValueKind == JsonValueKind.Object && args.TryGetProperty("scale", out var sc) && sc.TryGetDouble(out var scale) ? Math.Clamp(scale, 0.1, 1) : 0.5).ToString(System.Globalization.CultureInfo.InvariantCulture) };
                 if (Arg(args, "window") is { } window) shotArgs.AddRange(["--window", window]);
+                if (args.ValueKind == JsonValueKind.Object && args.TryGetProperty("diff", out var df) && df.ValueKind == JsonValueKind.True) shotArgs.Add("--diff");
                 try
                 {
                     var (code, text) = await DaemonAsync(new PipeMsg { Op = "run", Target = Arg(args, "target") ?? Cli.DefaultTarget(), Tool = "screenshot", Args = [.. shotArgs], LocalPath = file });
                     if (code != 0 || !File.Exists(file))
                     {
-                        await TextAsync(id, text, true);
+                        await TextAsync(id, text, code != 0); // no file and no error: nothing changed since the last one (--diff)
                         return;
                     }
 
@@ -378,29 +406,6 @@ internal static class McpServer
         var sw = new StringWriter();
         var code = await Cli.DaemonAsync(request, request.Tool ?? request.Op ?? "", true, sw);
         return (code, sw.ToString());
-    }
-
-    /// <summary>The same cap the CLI applies: first 200 and last 100 lines, with everything saved to a local file.</summary>
-    private static string Limit(string text, string tool)
-    {
-        var lines = text.Split('\n');
-        if (lines.Length <= 320) return text;
-        string? path = null;
-        try
-        {
-            var dir = Path.Combine(Path.GetTempPath(), AppInfo.Name, "out");
-            Directory.CreateDirectory(dir);
-            path = Path.Combine(dir, $"{DateTime.Now:yyyyMMdd-HHmmss}-{tool}-{Environment.ProcessId}.txt");
-            File.WriteAllText(path, text, new UTF8Encoding(false));
-        }
-        catch (IOException)
-        {
-            path = null;
-        }
-
-        return string.Join('\n', lines.Take(200)) +
-               $"\n[... {lines.Length - 300} lines omitted. Full output ({lines.Length} lines): {path ?? "(could not be saved)"} - read or search that file, or rerun with --grep/--tail ...]\n" +
-               string.Join('\n', lines.TakeLast(100));
     }
 
     private static Task TextAsync(JsonElement id, string text, bool isError) => ReplyAsync(id, w => Result(w, r =>

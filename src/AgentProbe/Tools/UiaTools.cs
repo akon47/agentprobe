@@ -20,11 +20,18 @@ internal static unsafe partial class UiaTools
     [
         new("ui", "Desktop", "Read a window's controls as text and act on them by name (UI Automation)",
             """
-            ui [window] [--grep REGEX] [--depth 12] [--max 300] [--all] [--class]
+            ui [window] [--grep REGEX] [--depth 12] [--max 300] [--all] [--class] [--pos] [--items] [--diff]
             ui --at @<x>,<y> [--depth 6]         what is at that point of the screen: the control there, the ones it
                                                  lies in (up to its window) and the ones inside it, each with its class
                  The control tree of a window (default: the foreground window; give part of its title or an HWND).
-                 One line per control: type, "name", #automation-id, =value, state, and its center point on screen.
+                 One line per control: type, "name", #automation-id, =value, state.
+                 --pos adds each control's center on screen (@x,y), for click/touch/drag by coordinates; a
+                 control with neither name nor id always has it, and so does `ui get`. You act by name, so the
+                 positions are left out unless asked for: they are a quarter of the text.
+                 A long run of list, tree or grid items is cut to its first 8 and any selected one, with a line
+                 that says how many are not listed; --items lists them all.
+                 --diff prints only what changed since the last `ui` of that window (controls that appeared,
+                 went, or read differently), instead of the whole tree again.
                  State is what the control reports: (selected) on the tab, list item or radio button that is the
                  selected one, (checked) / (unchecked) for a check box or toggle button, (expanded) / (collapsed),
                  (disabled), and (maximized) / (minimized) / (normal) on the window's own line. Without such a
@@ -39,6 +46,11 @@ internal static unsafe partial class UiaTools
                  --grep searches the WHOLE tree, off-screen controls included (to depth 40 unless --depth says
                  otherwise), and prints the matching lines; --max then limits how many of them are printed, and
                  the total is stated. A search that could not cover everything says INCOMPLETE.
+                 Every action below answers with what it did AND what changed on the screen in the moment after:
+                 a window or menu that opened (with its text and buttons), one that closed, a control of this
+                 window that reads differently, the program ending. "no change seen" is an answer too. So there
+                 is no need to follow an action with `windows`, `ui` or a screenshot to see its effect; what
+                 happens later than about a second is for `wait --ui` / `expect`. --no-watch leaves that out.
             ui click <name|#id> [--window W] [--nth N] [--mouse]   press a button / select an item (falls back to a mouse click on it)
             ui rclick <name|#id> [--window W]    right-click it (opens its context menu; `windows` then shows a popup)
             ui dblclick <name|#id> [--window W]  double-click it
@@ -187,6 +199,12 @@ internal static unsafe partial class UiaTools
     [ThreadStatic]
     private static bool _mouseOnly; // ui click --mouse: not the control's own action
 
+    [ThreadStatic]
+    private static bool _withPos; // --pos, --at and `ui get`: lines carry the control's center on screen
+
+    [ThreadStatic]
+    private static bool _walkTimedOut; // the last walk on this thread stopped at its deadline
+
     /// <summary>" (selected)", " (checked)", " (expanded)"... as the control reports them; "" for one that reports none.</summary>
     private static string StateOf(Node n)
     {
@@ -317,9 +335,11 @@ internal static unsafe partial class UiaTools
     }
 
     /// <summary>Depth-first walk of the control view. The caller releases every returned element.</summary>
-    private static List<Node> Walk(nint automation, nint root, int maxDepth, int maxNodes, bool includeOffscreen, out bool deeper)
+    /// <param name="deadline">A <see cref="System.Diagnostics.Stopwatch"/> timestamp after which the walk stops where it is (0: none); <see cref="_walkTimedOut"/> then says so.</param>
+    private static List<Node> Walk(nint automation, nint root, int maxDepth, int maxNodes, bool includeOffscreen, out bool deeper, long deadline = 0)
     {
         deeper = false;
+        _walkTimedOut = false;
         var cutByDepth = false;
         var nodes = new List<Node>();
         var walker = ControlViewWalker(automation);
@@ -330,6 +350,13 @@ internal static unsafe partial class UiaTools
             var node = Describe(element, depth);
             nodes.Add(node);
             if (nodes.Count >= maxNodes) return;
+            if (deadline != 0 && System.Diagnostics.Stopwatch.GetTimestamp() > deadline)
+            {
+                _walkTimedOut = true;
+                maxNodes = nodes.Count; // ends every loop above this one too
+                return;
+            }
+
             if (depth >= maxDepth)
             {
                 var below = Out(walker, 4, element);
@@ -359,11 +386,11 @@ internal static unsafe partial class UiaTools
         return nodes;
     }
 
-    private static string Line(Node n, int indent)
+    /// <summary>What a control's line says about the control itself: type, name, id, value and state. No class, no position.</summary>
+    private static string Core(Node n)
     {
         var sb = new StringBuilder();
-        sb.Append(' ', indent * 2).Append(TypeName(n.Type));
-        if (_withClass && Bstr(n.Element, 30) is { Length: > 0 } cls) sb.Append(" [").Append(Format.Clip(cls, 40)).Append(']'); // get_CurrentClassName
+        sb.Append(TypeName(n.Type));
         if (n.Name.Length > 0) sb.Append(" \"").Append(Format.Clip(n.Name, 70)).Append('"');
         if (n.Id.Length > 0 && !n.Id.All(char.IsDigit)) sb.Append(" #").Append(Format.Clip(n.Id, 40));
         if (RangeOf(n) is { Length: > 0 } range) sb.Append(" =").Append(range);
@@ -371,9 +398,31 @@ internal static unsafe partial class UiaTools
         sb.Append(StateOf(n));
         if (!n.Enabled) sb.Append(" (disabled)");
         if (n.Offscreen) sb.Append(" (off-screen)");
-        else if (n.Rect.Width > 0) sb.Append(" @").Append((n.Rect.Left + n.Rect.Right) / 2).Append(',').Append((n.Rect.Top + n.Rect.Bottom) / 2);
         return sb.ToString();
     }
+
+    /// <summary>A control that cannot be named in `ui click`: it has neither a name nor an id of its own.</summary>
+    private static bool Nameless(Node n) => n.Name.Length == 0 && (n.Id.Length == 0 || n.Id.All(char.IsDigit));
+
+    /// <summary>
+    /// The line as it is printed: the class when asked for, and the position when asked for (--pos, `ui get`,
+    /// --at) or when the position is the only handle the control has.
+    /// </summary>
+    private static string Line(Node n, int indent, string? core = null)
+    {
+        core ??= Core(n);
+        var sb = new StringBuilder();
+        sb.Append(' ', indent * 2);
+        var type = TypeName(n.Type);
+        if (_withClass && Bstr(n.Element, 30) is { Length: > 0 } cls) sb.Append(type).Append(" [").Append(Format.Clip(cls, 40)).Append(']').Append(core, type.Length, core.Length - type.Length); // get_CurrentClassName
+        else sb.Append(core);
+        if ((_withPos || Nameless(n)) && !n.Offscreen && n.Rect.Width > 0) sb.Append(" @").Append((n.Rect.Left + n.Rect.Right) / 2).Append(',').Append((n.Rect.Top + n.Rect.Bottom) / 2);
+        return sb.ToString();
+    }
+
+    /// <summary>An unnamed layout container, text or image: folded away in a listing, its children move up a level.</summary>
+    private static bool Structural(Node n) =>
+        n.Depth > 0 && n.Name.Length == 0 && n.Value.Length == 0 && (n.Id.Length == 0 || n.Id.All(char.IsDigit)) && n.Type is 50033 or 50026 or 50025 or 50020 or 50006 or 50038 or 50027;
 
     /// <summary>
     /// Every control the name stands for, by the first rule that finds any: the exact name, the exact id, part of
@@ -403,18 +452,20 @@ internal static unsafe partial class UiaTools
 
     private static Task<int> UiAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "all", "class", "mouse");
+        var a = ArgParser.Parse(args, "all", "class", "mouse", "pos", "items", "diff", "no-watch");
         var verb = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "";
         var isAction = verb is "click" or "rclick" or "dblclick" or "tap" or "dtap" or "set" or "get";
         var withClass = a.Flag("class") || verb == "get" || a.Has("at");
+        var withPos = a.Flag("pos") || verb == "get";
         if (a.Has("at"))
         {
             var point = (a.Get("at") ?? "").TrimStart('@').Split(',');
             if (point.Length != 2 || !int.TryParse(point[0], out var ax) || !int.TryParse(point[1], out var ay))
-                return Task.FromResult(ctx.Fail("ui --at: which point? Screen coordinates as `ui` prints them: ui --at @342,1156"));
+                return Task.FromResult(ctx.Fail("ui --at: which point? Screen coordinates as `ui --pos` prints them: ui --at @342,1156"));
             var (atCode, atText) = OnComThread(automation =>
             {
                 _withClass = true;
+                _withPos = true;
                 return At(automation, ax, ay, Math.Clamp(a.GetInt("depth", 6), 0, 40));
             });
             (atCode == 0 ? ctx.Out : ctx.Err).WriteLine(atText.TrimEnd());
@@ -440,25 +491,38 @@ internal static unsafe partial class UiaTools
 
         // A search looks at the whole tree: its limit is on the lines printed, not on the controls looked at.
         const int searchLimit = 20000;
-        var walkLimit = isAction ? 4000 : grep != null ? searchLimit : Math.Max(1, a.GetInt("max", 300));
+        // A listing prints at most --max lines, but looks at four times as many controls: a long list that is
+        // folded into a few lines must not keep the rest of the window from being read.
+        var max = Math.Max(1, a.GetInt("max", 300));
+        var walkLimit = isAction ? 4000 : grep != null ? searchLimit : a.Flag("items") ? max : max * 4;
         var nth = a.Has("nth") ? a.GetInt("nth", 0) : (int?)null;
         if (nth is < 1) return Task.FromResult(ctx.Fail("ui: --nth wants a number from 1."));
+        if (a.Flag("diff") && (isAction || grep != null)) return Task.FromResult(ctx.Fail("ui --diff compares two listings of a window: it goes with `ui [window]`, not with --grep or an action (an action says what changed by itself)."));
         var (code, text) = OnComThread(automation =>
         {
             _withClass = withClass;
+            _withPos = withPos;
             var root = RootFor(automation, window, out var title, out var error, out var hwnd);
             if (root == 0) return (2, error);
             var nodes = Walk(automation, root, a.GetInt("depth", isAction || grep != null ? 40 : 12), walkLimit, a.Flag("all") || isAction || grep != null, out var deeper);
             try
             {
                 _mouseOnly = a.Flag("mouse");
-                return isAction ? Act(ctx, verb, a.Positionals, nodes, nth, hwnd, title, nodes.Count >= walkLimit ? walkLimit : 0) : (0, Render(nodes, title, grep, a.Flag("all"), Math.Max(1, a.GetInt("max", 300)), walkLimit, deeper));
+                if (isAction) return Act(ctx, verb, a.Positionals, nodes, nth, hwnd, title, nodes.Count >= walkLimit ? walkLimit : 0, automation, !a.Flag("no-watch"));
+                var entries = grep == null ? new List<UiEntry>() : null;
+                var listing = Render(nodes, title, grep, a.Flag("all"), max, walkLimit, deeper, a.Flag("items"), entries);
+                if (entries == null) return (0, listing);
+                var earlier = RememberListing(hwnd, entries);
+                if (!a.Flag("diff")) return (0, listing);
+                return (0, earlier == null
+                    ? $"[--diff: this is the first `ui` of that window in this session, so there is nothing to compare with; the whole listing follows]\n{listing}"
+                    : DiffListing(title, earlier.Value.entries, entries, DateTime.UtcNow - earlier.Value.at));
             }
             finally
             {
                 foreach (var n in nodes) Release(n.Element);
             }
-        }, grep != null ? 60 : 20);
+        }, grep != null ? 60 : isAction ? 30 : 20);
 
         (code == 0 ? ctx.Out : ctx.Err).WriteLine(text.TrimEnd());
         return Task.FromResult(code);
@@ -527,45 +591,148 @@ internal static unsafe partial class UiaTools
         }
     }
 
-    private static string Render(List<Node> nodes, string title, Regex? grep, bool all, int max, int walkLimit, bool deeper)
+    /// <param name="entries">When given, filled with what the listing says about each control it lists (for <c>--diff</c>).</param>
+    private static string Render(List<Node> nodes, string title, Regex? grep, bool all, int max, int walkLimit, bool deeper, bool items, List<UiEntry>? entries)
     {
         var sb = new StringBuilder();
         var shown = 0;
         var matched = 0;
+        var folded = 0;
+        var cutLines = false;
 
         // Fold away unnamed layout containers: their children move up one level, which keeps the tree short.
         var indentAt = new int[64];
-        foreach (var n in nodes)
+
+        // A long run of items (list items, tree items, grid rows) under one parent: the first few are listed and
+        // the rest counted. A run is tracked per depth; `parentAt` is the node last seen at each depth.
+        const int foldAbove = 12, keep = 8;
+        var parentAt = new int[64];
+        var runParent = new int[64];
+        var runType = new int[64];
+        var runSeen = new int[64];
+        var runFolded = new int[64];
+        var runIndent = new int[64];
+        var runLong = new bool[64];
+        Array.Fill(runParent, -2);
+        var open = new List<int>(); // depths that have a run with folded items
+        var skipBelow = -1;
+
+        void EndRun(int depth)
         {
-            var structural = n.Depth > 0 && n.Name.Length == 0 && n.Value.Length == 0 && (n.Id.Length == 0 || n.Id.All(char.IsDigit)) && n.Type is 50033 or 50026 or 50025 or 50020 or 50006 or 50038 or 50027;
+            if (runFolded[depth] > 0)
+            {
+                sb.Append(' ', runIndent[depth] * 2).Append($"… {runFolded[depth]} more {TypeName(runType[depth])} here, not listed (--items lists them, --grep finds one)\n");
+                folded += runFolded[depth];
+                open.Remove(depth);
+            }
+
+            runFolded[depth] = 0;
+            runParent[depth] = -2;
+        }
+
+        for (var i = 0; i < nodes.Count; i++)
+        {
+            var n = nodes[i];
+            if (skipBelow >= 0)
+            {
+                if (n.Depth > skipBelow) continue; // inside an item that is not listed
+                skipBelow = -1;
+            }
+
+            var d = Math.Min(n.Depth, 63);
+            parentAt[d] = i;
+            var structural = Structural(n);
             var parentIndent = n.Depth == 0 ? -1 : indentAt[Math.Min(n.Depth - 1, 63)];
             var indent = structural ? parentIndent : parentIndent + 1;
-            indentAt[Math.Min(n.Depth, 63)] = indent;
+            indentAt[d] = indent;
+            for (var k = open.Count - 1; k >= 0; k--)
+            {
+                if (open[k] > d) EndRun(open[k]); // back above it: that run is over
+            }
+
             if (structural || (n.Offscreen && !all && grep == null && n.Depth > 0)) continue; // a search covers off-screen controls too; they say "(off-screen)"
-            var line = Line(n, Math.Max(0, indent));
+            if (grep == null && !items && n.Type is 50007 or 50029 or 50024) // ListItem, DataItem, TreeItem
+            {
+                var parent = d == 0 ? -1 : parentAt[d - 1];
+                if (runParent[d] != parent || runType[d] != n.Type)
+                {
+                    EndRun(d);
+                    (runParent[d], runType[d], runSeen[d], runIndent[d]) = (parent, n.Type, 0, Math.Max(0, indent));
+                    var length = 0;
+                    for (var j = i; j < nodes.Count && nodes[j].Depth >= n.Depth; j++)
+                    {
+                        if (nodes[j].Depth > n.Depth) continue;
+                        if (nodes[j].Type != n.Type) break;
+                        if (!nodes[j].Offscreen || all) length++;
+                    }
+
+                    runLong[d] = length > foldAbove;
+                }
+
+                runSeen[d]++;
+                if (runLong[d] && runSeen[d] > keep && StateProperty(n.Element, 30079) != 1) // SelectionItem.IsSelected: the selected one is always listed
+                {
+                    if (runFolded[d]++ == 0) open.Add(d);
+                    skipBelow = n.Depth;
+                    continue;
+                }
+            }
+            else
+            {
+                EndRun(d);
+            }
+
+            if (grep == null && shown >= max)
+            {
+                cutLines = true; // looked at, not printed: the first line says so
+                continue;
+            }
+
+            var core = Core(n);
+            var line = Line(n, Math.Max(0, indent), core);
             if (grep != null && !grep.IsMatch(line)) continue;
             matched++;
             if (grep != null && shown >= max) continue; // counted, not printed
+            entries?.Add(new UiEntry(KeyOf(n), core));
             sb.Append(grep != null ? line.TrimStart() : line).Append('\n');
             shown++;
         }
 
+        for (var k = open.Count - 1; k >= 0; k--) EndRun(open[k]);
+        if (folded > 0) entries?.Add(new UiEntry("(items not listed)", $"{folded} list, tree or grid items that are not listed"));
+
         // What was left out is said in the first line: a search that stopped early is not "no match".
         var cut = nodes.Count >= walkLimit;
         var note = grep == null
-            ? (cut ? $" (stopped at {walkLimit} controls: narrow with --grep, or raise --max)" : "")
+            ? (cut ? $" (stopped at {walkLimit} controls: narrow with --grep, or raise --max)" : cutLines ? $" (the first {max} lines; the window has more: narrow with --grep, or raise --max)" : "")
             : (matched > shown ? $" of {matched} that match (--max prints more)" : "") +
               (cut ? $" (INCOMPLETE: the search stopped after {walkLimit} controls, there may be more matches; name a smaller window)" : "");
         if (deeper) note += grep == null ? " (more controls exist below the depth limit: raise --depth)" : " (controls below the depth limit were not searched: raise --depth)";
         var what = grep == null ? "controls" : matched > shown ? "matching controls shown" : "controls match";
-        return $"window \"{Format.Clip(title, 70)}\": {shown} {what}{note}; '@x,y' is each control's center on screen\n" +
+        var positions = _withPos ? "'@x,y' is each control's center on screen" : "--pos adds positions (@x,y)";
+        return $"window \"{Format.Clip(title, 70)}\": {shown} {what}{note}; {positions}\n" +
                (shown > 0 ? sb.ToString() : grep != null && (cut || deeper) ? "[no match among the controls that were searched; see the first line for what was not]\n" : "[no control matches]\n");
     }
 
     /// <param name="cutAt">Not 0 when only the first that many controls of the window were read.</param>
-    private static (int, string) Act(ToolContext ctx, string verb, List<string> positionals, List<Node> nodes, int? nth, nint hwnd, string title, int cutAt)
+    /// <param name="watch">Also say what changed on the screen in the moment after the action.</param>
+    private static (int, string) Act(ToolContext ctx, string verb, List<string> positionals, List<Node> nodes, int? nth, nint hwnd, string title, int cutAt, nint automation, bool watch)
     {
-        var (code, text, node, several) = ActOn(ctx, verb, positionals, nodes, nth, hwnd, title);
+        var (code, text, node, several) = ActOn(ctx, verb, positionals, nodes, nth, hwnd, title, watch && verb != "get" ? automation : 0, out var watching);
+        if (code != 0 && watching != null && node != null && watching.Hwnd != 0 && !Win32.IsWindowVisible(watching.Hwnd))
+        {
+            // The window went away under the action (a button that closes it, or ends the program): the control
+            // could not answer any more, which is not the same as the action not having run.
+            code = 0;
+            text = $"acted on {TypeName(node.Type)} \"{Format.Clip(node.Name.Length > 0 ? node.Name : node.Id, 50)}\": its window went away during the action, so the control gave no proper answer; the action did run";
+        }
+
+        if (code == 0 && watching != null)
+        {
+            if (verb == "set" && node != null) watching.SkipKey = KeyOf(node); // its new value is in the answer already
+            text += "\n" + Changes(automation, watching);
+        }
+
         if (cutAt > 0 && (code != 0 || several > 1))
             text += $"\n[only the first {cutAt} controls of the window were read: there may be more with that name]";
 
@@ -573,14 +740,19 @@ internal static unsafe partial class UiaTools
         if (several > 1 && node != null && nth == null)
         {
             var where = node.Offscreen || node.Rect.Width <= 0 ? "off-screen" : $"@{(node.Rect.Left + node.Rect.Right) / 2},{(node.Rect.Top + node.Rect.Bottom) / 2}";
-            text += $"\n[{several} controls have that name; this is the first ({where}). --nth 2 takes the next]";
+            var first = $"[{several} controls have that name; this is the first ({where}). --nth 2 takes the next]";
+            var lineEnd = text.IndexOf('\n'); // right after what was done, before what changed
+            text = lineEnd < 0 ? text + "\n" + first : text[..lineEnd] + "\n" + first + text[lineEnd..];
         }
 
         return (code, text);
     }
 
-    private static (int code, string text, Node? node, int several) ActOn(ToolContext ctx, string verb, List<string> positionals, List<Node> nodes, int? nth, nint hwnd, string title)
+    /// <param name="watchWith">The automation object when what the action changes is to be reported, else 0.</param>
+    /// <param name="watching">What the screen looked like right before the action (null when not asked for, or when nothing was done).</param>
+    private static (int code, string text, Node? node, int several) ActOn(ToolContext ctx, string verb, List<string> positionals, List<Node> nodes, int? nth, nint hwnd, string title, nint watchWith, out UiWatch? watching)
     {
+        watching = null;
         var (code, text, node, several) = (0, "", (Node?)null, 0);
         var spec = positionals[1];
         var all = FindAll(nodes, spec);
@@ -610,6 +782,7 @@ internal static unsafe partial class UiaTools
             }
         }
 
+        if (watchWith != 0) watching = Before(watchWith, hwnd);
         (code, text) = Do(ctx, verb, positionals, node, hwnd, title);
         return (code, text, node, several);
     }

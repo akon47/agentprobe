@@ -139,18 +139,20 @@ internal static class DebugOutputTools
     [
         new("dbg", "Logs", "Debug output of all apps (OutputDebugString / Debug.WriteLine), like DebugView",
             """
-            dbg [--grep REGEX] [--name PROCESS | --pid N] [--tail N] [--all]
+            dbg [--grep REGEX] [--name PROCESS | --pid N] [--tail N] [--all] [--no-fold]
             dbg start [--global]      begin capturing now (plain `dbg` also starts it on first use)
             dbg stop
               Each call returns only lines captured since the previous call, so call it after each test step.
               --all returns everything still buffered (20,000 lines). Start the capture BEFORE reproducing.
+              Four or more lines in a row that differ only in their numbers are printed as the first one and
+              a line that says how many followed and gives the last; --no-fold prints them all.
               Output of a process that has a debugger attached goes to that debugger instead.
             """, DbgAsync) { Quiet = true },
     ];
 
     private static Task<int> DbgAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "all", "global");
+        var a = ArgParser.Parse(args, "all", "global", "no-fold");
         var sub = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "";
         var capture = ctx.Runtime.DebugCapture;
 
@@ -202,8 +204,8 @@ internal static class DebugOutputTools
         var total = result.Count;
         if (a.Has("tail")) result = result.TakeLast(a.GetInt("tail", 50)).ToList();
         var sb = new StringBuilder();
-        foreach (var (_, time, p, text) in result)
-            sb.Append(time.ToLocalTime().ToString("HH:mm:ss.fff")).Append(' ').Append(DebugCapture.NameOf(text)).Append('(').Append(p).Append(") ").Append(DebugCapture.TextOf(text)).Append('\n');
+        var printed = result.Select(l => ($"{l.time.ToLocalTime():HH:mm:ss.fff} {DebugCapture.NameOf(l.text)}({l.pid}) {DebugCapture.TextOf(l.text)}", DebugCapture.NameOf(l.text) + " " + DebugCapture.TextOf(l.text))).ToList();
+        foreach (var line in a.Flag("no-fold") ? printed.Select(l => l.Item1) : LineFold.Similar(printed)) sb.Append(line).Append('\n');
         ctx.Out.Write(sb.ToString());
         if (dropped > 0 && !a.Flag("all")) ctx.Out.WriteLine($"[{dropped} older lines were dropped from the buffer before being read]");
         if (total == 0) ctx.Out.WriteLine(lines.Count == 0 ? "[no new debug output]" : $"[{lines.Count} new lines, none match the filter]");

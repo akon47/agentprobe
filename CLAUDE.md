@@ -40,6 +40,9 @@ tests\verify.ps1 -Session                                # the test suite, about
   error reported as "nothing found" is a serious bug. Approximate or incomplete output says so in the same line.
 - **One exe, no install.** No services, drivers or extra files. The target never listens on a port.
 - **Output is for an agent's context window.** Few lines, no decoration; filter and summarize on the target.
+- **A command an agent does not have to run is the cheapest one.** Every turn carries the whole conversation again:
+  an action answers with what it changed (`UiaChanges.cs`), a crash is added to the next answer (`CrashNotes.cs`),
+  and what is left out or folded is said in the same line.
 - **Undo at session end** everything a tool changed on the target (`TargetRuntime.AddUndo`), and only what this
   session changed.
 - **The person at the target sees everything.** State-changing tools write an audit line
@@ -57,6 +60,10 @@ tests\verify.ps1 -Session                                # the test suite, about
 Add a `new Tool("name", "Group", "summary", """usage""", Handler)` to its group's `Tools` list (a new file is listed
 in `ToolRegistry`). The CLI forwards any registered name, so nothing else changes. Use `ArgParser`, `Table` and
 `Format`; mark read-only chatty tools `{ Quiet = true }`; document it in `docs/agent-guide.md` and both READMEs.
+
+The guide is one file in two parts. What comes before the first `<!-- topic: name | summary -->` line is the core
+that `agentprobe guide` prints and every agent keeps in its context: keep it short. Detail goes under a topic,
+which is read with `agentprobe guide <name>` when it is needed.
 
 ## NativeAOT
 

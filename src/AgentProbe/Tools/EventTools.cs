@@ -99,6 +99,14 @@ internal static class EventTools
         // wevtutil writes in the console code page when redirected: decode leniently, then parse.
         var decoder = new LineDecoder();
         var xml = decoder.Feed(bytes) + decoder.Flush();
+        result.AddRange(Parse(xml, log));
+        return result;
+    }
+
+    /// <summary>Events out of their XML (one &lt;Event&gt; element after the other), as wevtutil and the event log API write them.</summary>
+    public static List<EventRecord> Parse(string xml, string log)
+    {
+        var result = new List<EventRecord>();
         try
         {
             using var reader = XmlReader.Create(new StringReader(xml), new XmlReaderSettings { CheckCharacters = false, ConformanceLevel = ConformanceLevel.Fragment, DtdProcessing = DtdProcessing.Ignore });
@@ -263,6 +271,37 @@ internal static class EventTools
         return Task.FromResult(failures.Count > 0 ? 1 : 0);
     }
 
+    /// <summary>A crash or hang event as one line (without its time), or null for any other event.</summary>
+    public static string? CrashLine(EventRecord e)
+    {
+        string line;
+        if (e.Provider == "Application Error" && e.Id == 1000)
+        {
+            var code = e.Field("ExceptionCode", 6) ?? "?";
+            var meaning = uint.TryParse(code.Replace("0x", ""), NumberStyles.HexNumber, null, out var c) ? Native.ProcessDetails.ExitCodeName(c) : code;
+            var offset = (e.Field("FaultingOffset", 7) ?? "").TrimStart('0');
+            line = $"CRASH {e.Field("AppName", 0)} {e.Field("AppVersion", 1)} in {e.Field("ModuleName", 3)} {e.Field("ModuleVersion", 4)}+0x{(offset.Length > 0 ? offset : "0")}  {meaning}  (pid {Pid(e.Field("ProcessId", 8))})";
+        }
+        else if (e.Provider == "Application Hang" && e.Id == 1002)
+        {
+            line = $"HANG  {e.Field("AppName", 0)} {e.Field("AppVersion", 1)} stopped responding and was closed";
+        }
+        else if (e.Provider == ".NET Runtime" && e.Id == 1026)
+        {
+            var text = e.Message.Replace("\r", "");
+            var app = text.Split('\n').FirstOrDefault(l => l.StartsWith("Application:", StringComparison.Ordinal))?[12..].Trim() ?? "?";
+            var info = text.Split('\n').FirstOrDefault(l => l.Contains("Exception Info:", StringComparison.Ordinal) || l.StartsWith("Exception", StringComparison.Ordinal))?.Trim() ?? "";
+            var frame = text.Split('\n').FirstOrDefault(l => l.TrimStart().StartsWith("at ", StringComparison.Ordinal))?.Trim() ?? "";
+            line = $".NET  {app}: {Format.Clip(info.Replace("Exception Info: ", ""), 160)} {Format.Clip(frame, 120)}";
+        }
+        else
+        {
+            return null;
+        }
+
+        return line;
+    }
+
     /// <summary>One line per crash/hang, newest first.</summary>
     public static List<string> Crashes(TimeSpan since, int max, string? nameFilter = null)
     {
@@ -270,31 +309,7 @@ internal static class EventTools
         var lines = new List<string>();
         foreach (var e in Query("Application", xpath, max * 3).OrderByDescending(e => e.TimeUtc))
         {
-            string line;
-            if (e.Provider == "Application Error" && e.Id == 1000)
-            {
-                var code = e.Field("ExceptionCode", 6) ?? "?";
-                var meaning = uint.TryParse(code.Replace("0x", ""), NumberStyles.HexNumber, null, out var c) ? Native.ProcessDetails.ExitCodeName(c) : code;
-                var offset = (e.Field("FaultingOffset", 7) ?? "").TrimStart('0');
-                line = $"CRASH {e.Field("AppName", 0)} {e.Field("AppVersion", 1)} in {e.Field("ModuleName", 3)} {e.Field("ModuleVersion", 4)}+0x{(offset.Length > 0 ? offset : "0")}  {meaning}  (pid {Pid(e.Field("ProcessId", 8))})";
-            }
-            else if (e.Provider == "Application Hang" && e.Id == 1002)
-            {
-                line = $"HANG  {e.Field("AppName", 0)} {e.Field("AppVersion", 1)} stopped responding and was closed";
-            }
-            else if (e.Provider == ".NET Runtime" && e.Id == 1026)
-            {
-                var text = e.Message.Replace("\r", "");
-                var app = text.Split('\n').FirstOrDefault(l => l.StartsWith("Application:", StringComparison.Ordinal))?[12..].Trim() ?? "?";
-                var info = text.Split('\n').FirstOrDefault(l => l.Contains("Exception Info:", StringComparison.Ordinal) || l.StartsWith("Exception", StringComparison.Ordinal))?.Trim() ?? "";
-                var frame = text.Split('\n').FirstOrDefault(l => l.TrimStart().StartsWith("at ", StringComparison.Ordinal))?.Trim() ?? "";
-                line = $".NET  {app}: {Format.Clip(info.Replace("Exception Info: ", ""), 160)} {Format.Clip(frame, 120)}";
-            }
-            else
-            {
-                continue;
-            }
-
+            if (CrashLine(e) is not { } line) continue;
             if (nameFilter != null && !line.Contains(nameFilter, StringComparison.OrdinalIgnoreCase)) continue;
             lines.Add($"{Format.Time(e.TimeUtc)} {line}");
             if (lines.Count >= max) break;

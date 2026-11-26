@@ -9,8 +9,12 @@ internal static class SessionTools
     [
         new("history", "Session", "What was run on this target, and where it stopped",
             """
-            history [--last 20]
-              One line per command: run number, start time, duration, exit code, command.
+            history [--last 20] [--by-size]
+              One line per command: run number, start time, duration, how much it wrote, exit code, command.
+              OUT is the characters of text the command produced on the target: about 4 of them make a token
+              in English output, fewer in Korean (an estimate either way). It is where an agent's context goes:
+              --by-size puts the biggest first. Output that is cut on the developer PC (long output is, to its
+              head and tail) cost less than OUT says; pictures (screenshot) are not text and are not counted.
               After a reboot, or an update of agentprobe on that PC, the earlier commands are still listed
               ("before reboot" / "cut off by reboot", "before the update"); their output is not kept.
               "running" = still going; "orphaned" = it finished (or is still running) after the connection dropped,
@@ -46,13 +50,15 @@ internal static class SessionTools
     {
         var a = ArgParser.Parse(args);
         var runs = ctx.Runtime.History().Where(r => r.Tool is not ("history" or "result")).TakeLast(a.GetInt("last", 20)).ToList();
+        if (a.Has("by-size")) runs = [.. runs.OrderByDescending(r => r.OutputChars)];
+        static string Size(long chars) => chars < 1000 ? chars.ToString(System.Globalization.CultureInfo.InvariantCulture) : chars < 1_000_000 ? (chars / 1000.0).ToString(chars < 10_000 ? "0.#" : "0", System.Globalization.CultureInfo.InvariantCulture) + "K" : (chars / 1_000_000.0).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + "M";
         if (runs.Count == 0)
         {
             ctx.Out.WriteLine("nothing has been run in this session yet");
             return Task.FromResult(0);
         }
 
-        var t = new Table(">#", "START", ">TOOK", "RESULT", "COMMAND");
+        var t = new Table(">#", "START", ">TOOK", ">OUT", "RESULT", "COMMAND");
         foreach (var r in runs)
         {
             var result = r.ExitCode is { } code
@@ -60,10 +66,13 @@ internal static class SessionTools
                 : r.BeforeReboot ? (r.Restart == "update" ? (r.Tool.StartsWith("selfupdate", StringComparison.Ordinal) ? "updated" : "no longer followed after the update")
                     : r.Tool.StartsWith("reboot", StringComparison.Ordinal) ? "rebooted" : "cut off by reboot") : "running";
             if (r.BeforeReboot && r.ExitCode != null) result += r.Restart == "update" ? " (before the update)" : " (before reboot)";
-            t.Add(r.No, r.StartUtc.ToLocalTime().ToString("HH:mm:ss"), Format.Duration((r.EndUtc ?? DateTime.UtcNow) - r.StartUtc), result, Format.Clip(r.CommandLine, 110));
+            t.Add(r.No, r.StartUtc.ToLocalTime().ToString("HH:mm:ss"), Format.Duration((r.EndUtc ?? DateTime.UtcNow) - r.StartUtc), r.BeforeReboot ? "-" : Size(r.OutputChars), result, Format.Clip(r.CommandLine, 110));
         }
 
         ctx.Out.Write(t.ToString());
+        var counted = runs.Where(r => !r.BeforeReboot).ToList();
+        if (counted.Count > 0)
+            ctx.Out.WriteLine($"OUT: {Size(counted.Sum(r => r.OutputChars))} characters of output in these {counted.Count} commands (about 4 per token for English text: an estimate)");
         var jobs = ctx.Runtime.Jobs.List().Count(j => j.ExitCode == null);
         if (jobs > 0) ctx.Out.WriteLine($"{jobs} background job(s) still running (see `jobs`)");
         return Task.FromResult(0);

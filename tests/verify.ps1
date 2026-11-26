@@ -551,19 +551,27 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
     $tree = AP -t local ui 'AP Verify Window'
     Check 'ui: tree shows the button by name' ($tree.Out -match 'Button "Press me" #pressButton') $tree.Out
     # What the controls report about themselves: the check box is checked, the first tab is the selected one.
-    Check 'ui: state of a check box, of the tabs and of the window' ($tree.Out -match '(?m)CheckBox "Check me" #checkBox \(checked\)' -and $tree.Out -match '(?m)TabItem "First tab" \(selected\)' -and $tree.Out -match '(?m)TabItem "Second tab" @' -and $tree.Out -match '(?m)^Window "AP Verify Window" \(normal\)') $tree.Out
+    Check 'ui: state of a check box, of the tabs and of the window' ($tree.Out -match '(?m)CheckBox "Check me" #checkBox \(checked\)' -and $tree.Out -match '(?m)TabItem "First tab" \(selected\)' -and $tree.Out -match '(?m)TabItem "Second tab"\s*$' -and $tree.Out -match '(?m)^Window "AP Verify Window" \(normal\)') $tree.Out
     $sl = (AP -t local ui get '#wpfSlider' --window 'ApWpf').Out
     Check 'ui: a slider gives its value with its range' ($sl -match '^Slider \[Slider\] #wpfSlider =0\.25 \(0\.\.1\)') $sl
     $ls = (AP -t local ui get '#longList' --window 'AP Verify Window').Out
     Check 'ui: a list that was scrolled says how far (item 31 of 60 on top is about half way)' ($ls -match '\(scroll v=(\d+(\.\d+)?)%\)' -and [double]$Matches[1] -gt 40 -and [double]$Matches[1] -lt 65 -and $ls -notmatch ' h=') $ls
     $pos = if ((AP -t local windows 'AP Verify Window').Out -match '(?m)\s(-?\d+,-?\d+ \d+x\d+)\s.*AP Verify Window') { $Matches[1] } else { 'no position' }
-    Check 'ui: the window''s own line has the position and size that `windows` reports' ($tree.Out -match "(?m)^Window `"AP Verify Window`" \(normal\) $([regex]::Escape($pos)) ") "windows: $pos / ui: $(($tree.Out -split "`n")[1])"
-    $r = AP -t local ui 'AP Verify Window' --class --grep pressButton
+    Check 'ui: the window''s own line has the position and size that `windows` reports' ($tree.Out -match "(?m)^Window `"AP Verify Window`" \(normal\) $([regex]::Escape($pos))\s*`$") "windows: $pos / ui: $(($tree.Out -split "`n")[1])"
+    $r = AP -t local ui 'AP Verify Window' --class --pos --grep pressButton
     Check 'ui --class adds each control''s class name' ($r.Out -match '(?m)^Button \[WindowsForms10\.BUTTON[^\]]*\] "Press me"') $r.Out
     if ($r.Out -match '@(\d+),(\d+)') {
         $r = AP -t local ui --at "@$($Matches[1]),$($Matches[2])"
         Check 'ui --at: the control at a point, what it lies in and their classes' ($r.Code -eq 0 -and $r.Out -match '(?m)^> +Button \[[^\]]+\] "Press me"' -and $r.Out -match '(?m)^Window \[[^\]]+\] "AP Verify Window"') $r.Out
     } else { Check 'ui: button position for --at' $false $r.Out }
+    # Positions are left out unless asked for: an agent acts by name, and they are a quarter of the text.
+    Check 'ui: no positions unless --pos asks for them' ($tree.Out -match '(?m)^\s*Button "Press me" #pressButton\s*$' -and $tree.Out -match '--pos adds positions' -and (AP -t local ui 'AP Verify Window' --pos).Out -match '(?m)Button "Press me" #pressButton @\d+,\d+\s*$') $tree.Out
+    # A long run of items is cut to its first eight, and the line that follows says how many are not listed.
+    $r = AP -t local ui 'AP Verify Window' --all
+    $listed = @($r.Out -split "`n" | Where-Object { $_ -match '^\s*ListItem "item \d+"' }).Count
+    Check 'ui: a long run of list items is folded, and a line says how many are left out' ($r.Out -match '(?m)^\s*\S (\d+) more ListItem here, not listed' -and ($listed + [int]$Matches[1]) -eq 60 -and $listed -eq 8) "$listed listed`n$($r.Out)"
+    $r = AP -t local ui 'AP Verify Window' --all --items
+    Check 'ui --items lists every item' (@($r.Out -split "`n" | Where-Object { $_ -match '^\s*ListItem "item \d+"' }).Count -eq 60 -and $r.Out -notmatch 'not listed') $r.Out
     $sr = AP -t local screenshot --scale 0.1
     $savedAt = if ($sr.Out -match '(?m)^saved: (.+\.png)\s*$') { $Matches[1].Trim() } else { '' }
     Check 'screenshot without -o goes to the temp folder, not into the current folder' ($savedAt.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase) -and $savedAt -match '\\agentprobe\\screenshots\\' -and (Test-Path $savedAt) -and @(Get-ChildItem $work -Filter 'screenshot-*.png').Count -eq 0) $sr.Out
@@ -593,7 +601,7 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
     Remove-Item $clickFile -ErrorAction SilentlyContinue
     [void](AP -t local ui click 'Show cover' --window 'AP Verify Window')
     $cw = AP -t local wait --window 'AP Verify Cover' --timeout 10s
-    $twin = (AP -t local ui 'AP Verify Window' --grep 'twinA').Out
+    $twin = (AP -t local ui 'AP Verify Window' --pos --grep 'twinA').Out
     $coverAt = if ((AP -t local windows 'AP Verify Cover').Out -match '(?m)\s(-?\d+),(-?\d+) (\d+)x(\d+)\s.*AP Verify Cover') { @([int]$Matches[1], [int]$Matches[2], [int]$Matches[3], [int]$Matches[4]) } else { $null }
     $twinAt = if ($twin -match '@(\d+),(\d+)') { @([int]$Matches[1], [int]$Matches[2]) } else { $null }
     if ($cw.Code -eq 0 -and $coverAt -and $twinAt -and $twinAt[0] -ge $coverAt[0] -and $twinAt[0] -lt ($coverAt[0] + $coverAt[2]) -and $twinAt[1] -ge $coverAt[1] -and $twinAt[1] -lt ($coverAt[1] + $coverAt[3])) {
@@ -616,7 +624,7 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
 
     # A window that lies wholly behind another one (a magenta one): `windows` marks it, a picture of the screen shows
     # the one in front, and `screenshot --window` still shows the window itself and says that it is covered.
-    $press = (AP -t local ui 'AP Verify Window' --grep pressButton).Out
+    $press = (AP -t local ui 'AP Verify Window' --pos --grep pressButton).Out
     $origin = if ((AP -t local windows 'AP Verify Window').Out -match '(?m)\s(-?\d+),(-?\d+) \d+x\d+\s.*AP Verify Window') { @([int]$Matches[1], [int]$Matches[2]) } else { $null }
     [void](AP -t local ui click 'Big cover' --window 'AP Verify Window')
     $cw = AP -t local wait --window 'AP Verify Cover' --timeout 10s; Start-Sleep -Milliseconds 500
@@ -640,6 +648,33 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
     $s = AP -t local ui set '#inputBox' 'hello ui' --window 'AP Verify Window'
     Check 'ui set succeeds' ($s.Code -eq 0) $s.Out
     Check 'ui get reads the value back' ((AP -t local ui get '#inputBox' --window 'AP Verify Window').Out -match '=hello ui') ''
+
+    # Saying what is expected instead of reading the state: one line, pass or fail.
+    $r = AP -t local expect --ui '#inputBox' --has 'hello ui' --in 'AP Verify Window'
+    Check 'expect --ui --has: one line and exit 0 when the control reads that' ($r.Code -eq 0 -and $r.Out -match "^ok: control '#inputBox' to read /hello ui/") "$($r.Code) $($r.Out)"
+    $r = AP -t local expect --ui '#inputBox' --has 'something else' --in 'AP Verify Window' --timeout 1s
+    Check 'expect that does not hold: exit 1, and what the control reads instead' ($r.Code -eq 1 -and $r.Out -match '^FAILED after 1s: .*\(it reads: Edit.* #inputBox =hello ui\)') "$($r.Code) $($r.Out)"
+    $r = AP -t local wait --ui 'NoSuchControlZz' --in 'AP Verify Window' --timeout 1s
+    Check 'wait --ui for a control that is not there: 124, and it says there is none' ($r.Code -eq 124 -and $r.Out -match "no control 'NoSuchControlZz' in window") "$($r.Code) $($r.Out)"
+    $r = AP -t local expect --no-ui 'NoSuchControlZz' --in 'AP Verify Window'
+    Check 'expect --no-ui holds for a control that is not there, and not for one that is' ($r.Code -eq 0 -and (AP -t local expect --no-ui 'Press me' --in 'AP Verify Window' --timeout 1s).Code -eq 1) "$($r.Code) $($r.Out)"
+    $r = AP -t local expect --ui 'Press me' --in 'No Such Window Zz' --timeout 1s
+    Check 'expect in a window that does not exist fails and says that (not "no such control")' ($r.Code -eq 1 -and $r.Out -match "no window matches 'No Such Window Zz'") "$($r.Code) $($r.Out)"
+
+    # A list of commands as one command: quiet when all went well, the failed step when not.
+    $stepsFile = Join-Path $work 'steps.txt'
+    @('# a comment', 'ui set "#inputBox" "from steps" --window "AP Verify Window"', 'expect --ui "#inputBox" --has "from steps" --in "AP Verify Window"', 'try expect --ui "#inputBox" --has never --in "AP Verify Window" --timeout 1s', 'sleep 100ms', 'show ui get "#inputBox" --window "AP Verify Window"') | Set-Content $stepsFile -Encoding UTF8
+    $r = AP -t local run $stepsFile
+    Check 'run: every step ran; only the output of the `show` step and one line come back' ($r.Code -eq 0 -and $r.Out -match '(?m)^> ui get "#inputBox"' -and $r.Out -match '=from steps' -and $r.Out -match '(?m)^ok: 5 steps in .*failed but allowed to \(try\): step 3 exit 1' -and $r.Out -notmatch 'set Edit') "$($r.Code) $($r.Out)"
+    @('expect --ui "#inputBox" --has nope --in "AP Verify Window" --timeout 1s', 'ui set "#inputBox" "must not run" --window "AP Verify Window"') | Set-Content $stepsFile -Encoding UTF8
+    $r = AP -t local run $stepsFile --no-evidence
+    Check 'run: stops at the step that fails, with its output and exit code; the rest is not run' ($r.Code -eq 1 -and $r.Out -match '(?m)^step 1 of 2 FAILED \(exit 1\): expect ' -and $r.Out -match 'it reads: Edit.*=from steps' -and $r.Out -match '1 step was not run' -and (AP -t local ui get '#inputBox' --window 'AP Verify Window').Out -match '=from steps') "$($r.Code) $($r.Out)"
+    Remove-Item $clickFile -ErrorAction SilentlyContinue
+    @('ui click "Press me" --window "AP Verify Window"', 'nosuchcommandzz foo') | Set-Content $stepsFile -Encoding UTF8
+    $r = AP -t local run $stepsFile
+    Start-Sleep -Milliseconds 300
+    Check 'run: a line that is not a command means nothing is run' ($r.Code -eq 2 -and $r.Out -match "line 2: 'nosuchcommandzz' is not a command" -and $r.Out -match 'Nothing was run' -and -not (Test-Path $clickFile)) "$($r.Code) $($r.Out)"
+    [void](AP -t local ui set '#inputBox' 'hello ui' --window 'AP Verify Window')
     $r = AP -t local ui click 'NoSuchControlZz' --window 'AP Verify Window'
     Check 'ui: "no such control" names the window that was looked in' ($r.Code -ne 0 -and $r.Out -match "no control named 'NoSuchControlZz' in window `"AP Verify Window`"") $r.Out
     $s = AP -t local ui set '#inputBox' 'read back' --window 'AP Verify Window'
@@ -655,11 +690,18 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
     Start-Sleep -Milliseconds 500
     Check 'ui click invoked the button (app saw the text)' ((Test-Path $clickFile) -and ((Get-Content $clickFile -Raw -Encoding UTF8) -eq 'clicked:hello ui')) "$($c.Out) / file: $(if (Test-Path $clickFile) { Get-Content $clickFile -Raw -Encoding UTF8 })"
 
+    # An action says what it changed on the screen, so that no second command is needed to find out.
+    Check 'ui click says so when nothing changed on the screen' ($c.Out -match '(?m)^no change seen within \d+(\.\d+)?s \(windows, and this window''s controls\)') $c.Out
+    $s = AP -t local ui click 'Check me' --window 'AP Verify Window'
+    Check 'ui click says which control reads differently afterwards, and what it read before' ($s.Out -match '(?m)^changed within \d' -and $s.Out -match '(?m)^\s+~ CheckBox "Check me" #checkBox \((un)?checked\)\s+\(was \((un)?checked\)\)\s*$') $s.Out
+    $s = AP -t local ui click 'Check me' --window 'AP Verify Window' --no-watch
+    Check 'ui click --no-watch leaves the look at the screen out' ($s.Code -eq 0 -and $s.Out -match 'CheckBox "Check me"' -and $s.Out -notmatch 'changed within|no change seen') $s.Out
+
     # raw input: focus, click by coordinates from the tree, select all, type, press the button with the keyboard
     if (-not $SkipInput) {
     Remove-Item $clickFile -ErrorAction SilentlyContinue
     [void](AP -t local focus 'AP Verify Window'); Start-Sleep -Milliseconds 300
-    $edit = (AP -t local ui 'AP Verify Window' --grep inputBox).Out
+    $edit = (AP -t local ui 'AP Verify Window' --pos --grep inputBox).Out
     if ($edit -match '@(\d+),(\d+)') {
         $ex = [int]$Matches[1]; $ey = [int]$Matches[2]
         # --hover moves the pointer and presses nothing
@@ -676,7 +718,7 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
     } else { Check 'ui: edit field position' $false $edit }
 
     # Touch: the app must see a finger, not the mouse (Windows marks the mouse messages it makes from touch).
-    $press = (AP -t local ui 'AP Verify Window' --grep pressButton).Out
+    $press = (AP -t local ui 'AP Verify Window' --pos --grep pressButton).Out
     if ($press -match '@(\d+),(\d+)') {
         $px = $Matches[1]; $py = $Matches[2]
         Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
@@ -710,19 +752,21 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
 
     # A modal dialog disables the window it belongs to: `windows` says so, and a click on that window names it.
     Remove-Item $clickFile -ErrorAction SilentlyContinue
-    [void](AP -t local ui click 'Open dialog' --window 'AP Verify Window')
+    $od = AP -t local ui click 'Open dialog' --window 'AP Verify Window'
+    Check 'ui click says which window opened, with what is in it' ($od.Out -match '(?m)^\s+\+ window "AP Verify Dialog" \(powershell\.exe pid \d+\) opened' -and $od.Out -match '(?m)^\s+Button "Close dialog" #closeDialog\s*$' -and @($od.Out -split "`n" | Where-Object { $_ -match 'Close dialog' }).Count -eq 1) $od.Out
     $dw = AP -t local wait --window 'AP Verify Dialog' --timeout 15s
     $win = (AP -t local windows 'AP Verify').Out
     Check 'windows: the owner of an open modal dialog is marked disabled, the dialog is not' ($dw.Code -eq 0 -and $win -match '(?m)\sdisabled\s+AP Verify Window\s*$' -and $win -notmatch '(?m)disabled\s+AP Verify Dialog' -and $win -match '(?m)^disabled = ') $win
     if (-not $SkipInput) {
-        $press = (AP -t local ui 'AP Verify Window' --grep pressButton).Out
+        $press = (AP -t local ui 'AP Verify Window' --pos --grep pressButton).Out
         if ($press -match '@(\d+),(\d+)') {
             $r = AP -t local click "@$($Matches[1]),$($Matches[2])"
             Start-Sleep -Milliseconds 400
             Check 'click on a disabled window: says that it is disabled, and the app did not get the click' ($r.Out -match 'note: that point is on "AP Verify Window" \(powershell\.exe pid \d+\), which is disabled' -and -not (Test-Path $clickFile)) "$($r.Out) / clicked: $(Test-Path $clickFile)"
         } else { Check 'ui: button position while the dialog is open' $false $press }
     }
-    [void](AP -t local ui click 'Close dialog' --window 'AP Verify Dialog')
+    $cd = AP -t local ui click 'Close dialog' --window 'AP Verify Dialog'
+    Check 'ui click says which window closed' ($cd.Out -match '(?m)^\s+- window "AP Verify Dialog" \(powershell\.exe pid \d+\) closed') $cd.Out
     Start-Sleep -Milliseconds 700
     $win = (AP -t local windows 'AP Verify').Out
     Check 'windows: no longer disabled once the dialog is closed' ($win -match 'AP Verify Window' -and $win -notmatch 'disabled' -and $win -notmatch 'AP Verify Dialog') $win
@@ -750,6 +794,35 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
         $b = [IO.File]::ReadAllBytes($shot); $pw = [BitConverter]::ToUInt32($b[19..16], 0); $ph = [BitConverter]::ToUInt32($b[23..20], 0)
         Check 'screenshot size in the file matches what it reports' ($pw -eq [int]$Matches[1] -and $ph -eq [int]$Matches[2]) "file ${pw}x${ph}, reported $($Matches[1])x$($Matches[2])"
     }
+    # A part of the picture (what an image costs to read goes by its pixels), and numbers instead of a picture.
+    $part = Join-Path $work 'part.png'
+    $sr = AP -t local screenshot --control 'Press me' --window 'AP Verify Window' -o $part
+    if ((Test-Path $part) -and $sr.Out -match '(\d+)x(\d+) PNG of Button "Press me" #pressButton in window "AP Verify Window"') {
+        $b = [IO.File]::ReadAllBytes($part); $cw = [BitConverter]::ToUInt32($b[19..16], 0); $ch = [BitConverter]::ToUInt32($b[23..20], 0)
+        Check 'screenshot --control is that control only: the size it reports, a fraction of the window' ($cw -eq [int]$Matches[1] -and $ch -eq [int]$Matches[2] -and $pw -and $cw -lt ($pw / 2) -and $ch -lt ($ph / 4)) "control ${cw}x${ch}, window ${pw}x${ph}"
+    } else { Check 'screenshot --control writes a picture of the control' $false $sr.Out }
+    $none = Join-Path $work 'none.png'
+    $sr = AP -t local screenshot --control 'NoSuchControlZz' --window 'AP Verify Window' -o $none
+    Check 'screenshot --control for a control that is not there: an error and no picture' ($sr.Code -ne 0 -and $sr.Out -match "no control 'NoSuchControlZz'" -and -not (Test-Path $none)) "$($sr.Code) $($sr.Out)"
+    $sr = AP -t local screenshot --region '999999,999999,10,10' -o $none
+    Check 'screenshot --region outside the screen: an error and no picture' ($sr.Code -ne 0 -and $sr.Out -match 'lies outside' -and -not (Test-Path $none)) "$($sr.Code) $($sr.Out)"
+    [void](AP -t local ui click 'Show cover' --window 'AP Verify Window' --no-watch)
+    if ((AP -t local wait --window 'AP Verify Cover' --timeout 10s).Code -eq 0) {
+        Start-Sleep -Milliseconds 500
+        $sr = AP -t local screenshot --window 'AP Verify Cover' --stats -o $none
+        Check 'screenshot --stats: numbers and no picture; a magenta window is mostly magenta' ($sr.Code -eq 0 -and $sr.Out -match 'no image sent: average color #[0-9A-F]{6}; .* the most common color, about #F808F8, covers (\d+(\.\d+)?)%' -and [double]$Matches[1] -gt 40 -and $sr.Out -notmatch 'saved:' -and -not (Test-Path $none)) "$($sr.Code) $($sr.Out)"
+    } else { Check 'the cover window for the --stats check appeared' $false '' }
+    [void](AP -t local ui click 'Hide cover' --window 'AP Verify Window' --no-watch)
+    [void](AP -t local wait --no-window 'AP Verify Cover' --timeout 10s)
+    $sr = AP -t local screenshot --window 'AP Verify Window' --diff -o $none
+    Check 'screenshot --diff needs a session (the picture before is kept on the target): -t local says so' ($sr.Code -eq 2 -and $sr.Out -match 'keeps state between calls' -and -not (Test-Path $none)) "$($sr.Code) $($sr.Out)"
+
+    # The guide: a short core that stays in an agent's context, and topics that are read when needed.
+    $core = AP guide; $all = AP guide all; $topic = AP guide ui
+    Check 'guide: the core is short and lists the topics; a topic is that part; all is everything' ($core.Code -eq 0 -and $core.Out.Length -lt ($all.Out.Length / 2) -and $core.Out -match '(?m)^\s+guide ui\s' -and $topic.Out -match '^## Driving the UI' -and $all.Out.Contains($topic.Out.Trim()) -and ($core.Out + $all.Out) -notmatch '<!-- topic') "core $($core.Out.Length) characters, all $($all.Out.Length)"
+    $r = AP guide nosuchtopic
+    Check 'guide: an unknown topic is an error that lists the topics' ($r.Code -eq 2 -and $r.Out -match "no topic 'nosuchtopic'" -and $r.Out -match 'guide ui') "$($r.Code) $($r.Out)"
+
     Stop-Process -Id $form.Id -Force
     $w = AP -t local wait --no-window 'AP Verify Window' --timeout 5s
     Check 'wait --no-window after it closes' ($w.Code -eq 0) $w.Out
@@ -858,6 +931,8 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
                 $r = AP -t verify exec '[Console]::Out.Write("first`r`r`nsecond`r`nthird`n")'
                 Check 'exec: lines ending in CR CR LF are kept' (($r.Out -split "`n") -join '|' -eq 'first|second|third') ($r.Out -replace "`n", '|')
                 $r = AP -t verify read $big --head 120000
+                Check 'read: 120000 log lines that differ only in a number come back as the first, the count of the rest and the last' ($r.Code -eq 0 -and @($r.Out -split "`n").Count -eq 2 -and $r.Out -match 'request-id=1 ok' -and $r.Out -match '\[\+119999 more lines like the one above that differ only in numbers; the last one: .*request-id=120000 ok') ($r.Out.Substring(0, [Math]::Min(400, $r.Out.Length)))
+                $r = AP -t verify read $big --head 120000 --no-fold
                 $savedBig = if ($r.Out -match 'Full output \((\d+) lines\): (.+?\.txt)') { $Matches[2] } else { $null }
                 Check 'a 7 MB answer arrives complete (no hang, nothing lost)' ($r.Code -eq 0 -and $savedBig -and (Get-Content $savedBig).Count -eq 120000) "exit $($r.Code), saved $savedBig"
                 $r = AP -t verify events --log NoSuchLogForVerify
@@ -879,6 +954,24 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
                 Check 'the saved full output has every line' ($saved -and (Get-Content $saved).Count -eq 1000) "saved: $saved"
                 $r = AP -t verify exec --full '1..1000 | ForEach-Object { "row $_" }'
                 Check 'exec --full prints everything' (($r.Out -split "`n" | Where-Object { $_ -match '^row \d+$' }).Count -eq 1000) ''
+
+                # What is printed has a budget in characters too; a line repeated in a row is printed once; and
+                # --quiet-ok keeps a command that went well to its last lines.
+                $r = AP -t verify exec '1..150 | ForEach-Object { "$_ " + ("y" * 300) }'
+                Check 'long lines: output is cut by its size although it has fewer than 200 lines' ($r.Out -match '\[\.\.\. (\d+) lines omitted\. Full output \(150 lines\)' -and [int]$Matches[1] -gt 30 -and $r.Out -match '(?m)^1 y' -and $r.Out -match '(?m)^150 y') ($r.Out.Substring(0, [Math]::Min(300, $r.Out.Length)))
+                $r = AP -t verify exec '1..6 | ForEach-Object { "same line" }; "other"'
+                Check 'a line that comes several times in a row is printed once, with how often' (($r.Out -split "`n")[0] -eq 'same line  [x6: this line came 6 times in a row]' -and $r.Out -match '(?m)^other$') $r.Out
+                $r = AP -t verify exec --quiet-ok '1..400 | ForEach-Object { "build line $_" }; "Build succeeded."'
+                $savedQ = if ($r.Out -match 'Full output \(401 lines\): (.+?\.txt)') { $Matches[1] } else { $null }
+                Check 'exec --quiet-ok: a command that went well prints its last lines and where the rest is' ($r.Code -eq 0 -and $r.Out -match '396 earlier lines not shown' -and $r.Out -match '(?m)^Build succeeded\.$' -and $r.Out -notmatch '(?m)^build line 1$' -and $savedQ -and (Get-Content $savedQ).Count -eq 401) $r.Out
+                $r = AP -t verify exec --quiet-ok '1..3 | ForEach-Object { "line $_" }; exit 4'
+                Check 'exec --quiet-ok: a command that failed prints its output as usual' ($r.Code -eq 4 -and $r.Out -match '(?m)^line 1$' -and $r.Out -match '(?m)^line 3$') "$($r.Code) $($r.Out)"
+
+                # Log lines that differ only in their numbers are folded, and the line says so; other lines never are.
+                [void](AP -t verify exec '$l = @("12:00:00 start"); 1..50 | ForEach-Object { $l += ("12:00:{0:00} ERROR retry {1} failed" -f $_, $_) }; $l += "12:01:00 done"; $l += 1..6 | ForEach-Object { "value$_=$_" }; $l | Set-Content fold.log')
+                $r = AP -t verify read fold.log
+                Check 'read: log lines that differ only in numbers are the first one and a line that counts the rest and gives the last' ($r.Out -match '(?m)^12:00:01 ERROR retry 1 failed$' -and $r.Out -match '\[\+49 more lines like the one above that differ only in numbers; the last one: 12:00:50 ERROR retry 50 failed' -and @($r.Out -split "`n" | Where-Object { $_ -match '^value\d=\d$' }).Count -eq 6 -and @($r.Out -split "`n").Count -eq 10) $r.Out
+                Check 'read --no-fold prints every line' (@((AP -t verify read fold.log --no-fold).Out -split "`n").Count -eq 58) ''
 
                 $bin = Join-Path $work 'random.bin'; $rnd = New-Object byte[] (3MB); (New-Object Random 42).NextBytes($rnd); [IO.File]::WriteAllBytes($bin, $rnd)
                 [void](AP -t verify push $bin 'roundtrip.bin')
@@ -1051,8 +1144,59 @@ Write-Output 'script-done'
                 $rep = (AP -t verify watch stop).Out
                 Check 'watch: reports the exit of the watched process' ($rep -match "exit\s+powershell\.exe\($($leak2.Id)\)") $rep
 
+                [void](AP -t verify exec 'Write-Output ("z" * 5000)')
                 $h = (AP -t verify history --last 200).Out
                 Check 'history lists what was run, with exit codes' ($h -match 'exit 7\s+exec Write-Output' -and $h -match 'exit 124') $h
+                Check 'history: OUT is how much each command wrote (5000 characters and a line break: 5K), and a line adds it up' ($h -match '(?m)^\s*#\s+START\s+TOOK\s+OUT\s+RESULT\s+COMMAND' -and $h -match '(?m)\s5K\s+exit 0\s+exec Write-Output \("z" \* 5000\)' -and $h -match '(?m)^OUT: \S+ characters of output in these \d+ commands') (($h -split "`n" | Select-Object -Last 3) -join "`n")
+                $biggest = ((AP -t verify history --last 200 --by-size).Out -split "`n")[1]
+                Check 'history --by-size puts the command that wrote most first (the 7 MB read)' ($biggest -match '\s\d+(\.\d+)?M\s+exit 0\s+read ') $biggest
+
+                # A crash that Windows logs is added to a command's answer without being asked for, and only once.
+                $crashAt = Get-Date
+                $crashOut = (AP -t verify exec 'powershell -NoProfile -Command "[Environment]::FailFast(''agentprobe-verify'')"; exit 0').Out
+                $logged = $null; 1..20 | ForEach-Object { if (-not $logged) { Start-Sleep 1; $logged = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000; StartTime = $crashAt } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'powershell\.exe' } | Select-Object -First 1 } }
+                if (-not $logged) { Write-Host '  skipped: Windows did not log the crash of the test process here, so there is nothing to report.' -ForegroundColor Yellow }
+                else {
+                    $next = (AP -t verify exec 'Write-Output after-crash').Out; $again = (AP -t verify exec 'Write-Output once-more').Out
+                    $said = [regex]::Matches("$crashOut`n$next`n$again", 'Windows logged this on the target since the last command: \S+ \S+ CRASH powershell\.exe').Count
+                    Check 'a crash Windows logged is added to a command''s answer, once' ($said -eq 1 -and $again -notmatch 'Windows logged this') "said $said times`n$crashOut`n$next`n$again"
+                }
+
+                # What changed since the last look: the last look is remembered on the target, so this needs the session.
+                $form2 = Start-Process powershell -ArgumentList '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', "`"$formFile`"" -PassThru
+                if ((AP -t verify wait --window 'AP Verify Window' --timeout 40s).Code -ne 0) { Check 'the test window for the --diff checks appeared' $false '' }
+                else {
+                    Start-Sleep 1
+                    $first = AP -t verify ui 'AP Verify Window' --diff
+                    [void](AP -t verify ui set '#inputBox' 'diff me' --window 'AP Verify Window' --no-watch)
+                    $second = AP -t verify ui 'AP Verify Window' --diff
+                    $third = AP -t verify ui 'AP Verify Window' --diff
+                    Check 'ui --diff: the first look is the whole listing and says why; then only what changed; then nothing' ($first.Out -match 'nothing to compare with' -and $first.Out -match 'Button "Press me"' -and $second.Out -match '1 change since the last `ui` of it' -and $second.Out -match '(?m)^~ Edit.* #inputBox =diff me' -and $second.Out -notmatch 'Press me' -and $third.Out -match 'nothing changed among its \d+ listed controls') "$($first.Out)`n$($second.Out)`n$($third.Out)"
+                    $d1 = Join-Path $work 'd1.png'; $d2 = Join-Path $work 'd2.png'; $d3 = Join-Path $work 'd3.png'
+                    $whole = AP -t verify screenshot --window 'AP Verify Window' -o $d1
+                    [void](AP -t verify ui set '#inputBox' 'other pixels' --window 'AP Verify Window' --no-watch); Start-Sleep -Milliseconds 400
+                    $changed = AP -t verify screenshot --window 'AP Verify Window' --diff -o $d2
+                    $wholeSize = if ($whole.Out -match '(\d+)x(\d+) PNG') { @([int]$Matches[1], [int]$Matches[2]) } else { @(0, 0) }
+                    Check 'screenshot --diff: after a change, the picture is only the part that changed' ((Test-Path $d2) -and $changed.Out -match 'only the part that changed' -and $changed.Out -match '(\d+)x(\d+) PNG' -and [int]$Matches[1] -lt $wholeSize[0] -and [int]$Matches[2] -lt ($wholeSize[1] / 2)) "$($whole.Out)`n$($changed.Out)"
+                    [void](AP -t verify ui click 'Show cover' --window 'AP Verify Window' --no-watch)
+                    if ((AP -t verify wait --window 'AP Verify Cover' --timeout 10s).Code -eq 0) {
+                        Start-Sleep 1
+                        $before = AP -t verify screenshot --window 'AP Verify Cover' --diff -o $d3
+                        Remove-Item $d3 -ErrorAction SilentlyContinue
+                        $same = AP -t verify screenshot --window 'AP Verify Cover' --diff -o $d3
+                        Check 'screenshot --diff: with no picture of that area before, it is the whole picture and says so; unchanged, it is a line of text and no image' ($before.Out -match 'no earlier screenshot of exactly this area' -and $same.Code -eq 0 -and $same.Out -match '^no change: ' -and $same.Out -match 'No image was sent' -and -not (Test-Path $d3)) "$($before.Out)`n$($same.Out)"
+                    } else { Check 'the cover window for the screenshot --diff check appeared' $false '' }
+                }
+                Stop-Process -Id $form2.Id -Force -ErrorAction SilentlyContinue
+
+                # MCP: several lines in one `run` are steps.
+                $mp = [System.Diagnostics.Process]::Start($mcp)
+                $call = @{ jsonrpc = '2.0'; id = 7; method = 'tools/call'; params = @{ name = 'run'; arguments = @{ target = 'verify'; command = "exec 'Write-Output step-one'`nshow exec 'Write-Output step-two'" } } } | ConvertTo-Json -Depth 6 -Compress
+                $mp.StandardInput.WriteLine($call); $mp.StandardInput.Close()
+                $answer = $mp.StandardOutput.ReadToEnd() -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.id -eq 7 }
+                $mp.WaitForExit()
+                $stepsText = "$($answer.result.content[0].text)"
+                Check 'mcp: `run` with several lines runs them as steps (the output of the `show` step and one line)' ($stepsText -match 'step-two' -and $stepsText -notmatch 'step-one' -and $stepsText -match 'ok: 2 steps in') $stepsText
                 $shotR = Join-Path $work 'remote.png'; [void](AP -t verify screenshot --scale 0.25 -o $shotR)
                 Check 'screenshot arrives over the session' ((Test-Path $shotR) -and (Get-Item $shotR).Length -gt 1000) ''
                 # The firewall: "allow" is a rule for the length of the session. It needs administrator rights, which

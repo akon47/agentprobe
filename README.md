@@ -86,7 +86,7 @@ codex mcp add agentprobe -- "C:\tools\agentprobe.exe" mcp       # Codex
 For other clients, register the command `agentprobe.exe` with the single argument `mcp`.
 
 The server is deliberately thin, because MCP tool definitions occupy an agent's context on every turn. It offers
-four tools, `list_targets`, `run` (any agentprobe command line), `screenshot` (returned as an image) and `guide`,
+four tools, `list_targets`, `run` (any agentprobe command line, or several lines as steps), `screenshot` (returned as an image) and `guide`,
 about 2 KB in total, and its instructions tell the agent where the exe is, so an agent with a shell moves on to the
 command line, where output can be piped, filtered and saved to files. Nothing is lost through MCP: `run` reaches
 every command in this README.
@@ -105,7 +105,7 @@ behind a router or on a larger VPN is not found that way; start it with the addr
 | Cleanup afterwards | uninstall, close the port, remove keys | close the window |
 | Finding the PC | you need its address | automatic on the same network |
 | GUI apps | invisible (session 0) | run in the user's desktop session: visible, screenshot-able, clickable |
-| Cost for an AI agent | raw shell output: long, padded, often thousands of tokens per look | purpose-built commands that answer in a few compact lines |
+| Cost for an AI agent | raw shell output: long, padded, often thousands of tokens per look; a script per click, and another command to see what the click did | purpose-built commands that answer in a few compact lines; an action says what it changed; a whole test is one command |
 | Monitoring | poll in a loop | `watch` records in the background and reports trends |
 | A dropped connection | the command dies with the session | the command keeps running; `history` and `result` pick it up |
 | The person at the PC | sees nothing | on-screen banner, live activity list, log file |
@@ -118,16 +118,33 @@ behind a router or on a larger VPN is not found that way; start it with the addr
 - **Incremental reads.** `logs`, `dbg` and `read --new` return only what is new since the previous call.
 - **Trends instead of samples.** `watch` answers "private bytes 210M→480M, +22M/min, steady growth: LIKELY LEAK"
   in one line, after one call.
-- **Blocking waits.** `wait --window "Setup" --timeout 60s` replaces a polling loop.
-- **Output is capped.** Long output prints its first 200 and last 100 lines and is saved to a local file to search.
+- **Blocking waits.** `wait --window "Setup" --timeout 60s` replaces a polling loop, also for a control:
+  `wait --ui "#status" --has Done`.
+- **Actions say what they changed.** Every turn of an agent carries the whole conversation again, so the number of
+  commands matters more than their length. `ui click "Delete"` answers with the dialog that opened and what it says,
+  the control that reads differently, or the program ending: no `windows`, `ui` and `screenshot` afterwards to find out.
+  A crash on the tested PC is added to the next command's answer by itself.
+- **Assertions.** `expect --ui "#status" --has Saved` is one line: `ok`, or what the control reads instead.
+- **A test is one command.** `agentprobe run steps.txt` runs a list of commands (push the build, start it, drive
+  it, check it) and answers `ok: 8 steps in 9.4s`, or the step that failed with what the tested PC shows at that
+  moment. Run again after each fix: one turn instead of eight.
+- **Only what changed.** `ui <window> --diff` and `screenshot --diff` return the difference from the last look; an
+  unchanged screen is one line of text and no image. `screenshot --control Save` is one control, and
+  `screenshot --stats` answers "is it black?" in numbers.
+- **Output is capped**, by lines and by characters: long output prints its head and tail and is saved to a local
+  file to search. A line repeated in a row is printed once with its count, a log's run of lines that differ only in
+  their numbers as the first and the last, and `exec --quiet-ok` prints only the end of a build that succeeded.
+- **A short guide.** `agentprobe guide` is the core an agent keeps in its context; `guide ui`, `guide exec` and the
+  other topics are read when they are needed.
+- **It can be measured.** `history` shows how many characters each command wrote, biggest first with `--by-size`.
 - **Fleets collapse.** Run on fifty PCs with `-t all`; identical results are printed once with the list of PCs.
 
 ## What it can do
 
 | Area | Commands |
 |---|---|
-| Run | `exec` (PowerShell, pwsh, 32-bit PowerShell, cmd; `exec -f script.ps1 -Arg value` sends a script with its arguments), `start` / `jobs` / `logs` / `kill` background jobs (`start --exe app.exe` tracks a GUI app itself, `start --lnk` starts what a shortcut starts, `--env NAME=VALUE` sets its environment, `--replace MyApp.exe` first closes the running one), `wait` for a process, window, port, file, log line or idle CPU |
-| Files | `push`, `pull` (files and folders), `ls`, `read` (tail, grep, line ranges, a time span of a log, only-new), `stat` (version, x86/x64, .NET or native, SHA-256, blocked-download flag, what a shortcut starts), `locks` (who holds a file open) |
+| Run | `exec` (PowerShell, pwsh, 32-bit PowerShell, cmd; `exec -f script.ps1 -Arg value` sends a script with its arguments), `start` / `jobs` / `logs` / `kill` background jobs (`start --exe app.exe` tracks a GUI app itself, `start --lnk` starts what a shortcut starts, `--env NAME=VALUE` sets its environment, `--replace MyApp.exe` first closes the running one; `exec --quiet-ok` prints only the last lines of a command that succeeded), `wait` for a process, window, port, file, log line, idle CPU or a control of a window, `expect` (the same conditions as a one-line assertion), `run` (a file of commands as one command: quiet when all went well, the failed step with evidence when not) |
+| Files | `push`, `pull` (files and folders), `ls`, `read` (tail, grep, line ranges, a time span of a log, only-new; repeated log lines folded), `stat` (version, x86/x64, .NET or native, SHA-256, blocked-download flag, what a shortcut starts), `locks` (who holds a file open) |
 | First look | `triage`: load, hung windows, recent crashes and errors, low disk, pending reboot, and what to try next; for an app that is not running, where it is installed and how to start it |
 | Processes | `ps`, `top`, `proc`, `threads` (CPU per thread, wait reason, name, creation time, start module; threads per name), `stacks` (call stacks of a live process, identical ones grouped), `modules` (loaded DLLs, versions, paths), `handles` (by type, and what grew), `vmmap` (which kind of memory grows: heaps, stacks, images, mapped files), `heap` (.NET objects by type, only the reachable ones on request, the window objects that are still alive and how many of them are shown, the chain of references that keeps one alive, and the values in an object's fields; read on the tested PC from a snapshot), `dump` (small or full memory dump, fetched to your PC or kept there) |
 | System | `sys` (OS build, hardware, locale, GPU drivers, displays, .NET / VC++ runtimes), `mem` (commit, pools, standby lists, biggest consumers), `net` (listeners, connections per process, reachability checks), `svc`, `reg`, `firewall` (allow a program you pushed to accept connections for the session, or close the Windows Firewall prompt, once or for the whole session; lists and removes the rules Windows keeps afterwards) |
@@ -135,8 +152,8 @@ behind a router or on a larger VPN is not found that way; start it with the addr
 | Logs | `events` (Windows event logs, filtered and de-duplicated), `crashes` (faulting module, exception code, dump files, blue screens), `dbg` (OutputDebugString capture, like DebugView) |
 | Monitor | `watch`: per-process private bytes, handles, GDI/USER objects, threads and CPU with growth rates and a leak verdict; start/exit of the watched processes and of what they start, with decoded exit codes; any crash; windows that stop responding. The noise of Windows starting its own helpers is counted, not listed |
 | Capture | `trace` (which file and registry accesses FAIL for a process, counted and grouped: Process Monitor's most useful view as a short table), `crashdumps on` (Windows saves a dump whenever the app crashes), `wpr start/stop` (Windows Performance Recorder traces: CPU, disk, file, registry, heap) |
-| Desktop | `ui` (a window's controls as text with their state: selected, checked, expanded, scroll position, slider value; click, tap, read and fill them by name; `ui --at @x,y` for what is at a point), `windows` (also flags a Windows prompt waiting for the person: firewall, UAC, credentials; and open menus), `screenshot` (screen, display, or one window drawn by itself so that nothing in front hides it, scaled), `click` (names the window that got the click, and refuses when another window is in front of the one you name), `touch` (tap, double tap, press and hold, drag as a finger does, also on a PC without a touch screen), `drag`, `scroll`, `type`, `key`, `focus` |
-| Session | `list` (what each PC is doing, since when it is connected, whether the person there has paused it), `dashboard`, `name`, `history`, `result`, `reboot --wait`, `end` |
+| Desktop | `ui` (a window's controls as text with their state: selected, checked, expanded, scroll position, slider value; click, tap, read and fill them by name, and each action says what changed on the screen; `--diff` for what changed since the last look, `--pos` for coordinates; `ui --at @x,y` for what is at a point), `windows` (also flags a Windows prompt waiting for the person: firewall, UAC, credentials; and open menus), `screenshot` (screen, display, or one window drawn by itself so that nothing in front hides it, scaled; one control or a region; only what changed; or numbers instead of a picture), `click` (names the window that got the click, and refuses when another window is in front of the one you name), `touch` (tap, double tap, press and hold, drag as a finger does, also on a PC without a touch screen), `drag`, `scroll`, `type`, `key`, `focus` |
+| Session | `list` (what each PC is doing, since when it is connected, whether the person there has paused it), `dashboard`, `name`, `history` (with how much each command wrote), `result`, `reboot --wait`, `end` |
 
 `agentprobe help` lists everything; `agentprobe help <command>` shows the options.
 

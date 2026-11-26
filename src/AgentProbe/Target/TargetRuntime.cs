@@ -162,6 +162,9 @@ internal sealed class TargetRuntime
     /// </summary>
     public volatile bool Paused;
 
+    /// <summary>Crashes and hangs Windows logged up to this moment have been reported to the developer PC (see <see cref="Tools.CrashNotes"/>).</summary>
+    public DateTime CrashesSeenUtc = DateTime.UtcNow;
+
     /// <summary>Set while `firewall dismiss --auto` is on: cancelling it stops the watch.</summary>
     public CancellationTokenSource? PromptWatch;
 

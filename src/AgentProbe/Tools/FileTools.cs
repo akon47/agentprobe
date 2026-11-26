@@ -33,7 +33,7 @@ internal static partial class FileTools
             """, LsAsync) { Quiet = true },
         new("read", "Files", "Read a text file, or just the part you need",
             """
-            read <file> [--tail N] [--head N] [--lines 100-180] [--grep REGEX] [--between 12:02 12:05] [--new]
+            read <file> [--tail N] [--head N] [--lines 100-180] [--grep REGEX] [--between 12:02 12:05] [--new] [--no-fold]
               --new    only complete lines appended since the last `read --new` of this file (first call: last 40 lines).
                        Ideal for following a log between test steps without re-reading it.
               --grep   matching lines with line numbers; the WHOLE file is searched whatever its size.
@@ -43,6 +43,9 @@ internal static partial class FileTools
                        starts within its first 48 characters ("1:05:03 PM" is read as 13:05:03); a line without one
                        (a stack trace) belongs to the line before it. It is the time of day only: in a log of several
                        days, every day's span is shown. Combines with --grep and --lines, not with --new.
+              Log lines (ones that start with a time of day) that come four or more in a row and differ only in
+              their numbers (the same error every second) are printed as the first one and a line that says how
+              many followed and gives the last; --no-fold prints them all. Other lines are never folded.
               Encoding is detected per line (UTF-8, UTF-16, ANSI). Big files without a filter return their last 200 lines.
             """, ReadAsync) { Quiet = true },
         new("stat", "Files", "Facts about a file: version, x86/x64, .NET or native, SHA-256, blocked-from-internet flag",
@@ -120,7 +123,7 @@ internal static partial class FileTools
 
     private static Task<int> ReadAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "new");
+        var a = ArgParser.Parse(args, "new", "no-fold");
         TimeSpan betweenFrom = default, betweenTo = default;
         var between = a.Has("between");
         if (between)
@@ -276,12 +279,8 @@ internal static partial class FileTools
         }
 
         var sb = new StringBuilder();
-        foreach (var (no, text) in shown)
-        {
-            if (numbered) sb.Append(no).Append(": ");
-            sb.Append(text).Append('\n');
-        }
-
+        var printed = shown.Select(l => (numbered ? $"{l.no}: {l.text}" : l.text, l.text)).ToList();
+        foreach (var line in a.Flag("no-fold") ? printed.Select(l => l.Item1) : LineFold.Similar(printed, text => TimeIn(text) != null)) sb.Append(line).Append('\n');
         ctx.Out.Write(sb.ToString());
         if (note.Length > 0) ctx.Out.WriteLine(note);
         else if (shown.Count == 0) ctx.Out.WriteLine(isNew ? "[no new lines]" : grep != null ? "[no matches]" : "[empty]");

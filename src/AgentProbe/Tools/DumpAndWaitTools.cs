@@ -101,16 +101,102 @@ internal static class WaitTool
               --idle <pid|name>        the process uses < 2% of a core for 3s (finished starting up / working)
               --below <percent>        with --idle: that limit instead of 2, in % of one core, for an app that is
                                        never quite idle (a video app at rest may sit at 15%: --idle app --below 25)
-              Exit code 0 when met (prints how long it took), 124 on timeout (prints what was still missing).
+              --ui <name|#id>          a control with that name or id is on screen (found as `ui click` finds it)
+              --has <regex>            with --ui: ...and its line, as `ui get` prints it without the position,
+                                       matches: --ui "#status" --has Saved   --ui "Apply" --has "\(disabled\)"
+              --no-ui <name|#id>       no such control is on screen (the progress bar went, the dialog's text is gone)
+              --in <window>            the window --ui and --no-ui look in (default: the foreground window)
+              Exit code 0 when met (prints how long it took), 124 on timeout (prints what was still missing,
+              and for a control what it reads instead).
             """, WaitAsync),
+        new("expect", "Run", "Check that something is the case now (or within a few seconds): one line, exit 0 or 1",
+            """
+            expect [--timeout 5s] <condition> [more conditions: all must hold]
+              An assertion with the conditions of `wait` (see `help wait`): --ui <name> [--has <regex>],
+              --no-ui <name>, --window <title>, --no-window <title>, --start <name>, --exit <name>, --port <n>,
+              --file <path> [--grep RE], --job <id>, --idle <name>. Each has 5 seconds to come true (--timeout).
+              Exit 0 and "ok: ..." when they hold. Exit 1 and what is the case instead when they do not:
+                  expect --ui "#status" --has Saved
+                  FAILED after 5s: control '#status' to read /Saved/ (it reads: Text "Disk full" #status)
+              Say what you expect instead of reading the state and judging it: one short line either way.
+            """, ExpectAsync),
     ];
 
-    private static async Task<int> WaitAsync(ToolContext ctx, string[] args)
+    private static Task<int> WaitAsync(ToolContext ctx, string[] args) => CheckAsync(ctx, args, "wait");
+
+    private static Task<int> ExpectAsync(ToolContext ctx, string[] args) => CheckAsync(ctx, args, "expect");
+
+    /// <summary><c>wait</c> and <c>expect</c>: the same conditions; they differ in how long they wait by default and in how they answer.</summary>
+    private static async Task<int> CheckAsync(ToolContext ctx, string[] args, string tool)
     {
         var a = ArgParser.Parse(args);
-        var timeout = a.GetDuration("timeout") ?? TimeSpan.FromSeconds(60);
+        var expect = tool == "expect";
+        var timeout = a.GetDuration("timeout") ?? TimeSpan.FromSeconds(expect ? 5 : 60);
         var checks = new List<(string name, Func<bool> met)>();
+        var notes = new Dictionary<string, Func<string>>(); // per condition: what is the case instead, for the answer when it is not met
         Func<string>? idleNote = null; // what --idle last measured, for the timeout message
+
+        if (a.Has("has") && !a.Has("ui")) return ctx.Fail($"{tool}: --has goes with --ui <name|#id>.");
+        if (a.Has("in") && !a.Has("ui") && !a.Has("no-ui")) return ctx.Fail($"{tool}: --in <window> goes with --ui or --no-ui.");
+        if (a.Get("ui") is { } control)
+        {
+            System.Text.RegularExpressions.Regex? has = null;
+            if (a.Get("has") is { } hasPattern)
+            {
+                try
+                {
+                    has = new System.Text.RegularExpressions.Regex(hasPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                }
+                catch (ArgumentException ex)
+                {
+                    return ctx.Fail($"{tool}: bad --has pattern: " + ex.Message);
+                }
+            }
+
+            var name = has != null ? $"control '{control}' to read /{a.Get("has")}/" : $"control '{control}' on screen";
+            var reads = "";
+            notes[name] = () => reads;
+            checks.Add((name, () =>
+            {
+                var probe = UiaTools.Probe(a.Get("in"), control);
+                if (probe.status != 0)
+                {
+                    reads = probe.status == 1 ? probe.text : "the window could not be looked in: " + probe.text;
+                    return false;
+                }
+
+                reads = "it reads: " + probe.text;
+                if (probe.offscreen)
+                {
+                    reads = "it exists but is not visible on screen: " + probe.text;
+                    return false;
+                }
+
+                return has == null || has.IsMatch(probe.text);
+            }));
+        }
+
+        if (a.Get("no-ui") is { } absent)
+        {
+            var name = $"control '{absent}' to be gone";
+            var reads = "";
+            notes[name] = () => reads;
+            checks.Add((name, () =>
+            {
+                var probe = UiaTools.Probe(a.Get("in"), absent);
+                if (probe.status == 1 || (probe.status == 0 && probe.offscreen)) return true;
+                if (probe.status == 0)
+                {
+                    reads = "it is there: " + probe.text;
+                    return false;
+                }
+
+                // Its window is gone: so is the control. A window that could not be read is not "gone".
+                if (probe.text.Contains("no window matches", StringComparison.Ordinal)) return true;
+                reads = "the window could not be looked in: " + probe.text;
+                return false;
+            }));
+        }
 
         if (a.Get("exit") is { } exit) checks.Add(($"exit of {exit}", () => ProcessTools.Find(ProcessSnapshot.Take(), exit).Count == 0));
         if (a.Get("start") is { } start) checks.Add(($"start of {start}", () => ProcessTools.Find(ProcessSnapshot.Take(), start).Count > 0));
@@ -119,7 +205,7 @@ internal static class WaitTool
         if (a.Get("port") is { } portText && int.TryParse(portText, out var port)) checks.Add(($"port {port}", () => NetTools.IsListening(port)));
         if (a.Get("job") is { } jobId)
         {
-            if (ctx.Runtime.Jobs.Find(jobId) == null) return ctx.Fail($"wait: there is no job '{jobId}' (see `jobs`).");
+            if (ctx.Runtime.Jobs.Find(jobId) == null) return ctx.Fail($"{tool}: there is no job '{jobId}' (see `jobs`).");
             checks.Add(($"job {jobId}", () => ctx.Runtime.Jobs.Find(jobId) is not { ExitCode: null }));
         }
         if (a.Get("file") is { } file)
@@ -134,7 +220,7 @@ internal static class WaitTool
                 }
                 catch (ArgumentException ex)
                 {
-                    return ctx.Fail("wait: bad --grep pattern: " + ex.Message);
+                    return ctx.Fail($"{tool}: bad --grep pattern: " + ex.Message);
                 }
 
                 checks.Add(($"/{grep}/ in {Path.GetFileName(path)}", () => FileContains(path, re)));
@@ -145,11 +231,11 @@ internal static class WaitTool
             }
         }
 
-        if (a.Has("below") && !a.Has("idle")) return ctx.Fail("wait: --below goes with --idle <pid|name>.");
+        if (a.Has("below") && !a.Has("idle")) return ctx.Fail($"{tool}: --below goes with --idle <pid|name>.");
         if (a.Get("idle") is { } idle)
         {
             var limit = a.GetDouble("below", 2);
-            if (limit is <= 0 or > 6400) return ctx.Fail("wait: --below needs a percentage of one core, for example 25.");
+            if (limit is <= 0 or > 6400) return ctx.Fail($"{tool}: --below needs a percentage of one core, for example 25.");
             var quietSince = (DateTime?)null;
             long lastCpu = -1;
             var lastAt = Stopwatch.GetTimestamp();
@@ -181,7 +267,8 @@ internal static class WaitTool
             }));
         }
 
-        if (checks.Count == 0) return ctx.Fail("wait: no condition given. See `agentprobe help wait`.");
+        if (checks.Count == 0) return ctx.Fail($"{tool}: no condition given. See `agentprobe help {tool}`.");
+        string Missing(List<(string name, Func<bool> met)> pending) => string.Join(", ", pending.Select(c => c.name + (notes.TryGetValue(c.name, out var why) && why() is { Length: > 0 } text ? $" ({text})" : "")));
 
         var sw = Stopwatch.StartNew();
         var pending = checks.ToList();
@@ -190,15 +277,19 @@ internal static class WaitTool
             pending = pending.Where(c => !Safe(c.met)).ToList();
             if (pending.Count == 0)
             {
-                ctx.Out.WriteLine($"ok after {Format.Duration(sw.Elapsed)}: {string.Join(", ", checks.Select(c => c.name))}");
+                ctx.Out.WriteLine(expect
+                    ? $"ok: {string.Join(", ", checks.Select(c => c.name))}{(sw.Elapsed.TotalSeconds >= 1 ? $" (after {Format.Duration(sw.Elapsed)})" : "")}"
+                    : $"ok after {Format.Duration(sw.Elapsed)}: {string.Join(", ", checks.Select(c => c.name))}");
                 return 0;
             }
 
             if (sw.Elapsed >= timeout)
             {
                 var note = idleNote != null && pending.Any(c => c.name.Contains("% of a core", StringComparison.Ordinal)) ? idleNote() : "";
-                ctx.Out.WriteLine($"timed out after {Format.Duration(timeout)}; still waiting for: {string.Join(", ", pending.Select(c => c.name))}{note}");
-                return 124;
+                ctx.Out.WriteLine(expect
+                    ? $"FAILED after {Format.Duration(timeout)}: {Missing(pending)}{note}"
+                    : $"timed out after {Format.Duration(timeout)}; still waiting for: {Missing(pending)}{note}");
+                return expect ? 1 : 124;
             }
 
             await Task.Delay(300, ctx.Ct);

@@ -422,7 +422,7 @@ internal static class ExecTools
     [
         new("exec", "Run", "Run a command (PowerShell by default) and wait for it",
             """
-            exec [--shell powershell|pwsh|ps32|cmd] [--cwd DIR] [--timeout 60s] <command>
+            exec [--shell powershell|pwsh|ps32|cmd] [--cwd DIR] [--timeout 60s] [--quiet-ok] <command>
             exec -f local-script.ps1 [args] send a local script file and run it; what follows the file name goes
                                             to the script (its param block works): exec -f t.ps1 -Port 8080 -Fast
                                             Put --shell/--cwd/--timeout before -f; write -- before script arguments
@@ -433,6 +433,9 @@ internal static class ExecTools
               Runs as the logged-on user in their desktop session, so GUI apps you launch are visible.
               --shell ps32 is the 32-bit PowerShell (what a 32-bit app sees: SysWOW64, WOW6432Node).
               Trailing spaces and runs of blank lines are removed from the output.
+              --quiet-ok   for a command whose output only matters when it fails (a build, an installer, a test
+                           run): exit code 0 prints its last 5 lines and where the whole output was saved on
+                           the developer PC; any other exit code prints the output as usual.
             """, ExecAsync),
         new("start", "Run", "Start a long-running command in the background",
             """
@@ -466,8 +469,11 @@ internal static class ExecTools
         new("jobs", "Run", "List background jobs", "jobs", JobsAsync) { Quiet = true },
         new("logs", "Run", "Output of a background job (only what is new since the last call)",
             """
-            logs <job> [--all] [--tail N] [--grep REGEX]
+            logs <job> [--all] [--tail N] [--grep REGEX] [--no-fold]
               Without --all, returns only output produced since the previous `logs` call for that job.
+              Four or more lines in a row that differ only in their numbers (a retry loop, a progress counter)
+              are printed as the first one and a line that says how many followed and gives the last;
+              --no-fold prints them all.
             """, LogsAsync) { Quiet = true },
         new("kill", "Run", "Stop a background job, or any process by pid/name",
             """
@@ -733,13 +739,14 @@ internal static class ExecTools
 
     private static Task<int> LogsAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "all");
+        var a = ArgParser.Parse(args, "all", "no-fold");
         if (a.Positionals.Count == 0) return Task.FromResult(ctx.Fail("logs: which job? (see `jobs`)"));
         var job = ctx.Runtime.Jobs.Find(a.Positionals[0]);
         if (job == null) return Task.FromResult(ctx.Fail($"logs: no job '{a.Positionals[0]}'."));
 
         var text = job.Read(a.Flag("all") || a.Has("tail"));
         text = TextFilter.Apply(text, a.Get("grep"), null, a.Has("tail") ? a.GetInt("tail", 50) : null, ctx.Err);
+        if (!a.Flag("no-fold")) text = LineFold.Text(text);
         ctx.Out.Write(text);
         if (text.Length > 0 && !text.EndsWith('\n')) ctx.Out.WriteLine();
         var state = job.ExitCode is { } code ? "exited " + Native.ProcessDetails.ExitCodeName((uint)code) : "still running";
