@@ -16,7 +16,7 @@ This is the short guide. Topics to read when you need them are listed at the end
 3. **Prefer a built-in tool over `exec`.** Built-ins answer in a few compact lines; a PowerShell pipeline that does the
    same costs several times more tokens and is easy to get subtly wrong.
 4. **Every command is a turn, and every turn carries the whole conversation again.** So:
-   - An action (`ui click`, `ui set`, `click`, `key`, `type`) already says what it changed: the window or menu that
+   - An action (`ui click`, `click`, `key`, `type`, `touch`) already says what it changed: the window or menu that
      opened with its text and buttons, the control that reads differently, the program ending. Do not follow it
      with `windows`, `ui` or `screenshot` to see its effect.
    - Say what you expect instead of looking: `expect --ui "#status" --has Saved` is one line, pass or fail.
@@ -147,8 +147,7 @@ changed within 0.6s:
 
 `~` reads differently (with what it read before), `+` appeared, `-` went. `no change seen within 0.5s` is an answer
 too: the click did nothing visible in that time. What happens later is for `wait --ui` / `expect`; `--no-watch`
-leaves the look out (a quick series of keys). Touch (`touch`, `ui tap`, `ui dtap`) does not look unless you add
-`--watch`: check its effect with `expect`, `ui get` or `ui <window> --diff`.
+leaves the look out (a quick series of keys).
 
 `ui click` uses the control's own action where there is one and the mouse otherwise; a button that can only be
 toggled (a WPF ToggleButton) is clicked with the mouse, because toggling it would flip its state without running the
@@ -316,9 +315,7 @@ the target may open: the report says how many exits it could not judge.
 
 What an action says changed is what was different about a second after it: the top-level windows, and the controls
 of the window acted on (the first 400; with more, only controls that read differently are reported, and the answer
-says so). "no change seen" means none in that time and in those places, not that nothing will happen. Touch
-does not look by default: on the machine that builds agentprobe, the first touch of a logon session sent with the
-look around it reached a button without pressing it, for a reason that is not known. The crash
+says so). "no change seen" means none in that time and in those places, not that nothing will happen. The crash
 line added to a command's answer comes from the Application event log, which Windows writes a moment after the
 crash: a crash at the very end of a command is reported with the next one.
 
