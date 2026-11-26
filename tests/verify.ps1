@@ -736,6 +736,9 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
             Write-Host "  skipped: this Windows does not accept injected touch input ($($r.Out.Trim()))." -ForegroundColor Yellow
         } else {
             Check 'touch tap presses the button, and the app sees touch input' ($r.Code -eq 0 -and $r.Out -match "tapped by touch at screen $px,$py on `"AP Verify Window`"" -and (Test-Path $clickFile) -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch') "$($r.Code) $($r.Out) / pressed: $(Test-Path $clickFile) / seen as: $(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })`n$((AP -t local windows 'AP Verify').Out)"
+            # (The tap above is the first touch of this logon session when the suite runs on a fresh machine, and
+            # it is sent with the look at the screen around it, so the process lives on after it: the case in
+            # which a tap used to reach the button without pressing it.)
             # The same tap again, and once without the look at the screen: each must press the button.
             Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
             $r = AP -t local touch tap "@$px,$py" --window 'AP Verify Window'; Start-Sleep -Milliseconds 600

@@ -99,6 +99,9 @@ internal static partial class UiTools
               ui dtap <name>. A gesture is one command because its timing matters: two `touch tap` calls are
               seconds apart and never a double tap.
               Windows shows its touch feedback at the point, and hides the mouse pointer until the mouse moves.
+              The mouse pointer is put at the first point right before the finger goes down, which Windows
+              does for a touch anyway (except for the first one after logon: without this, that tap reached a
+              button and did not press it). An app can see that as the mouse arriving there a moment earlier.
             """, TouchAsync),
         new("drag", "Desktop", "Drag from one position to another", "drag <x1> <y1> <x2> <y2> [--screen]", DragAsync),
         new("scroll", "Desktop", "Turn the mouse wheel", "scroll <notches> [x y]     positive = up, negative = down", ScrollAsync),
@@ -1132,6 +1135,15 @@ internal static partial class UiTools
 
         if (!InitializeTouchInjection(1, 1)) return Refused("InitializeTouchInjection"); // one contact, Windows' own touch feedback
         var (x, y) = path[0];
+
+        // The mouse pointer goes to the first point before the finger does. Windows puts it there itself for a
+        // touch, but not yet for the first touch of a logon session: the mouse messages it makes from that touch
+        // then had a mouse move between the down and the up that carried the pointer's OLD place (the button's
+        // capture asks for one, and it is made from where the pointer is). A button takes that for the pointer
+        // having left it and does not click: the tap arrived and pressed nothing. Seen on the build machine
+        // whenever the process that sent the touch lived on after it, as agentprobe does on a shared PC.
+        SetCursorPos(x, y);
+        Thread.Sleep(40);
         if (!TouchFrame(x, y, TouchDown)) return Refused("touch down");
         var (liftX, liftY) = (x, y); // the last point Windows accepted
         string? failure = null;
@@ -1495,6 +1507,10 @@ internal static partial class UiTools
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetCursorPos(out POINT point);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetCursorPos(int x, int y);
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
