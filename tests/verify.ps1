@@ -735,7 +735,14 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
         if ($r.Out -match 'Windows refused the touch input \(InitializeTouchInjection') {
             Write-Host "  skipped: this Windows does not accept injected touch input ($($r.Out.Trim()))." -ForegroundColor Yellow
         } else {
-            Check 'touch tap presses the button, and the app sees touch input' ($r.Code -eq 0 -and $r.Out -match "tapped by touch at screen $px,$py on `"AP Verify Window`"" -and (Test-Path $clickFile) -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch') "$($r.Code) $($r.Out) / pressed: $(Test-Path $clickFile) / seen as: $(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })"
+            Check 'touch tap presses the button, and the app sees touch input' ($r.Code -eq 0 -and $r.Out -match "tapped by touch at screen $px,$py on `"AP Verify Window`"" -and (Test-Path $clickFile) -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch') "$($r.Code) $($r.Out) / pressed: $(Test-Path $clickFile) / seen as: $(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })`n$((AP -t local windows 'AP Verify').Out)"
+            # The same tap again, and once without the look at the screen: each must press the button.
+            Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
+            $r = AP -t local touch tap "@$px,$py" --window 'AP Verify Window'; Start-Sleep -Milliseconds 600
+            Check 'touch tap a second time presses the button again' ($r.Code -eq 0 -and (Test-Path $clickFile) -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch') "$($r.Code) $($r.Out) / pressed: $(Test-Path $clickFile) / seen as: $(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })`n$((AP -t local windows 'AP Verify').Out)"
+            Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
+            $r = AP -t local touch tap "@$px,$py" --window 'AP Verify Window' --no-watch; Start-Sleep -Milliseconds 600
+            Check 'touch tap --no-watch presses the button and says nothing about the screen' ($r.Code -eq 0 -and (Test-Path $clickFile) -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch' -and $r.Out -notmatch 'changed within|no change seen') "$($r.Code) $($r.Out) / pressed: $(Test-Path $clickFile) / seen as: $(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })"
             Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
             $r = AP -t local ui tap 'Press me' --window 'AP Verify Window'; Start-Sleep -Milliseconds 600
             Check 'ui tap taps a control by name, by touch' ($r.Code -eq 0 -and $r.Out -match 'tapped Button "Press me" by touch' -and (Test-Path $clickFile) -and (Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'touch') "$($r.Code) $($r.Out) / seen as: $(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })"
