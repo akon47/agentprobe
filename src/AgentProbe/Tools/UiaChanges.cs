@@ -143,11 +143,12 @@ internal static unsafe partial class UiaTools
     /// <summary>
     /// For the tools that send raw input (click, touch, key, type, drag, scroll): the look before. One thread
     /// connects to UI Automation, takes this look, waits while the caller sends its input, and then takes the look
-    /// after (<see cref="Report"/>) before it disconnects. So the connection is neither dropped right before the
-    /// input nor made right after it. With a connection of its own for each look, `touch tap` on the build
-    /// machine reached a button without pressing it in two runs of three (its mouse-down arrived, its click
-    /// did not), while `ui tap`, which taps while connected, pressed it every time. Why is not known; this is
-    /// the order that worked.
+    /// after (<see cref="Report"/>) before it disconnects: one connection for both looks, neither dropped
+    /// right before the input nor made right after it.
+    /// Touch is the exception to "an action looks by itself": the first touch input of a logon session, sent
+    /// with these two looks around it, reached a button on the build machine without pressing it (its
+    /// mouse-down arrived, its click did not) in four runs of five; the same tap without the looks, and a
+    /// second tap with them, pressed it. Why is not known, so `touch` and `ui tap` look only with --watch.
     /// </summary>
     public static UiWatch Watch(nint hwnd)
     {

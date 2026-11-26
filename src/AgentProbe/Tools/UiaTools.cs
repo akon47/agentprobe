@@ -51,6 +51,9 @@ internal static unsafe partial class UiaTools
                  window that reads differently, the program ending. "no change seen" is an answer too. So there
                  is no need to follow an action with `windows`, `ui` or a screenshot to see its effect; what
                  happens later than about a second is for `wait --ui` / `expect`. --no-watch leaves that out.
+                 tap and dtap do it only with --watch: the first touch input of a logon session, sent while
+                 agentprobe looked at the window before and after it, reached a button on the build machine
+                 without pressing it (later ones did press). Why is not known, so touch does not look unless asked.
             ui click <name|#id> [--window W] [--nth N] [--mouse]   press a button / select an item (falls back to a mouse click on it)
             ui rclick <name|#id> [--window W]    right-click it (opens its context menu; `windows` then shows a popup)
             ui dblclick <name|#id> [--window W]  double-click it
@@ -452,7 +455,7 @@ internal static unsafe partial class UiaTools
 
     private static Task<int> UiAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "all", "class", "mouse", "pos", "items", "diff", "no-watch");
+        var a = ArgParser.Parse(args, "all", "class", "mouse", "pos", "items", "diff", "no-watch", "watch");
         var verb = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "";
         var isAction = verb is "click" or "rclick" or "dblclick" or "tap" or "dtap" or "set" or "get";
         var withClass = a.Flag("class") || verb == "get" || a.Has("at");
@@ -508,7 +511,9 @@ internal static unsafe partial class UiaTools
             try
             {
                 _mouseOnly = a.Flag("mouse");
-                if (isAction) return Act(ctx, verb, a.Positionals, nodes, nth, hwnd, title, nodes.Count >= walkLimit ? walkLimit : 0, automation, !a.Flag("no-watch"));
+                // Touch looks at the screen only when asked to (see the note in the usage text).
+                var watch = verb is "tap" or "dtap" ? a.Flag("watch") : !a.Flag("no-watch");
+                if (isAction) return Act(ctx, verb, a.Positionals, nodes, nth, hwnd, title, nodes.Count >= walkLimit ? walkLimit : 0, automation, watch);
                 var entries = grep == null ? new List<UiEntry>() : null;
                 var listing = Render(nodes, title, grep, a.Flag("all"), max, walkLimit, deeper, a.Flag("items"), entries);
                 if (entries == null) return (0, listing);

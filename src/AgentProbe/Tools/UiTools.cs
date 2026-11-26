@@ -81,7 +81,7 @@ internal static partial class UiTools
               The answer also says what changed on the screen in the moment after the click (a window that
               opened, with its text; one that closed; controls of that window that read differently), so no
               `windows`, `ui` or screenshot is needed to see its effect; --no-watch leaves that out. The
-              same goes for touch, drag, scroll, type and key.
+              same goes for drag, scroll, type and key (touch: only with --watch).
               --screen means raw desktop coordinates instead. Windows of elevated apps ignore input unless
               agentprobe itself runs elevated on the target.
             """, ClickAsync),
@@ -99,6 +99,11 @@ internal static partial class UiTools
               ui dtap <name>. A gesture is one command because its timing matters: two `touch tap` calls are
               seconds apart and never a double tap.
               Windows shows its touch feedback at the point, and hides the mouse pointer until the mouse moves.
+              --watch adds what changed on the screen in the moment after, as `click` does by itself. It is
+              not the default for touch: the first touch input of a logon session, sent while agentprobe
+              looked at the window before and after it, reached a button on the build machine without
+              pressing it (later ones did press). Why is not known. Check a touch's effect with `expect`,
+              `ui get` or `ui <window> --diff`.
             """, TouchAsync),
         new("drag", "Desktop", "Drag from one position to another", "drag <x1> <y1> <x2> <y2> [--screen]", DragAsync),
         new("scroll", "Desktop", "Turn the mouse wheel", "scroll <notches> [x y]     positive = up, negative = down", ScrollAsync),
@@ -1196,7 +1201,7 @@ internal static partial class UiTools
 
     private static async Task<int> TouchAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "screen", "raise", "no-watch");
+        var a = ArgParser.Parse(args, "screen", "raise", "watch");
         var verb = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "";
         if (verb is not ("tap" or "dtap" or "hold" or "drag")) return ctx.Fail("touch: tap, dtap, hold or drag? e.g. touch tap 640 400   (see `help touch`)");
         a.Positionals.RemoveAt(0);
@@ -1223,7 +1228,7 @@ internal static partial class UiTools
         if (path.Count > 1 && IsOwnWindow(RootAt(path[^1].x, path[^1].y))) return ctx.Fail($"touch: {path[^1].x},{path[^1].y}, where the drag would end, is on agentprobe's own window on the target; nothing was done.");
         var onWhat = Describe(RootAt(path[0].x, path[0].y));
         var blocked = DisabledWindowAt(path[0].x, path[0].y);
-        var watch = await WatchAsync(a.Flag("no-watch"), RootAt(path[0].x, path[0].y));
+        var watch = await WatchAsync(!a.Flag("watch"), RootAt(path[0].x, path[0].y)); // only when asked: see the usage text
         var failure = await Task.Run(() => verb == "dtap" ? TouchTaps(path[0].x, path[0].y, 2, ctx.Ct) : TouchGesture(path, duration, ctx.Ct), ctx.Ct);
         if (failure != null)
         {
