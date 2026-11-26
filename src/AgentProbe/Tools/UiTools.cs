@@ -1225,7 +1225,12 @@ internal static partial class UiTools
         var blocked = DisabledWindowAt(path[0].x, path[0].y);
         var watch = await WatchAsync(a.Flag("no-watch"), RootAt(path[0].x, path[0].y));
         var failure = await Task.Run(() => verb == "dtap" ? TouchTaps(path[0].x, path[0].y, 2, ctx.Ct) : TouchGesture(path, duration, ctx.Ct), ctx.Ct);
-        if (failure != null) return ctx.Fail("touch: " + failure);
+        if (failure != null)
+        {
+            UiaTools.Drop(watch);
+            return ctx.Fail("touch: " + failure);
+        }
+
 
         var where = $"{path[0].x},{path[0].y}";
         ctx.Runtime.Audit.Write(verb switch
@@ -1346,6 +1351,7 @@ internal static partial class UiTools
             // this is typing, and none of it may land there.
             if (StopTyping(ctx) is { } stop)
             {
+                UiaTools.Drop(watch);
                 ctx.Runtime.Audit.Write($"type stopped after {typed} of {text.Length} characters");
                 return ctx.Fail($"type: stopped after {typed} of {text.Length} characters: {stop}");
             }
@@ -1422,6 +1428,7 @@ internal static partial class UiTools
         {
             if (StopTyping(ctx) is { } stop)
             {
+                UiaTools.Drop(watch);
                 ctx.Runtime.Audit.Write("key " + string.Join(' ', args.Take(pressed)) + $" (stopped after {pressed} of {combos.Count})");
                 return ctx.Fail($"key: stopped after {pressed} of {combos.Count}: {stop}");
             }

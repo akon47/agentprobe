@@ -723,7 +723,7 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
         $px = $Matches[1]; $py = $Matches[2]
         Remove-Item $clickFile, $touchFile -ErrorAction SilentlyContinue
         [void](AP -t local click "@$px,$py"); Start-Sleep -Milliseconds 400
-        Check 'the test window tells mouse from touch: a mouse click is seen as mouse' ((Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'mouse') "$(if (Test-Path $touchFile) { Get-Content $touchFile -Raw })"
+        Check 'the test window tells mouse from touch: a mouse click is seen as mouse, and it presses the button' ((Get-Content $touchFile -Raw -ErrorAction SilentlyContinue) -eq 'mouse' -and (Test-Path $clickFile)) "$(if (Test-Path $touchFile) { Get-Content $touchFile -Raw }) / pressed: $(Test-Path $clickFile)"
         # A WPF ToggleButton offers only "toggle", which would flip its state without the app's click handler running.
         Remove-Item $toggleFile -ErrorAction SilentlyContinue
         [void](AP -t local focus 'ApWpf'); Start-Sleep -Milliseconds 400

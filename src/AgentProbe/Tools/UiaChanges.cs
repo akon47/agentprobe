@@ -21,6 +21,13 @@ internal sealed class UiWatch
     public bool ControlsCut;
     public string WhyNoControls = "";
     public string? SkipKey;
+
+    // For the tools that send raw input: the thread that took this look stays connected to UI Automation until
+    // it has also taken the look after (see UiaTools.Watch). Null when that thread is not there.
+    public ManualResetEventSlim? Go;
+    public ManualResetEventSlim? Done;
+    public volatile bool Abandoned;
+    public volatile string? Result;
 }
 
 /// <summary>
@@ -133,28 +140,78 @@ internal static unsafe partial class UiaTools
         return watch;
     }
 
-    /// <summary>For the tools that send raw input (click, touch, key, type, drag, scroll): the look before, on a thread of its own.</summary>
+    /// <summary>
+    /// For the tools that send raw input (click, touch, key, type, drag, scroll): the look before. One thread
+    /// connects to UI Automation, takes this look, waits while the caller sends its input, and then takes the look
+    /// after (<see cref="Report"/>) before it disconnects. So the connection is neither dropped right before the
+    /// input nor made right after it. With a connection of its own for each look, `touch tap` on the build
+    /// machine reached a button without pressing it in two runs of three (its mouse-down arrived, its click
+    /// did not), while `ui tap`, which taps while connected, pressed it every time. Why is not known; this is
+    /// the order that worked.
+    /// </summary>
     public static UiWatch Watch(nint hwnd)
     {
         UiWatch? watch = null;
-        OnComThread(automation =>
+        var ready = new ManualResetEventSlim();
+        var go = new ManualResetEventSlim();
+        var done = new ManualResetEventSlim();
+        var gaveUp = false;
+        var thread = new Thread(() =>
         {
-            watch = Before(automation, hwnd);
-            return (0, "");
-        }, 6);
-        return watch ?? Before(0, hwnd); // UI Automation did not answer in time: the windows are still compared
+            CoInitializeEx(0, 0); // multithreaded apartment
+            nint automation = 0;
+            UiWatch? mine = null;
+            try
+            {
+                var clsid = ClsidAutomation;
+                var iid = IidAutomation;
+                if (CoCreateInstance(&clsid, 0, 1, &iid, &automation) < 0) automation = 0;
+                mine = Before(automation, hwnd);
+                (mine.Go, mine.Done) = (go, done);
+                watch = mine;
+                ready.Set();
+                if (Volatile.Read(ref gaveUp) || !go.Wait(TimeSpan.FromMinutes(3)) || mine.Abandoned) return;
+                mine.Result = Changes(automation, mine);
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                if (mine != null) mine.Result = "what changed on the screen was not determined: " + ex.Message;
+            }
+            finally
+            {
+                done.Set();
+                Release(automation);
+                CoUninitialize();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "uia-watch",
+        };
+        thread.Start();
+        if (ready.Wait(TimeSpan.FromSeconds(6)) && watch is { } taken) return taken;
+
+        // UI Automation did not answer in time (a busy or hung window): the windows are still compared, here.
+        Volatile.Write(ref gaveUp, true);
+        return Before(0, hwnd);
     }
 
     /// <summary>The look after, as the lines to add to the action's answer.</summary>
     public static string Report(UiWatch watch)
     {
-        string? text = null;
-        OnComThread(automation =>
-        {
-            text = Changes(automation, watch);
-            return (0, "");
-        }, 12);
-        return text ?? Changes(0, watch);
+        if (watch.Go == null || watch.Done == null) return Changes(0, watch);
+        watch.Go.Set();
+        return watch.Done.Wait(TimeSpan.FromSeconds(20)) && watch.Result is { } text
+            ? text
+            : "what changed on the screen was not determined: UI Automation did not answer in time (`windows` shows whether the window stopped responding)";
+    }
+
+    /// <summary>The input was not sent after all: lets the thread that waits for it go.</summary>
+    public static void Drop(UiWatch? watch)
+    {
+        if (watch?.Go == null) return;
+        watch.Abandoned = true;
+        watch.Go.Set();
     }
 
     /// <summary>Waits for the screen to settle (up to 1.5 s), then says what is different from <paramref name="watch"/>.</summary>
