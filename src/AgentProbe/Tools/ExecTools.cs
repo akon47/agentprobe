@@ -422,7 +422,7 @@ internal static class ExecTools
     [
         new("exec", "Run", "Run a command (PowerShell by default) and wait for it",
             """
-            exec [--shell powershell|pwsh|ps32|cmd] [--cwd DIR] [--timeout 60s] [--quiet-ok] <command>
+            exec [--shell powershell|pwsh|ps32|cmd] [--cwd DIR] [--timeout 60s] [--quiet-ok] [--no-fold] <command>
             exec -f local-script.ps1 [args] send a local script file and run it; what follows the file name goes
                                             to the script (its param block works): exec -f t.ps1 -Port 8080 -Fast
                                             Put --shell/--cwd/--timeout before -f; write -- before script arguments
@@ -432,7 +432,9 @@ internal static class ExecTools
               Default folder is the session workspace (where relative `push` paths land).
               Runs as the logged-on user in their desktop session, so GUI apps you launch are visible.
               --shell ps32 is the 32-bit PowerShell (what a 32-bit app sees: SysWOW64, WOW6432Node).
-              Trailing spaces and runs of blank lines are removed from the output.
+              Trailing spaces and runs of blank lines are removed from the output. The same PowerShell error from
+              the same place of the script, three times or more, is printed once with how many more came and the
+              last one's message; --no-fold prints each.
               --quiet-ok   for a command whose output only matters when it fails (a build, an installer, a test
                            run): exit code 0 prints its last 5 lines and where the whole output was saved on
                            the developer PC; any other exit code prints the output as usual.
@@ -487,7 +489,7 @@ internal static class ExecTools
     {
         // The CLI puts the command text in --script. With --as-file it is a whole script file (-f or stdin) and the
         // words after -- are that script's arguments.
-        var a = ArgParser.Parse(args, "as-file");
+        var a = ArgParser.Parse(args, "as-file", "no-fold");
         var command = a.Get("script") ?? string.Join(' ', a.Positionals);
         if (string.IsNullOrWhiteSpace(command)) return ctx.Fail("exec: no command given.");
 
@@ -521,6 +523,7 @@ internal static class ExecTools
                 else ctx.Out.Write(squeeze.Apply(text));
             }, a.GetDuration("timeout"), ctx.Ct, onStarted: process => started = process.Id, onNote: n => notes.Append(n));
             var errorText = PsErrors.ToPlainText(stderr.ToString());
+            if (!a.Flag("no-fold")) errorText = PsErrors.FoldRepeats(errorText);
             if (errorText.Length > 0) ctx.Err.Write(new Squeezer().Apply(errorText));
             if (notes.Length > 0) ctx.Err.Write(notes.ToString()); // after the error text: PowerShell's error format would swallow it
 
@@ -858,6 +861,65 @@ internal static class PsErrors
         var lines = sb.ToString().Replace("\r\n", "\n").Split('\n')
             .Where(l => !l.TrimStart().StartsWith("+ ~", StringComparison.Ordinal) && !l.TrimStart().StartsWith("+ CategoryInfo", StringComparison.Ordinal));
         return string.Join('\n', lines).TrimEnd() + "\n";
+    }
+
+    /// <summary>
+    /// The same error from the same place of a script, over and over (a loop in which one step fails), is printed
+    /// once, followed by a line that says how many more came and gives the last one's message. An error record is
+    /// the lines up to "+ FullyQualifiedErrorId : ..."; it is the same error when that line, the position line and
+    /// the quoted code are the same (the message may name a different file each time).
+    /// </summary>
+    public static string FoldRepeats(string text)
+    {
+        var lines = text.Replace("\r\n", "\n").Split('\n');
+        var records = new List<(int from, int to, string key, string message)>();
+        var start = 0;
+        for (var i = 0; i < lines.Length; i++)
+        {
+            if (!lines[i].TrimStart().StartsWith("+ FullyQualifiedErrorId", StringComparison.Ordinal)) continue;
+            var firstPlus = i;
+            while (firstPlus - 1 >= start && lines[firstPlus - 1].TrimStart().StartsWith('+')) firstPlus--;
+            var position = firstPlus - 1; // "At line:2 char:32" in the PC's language
+            if (position < start)
+            {
+                start = i + 1;
+                continue;
+            }
+
+            // At most a few lines of message before the position: anything earlier stays outside the record.
+            var from = position;
+            while (from - 1 >= start && position - from < 4 && lines[from - 1].Trim().Length > 0) from--;
+            var key = lines[position].Trim() + "\n" + string.Join("\n", lines[firstPlus..(i + 1)].Where(l => !l.TrimStart().StartsWith("+ CategoryInfo", StringComparison.Ordinal)).Select(l => l.Trim()));
+            records.Add((from, i, key, string.Join(" ", lines[from..position].Select(l => l.Trim()))));
+            start = i + 1;
+        }
+
+        var groups = records.GroupBy(r => r.key).Where(g => g.Count() >= 3).ToDictionary(g => g.Key, g => g.ToList());
+        if (groups.Count == 0) return text;
+        var drop = new HashSet<int>();
+        var after = new Dictionary<int, string>();
+        foreach (var (_, list) in groups)
+        {
+            foreach (var r in list.Skip(1))
+                for (var i = r.from; i <= r.to; i++) drop.Add(i);
+            after[list[0].to] = $"[the same error from the same place came {list.Count - 1} more times (x{list.Count} in all); the last one: {Util.Format.Clip(list[^1].message, 200).TrimEnd('.')}. exec --no-fold prints each]";
+        }
+
+        var sb = new StringBuilder();
+        for (var i = 0; i < lines.Length; i++)
+        {
+            if (drop.Contains(i))
+            {
+                if (i + 1 < lines.Length && lines[i + 1].Trim().Length == 0) i++; // and the blank line after it
+                continue;
+            }
+
+            sb.Append(lines[i]);
+            if (i < lines.Length - 1) sb.Append('\n');
+            if (after.TryGetValue(i, out var note)) sb.Append(note).Append('\n');
+        }
+
+        return sb.ToString();
     }
 }
 

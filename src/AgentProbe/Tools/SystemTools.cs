@@ -219,6 +219,10 @@ internal static partial class SystemTools
         var up = Uptime();
         o.WriteLine($"host     {Environment.MachineName}  user {Environment.UserDomainName}\\{Environment.UserName}  agentprobe runs {(Environment.IsPrivilegedProcess ? "elevated (administrator)" : "as standard user")}");
         o.WriteLine($"os       {product} {display} build {build} {RuntimeInformation.OSArchitecture.ToString().ToLowerInvariant()}  up {Format.Duration(up)} (boot {Format.Time(DateTime.UtcNow - up)}){(PendingReboot() ? "  ! reboot pending" : "")}");
+        var startKind = BootHistory.CurrentStartKind();
+        var wake = BootHistory.WakeUpType();
+        if (startKind != null || wake != null)
+            o.WriteLine($"boot     {startKind ?? "kind of start not in the log"}; started by: {wake ?? "not reported"} (the firmware's SMBIOS wake-up type, for this start only)");
         o.WriteLine($"machine  {bios?.GetValue("SystemManufacturer")} {bios?.GetValue("SystemProductName")}  bios {bios?.GetValue("BIOSVersion")}");
         o.WriteLine($"cpu      {(cpu?.GetValue("ProcessorNameString") as string)?.Trim()}  {Environment.ProcessorCount} logical");
         o.WriteLine($"ram      {Format.Bytes((long)m.ullTotalPhys)} total, {Format.Bytes((long)m.ullAvailPhys)} available ({m.dwMemoryLoad}% used)");
@@ -365,10 +369,14 @@ internal static partial class SystemTools
         var secure = SystemPrompts.SecureDesktopShowing();
         if (secure) o.WriteLine("prompt   the secure desktop is showing (a UAC prompt, the lock screen or Ctrl+Alt+Del)");
         if (prompts.Count > 0 || secure) findings.Add("a system dialog is waiting on the screen (firewall, UAC, credentials, a file picker): the person at the PC has to answer it before what caused it continues. " + SystemPrompts.Effect);
-        if (PendingReboot())
+        var pendingReboot = PendingReboot();
+        if (pendingReboot) o.WriteLine("reboot   a restart is pending (updates/installers)");
+
+        // Resets, power losses and blue screens leave no application crash: they show only in the System log.
+        if (BootHistory.TriageLine(out var resetFinding) is { } resets)
         {
-            o.WriteLine("reboot   a restart is pending (updates/installers)");
-            findings.Add("pending reboot can explain odd installer/driver behavior");
+            o.WriteLine(resets);
+            findings.Add(resetFinding!);
         }
 
         var crashes = EventTools.Crashes(TimeSpan.FromHours(24), 5);
@@ -425,6 +433,8 @@ internal static partial class SystemTools
             }
         }
 
+        // The weakest lead goes last: with anything else found it is rarely the cause.
+        if (pendingReboot) findings.Add("pending reboot can explain odd installer/driver behavior");
         o.WriteLine();
         o.WriteLine(findings.Count == 0 ? "no obvious system-level problem. Next: `proc <name>`, `events`, `crashes`, or start a `watch`." : "next:\n  - " + string.Join("\n  - ", findings));
         return 0;
@@ -502,7 +512,9 @@ internal static partial class SystemTools
 
     // ------------------------------------------------------------------ svc
 
-    private static unsafe List<(string name, string display, uint state, uint pid)> Services()
+    /// <param name="type">SERVICE_WIN32 (0x30) by default; SERVICE_DRIVER (0x0B) for kernel and file system drivers.</param>
+    /// <param name="state">1 running, 2 stopped, 3 both.</param>
+    internal static unsafe List<(string name, string display, uint state, uint pid)> Services(uint type = 0x30, uint state = 3)
     {
         var list = new List<(string, string, uint, uint)>();
         var scm = Win32.OpenSCManager(null, null, 0x0004); // ENUMERATE_SERVICE
@@ -510,11 +522,11 @@ internal static partial class SystemTools
         try
         {
             uint resume = 0;
-            Win32.EnumServicesStatusEx(scm, 0, 0x30, 3, null, 0, out var needed, out _, ref resume, null);
+            Win32.EnumServicesStatusEx(scm, 0, type, state, null, 0, out var needed, out _, ref resume, null);
             var buffer = new byte[needed + 4096];
             fixed (byte* b = buffer)
             {
-                if (!Win32.EnumServicesStatusEx(scm, 0, 0x30, 3, b, (uint)buffer.Length, out _, out var count, ref resume, null)) return list;
+                if (!Win32.EnumServicesStatusEx(scm, 0, type, state, b, (uint)buffer.Length, out _, out var count, ref resume, null)) return list;
                 for (var i = 0; i < count; i++)
                 {
                     var e = b + (i * 56); // ENUM_SERVICE_STATUS_PROCESSW on x64

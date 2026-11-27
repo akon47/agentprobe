@@ -139,7 +139,6 @@ internal static partial class Home
             Update = facts.Update;
             Other = facts.Other;
             Title = $"agentprobe {AppInfo.Version}  -  " + Lang.T("developer PC", "개발 PC") + $" \"{Environment.MachineName}\"";
-            Instructions = $"To debug or test on the remote Windows PC, use the agentprobe CLI: {command}. Run `{command} guide` first.";
             ClaudeMcp = $"claude mcp add agentprobe -- \"{exe}\" mcp";
             CodexMcp = $"codex mcp add agentprobe -- \"{exe}\" mcp";
             Chat = Lang.T(
@@ -148,10 +147,9 @@ internal static partial class Home
             Give = Lang.T(
                 "Give your AI agent ONE of these. It is the same for Claude Code, Codex and others.",
                 "아래 중 하나를 AI 에이전트에게 주세요. Claude Code, Codex 등 어떤 에이전트든 같습니다.");
-            InstructionsLabel = Lang.T("A line for its instructions file (CLAUDE.md, AGENTS.md, ...)", "지침 파일(CLAUDE.md, AGENTS.md 등)에 넣을 한 줄");
             ClaudeLabel = Lang.T("Register as an MCP server in Claude Code (then restart the agent)", "Claude Code에 MCP 서버로 등록 (등록 후 에이전트 다시 시작)");
             CodexLabel = Lang.T("Register as an MCP server in Codex (then restart the agent)", "Codex에 MCP 서버로 등록 (등록 후 에이전트 다시 시작)");
-            ChatLabel = Lang.T("Or just say it in the chat", "또는 대화에서 바로 말하기");
+            ChatLabel = Lang.T("Paste this into the chat, then say what to look into", "대화에 이 문구를 붙여 넣고, 조사할 내용을 이어서 쓰기");
             TargetHow = Lang.T(
                 $"On the PC to test: run this exe, pick \"Share this PC\", then allow \"{Environment.MachineName}\" (key {facts.Key}).",
                 $"테스트할 PC에서: 이 exe 실행, \"이 PC 공유\" 선택, \"{Environment.MachineName}\" 허용 (키 {facts.Key})");
@@ -180,8 +178,6 @@ internal static partial class Home
 
         public string Title { get; }
 
-        public string Instructions { get; }
-
         public string ClaudeMcp { get; }
 
         public string CodexMcp { get; }
@@ -189,8 +185,6 @@ internal static partial class Home
         public string Chat { get; }
 
         public string Give { get; }
-
-        public string InstructionsLabel { get; }
 
         public string ClaudeLabel { get; }
 
@@ -216,17 +210,14 @@ internal static partial class Home
         o.WriteLine();
         o.WriteLine("  " + c.Give);
         o.WriteLine();
-        o.WriteLine("  1. " + c.InstructionsLabel);
-        o.WriteLine("    " + c.Instructions);
+        o.WriteLine("  1. " + c.ChatLabel);
+        o.WriteLine("    " + c.Chat);
         o.WriteLine();
         o.WriteLine("  2. " + c.ClaudeLabel);
         o.WriteLine("    " + c.ClaudeMcp);
         o.WriteLine();
         o.WriteLine("  3. " + c.CodexLabel);
         o.WriteLine("    " + c.CodexMcp);
-        o.WriteLine();
-        o.WriteLine("  4. " + c.ChatLabel);
-        o.WriteLine("    " + c.Chat);
         o.WriteLine();
         o.WriteLine("  " + c.TargetHow);
         o.WriteLine("  " + c.TargetManual);
@@ -370,10 +361,9 @@ internal static partial class Home
             }
 
             blocks.Add(new Block(Lang.T("For your AI agent: one of these, click to copy", "AI 에이전트에게 줄 것: 하나를 클릭해 복사"), 2));
-            Item(Lang.T("A line for its instructions file (CLAUDE.md, AGENTS.md)", "지침 파일에 넣을 한 줄 (CLAUDE.md, AGENTS.md)"), () => CopyItem(_c.Instructions));
+            Item(Lang.T("A prompt to paste into a chat", "대화에 붙여 넣을 문구"), () => CopyItem(_c.Chat));
             Item(Lang.T("The command that registers MCP in Claude Code", "Claude Code에 MCP를 등록하는 명령"), () => CopyItem(_c.ClaudeMcp));
             Item(Lang.T("The command that registers MCP in Codex", "Codex에 MCP를 등록하는 명령"), () => CopyItem(_c.CodexMcp));
-            Item(Lang.T("A prompt to paste into a chat", "대화에 붙여 넣을 문구"), () => CopyItem(_c.Chat));
             blocks.Add(new Block(""));
             blocks.Add(new Block(Lang.T("This PC", "이 PC"), 2));
             Item(Lang.T("Open the dashboard", "대시보드 열기"), () =>

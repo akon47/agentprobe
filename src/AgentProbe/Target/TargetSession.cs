@@ -118,7 +118,7 @@ internal sealed class TargetSession(SecureChannel channel, TargetRuntime runtime
         if (!background)
         {
             await TrySendAsync(new Msg { Type = "started", Id = m.Id, Code = record.No });
-            if (!tool.IsQuiet(args)) runtime.Audit.Write($"#{record.No} {Format.Clip(record.CommandLine, 300)}");
+            if (!tool.IsQuiet(args)) runtime.Audit.Write($"#{record.No} {Format.Clip(record.CommandLine, 300)}", record.CommandLine);
             activity(Format.Clip(record.CommandLine, 70));
         }
 

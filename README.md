@@ -63,15 +63,15 @@ agentprobe guide                        # the playbook an AI agent should read f
 ```
 
 It is a plain command-line tool, so **any agent that can run a shell command can use it**: Claude Code, Codex,
-Gemini CLI, Cursor and others. There is nothing to register. Add one line to the instructions file your agent reads
-(`CLAUDE.md`, `AGENTS.md`, ...):
+Gemini CLI, Cursor and others. There is nothing to register. Start the session by telling it, and add what to look
+into:
 
-```markdown
-To debug or test on the remote Windows PC, use the `agentprobe` CLI. Run `agentprobe guide` first.
+```text
+A Windows PC is shared with this machine through agentprobe. Run `agentprobe guide` and `agentprobe list`, then use that CLI to investigate: ...
 ```
 
 There is one guide for every agent, and it is built into the exe: `agentprobe guide` prints it, and the dashboard's
-**Connect an agent** button shows it together with the line to copy. People use the same commands in a terminal, or
+**Connect an agent** button shows it together with the prompt to copy. People use the same commands in a terminal, or
 the dashboard below.
 
 ### MCP, if your agent is set up that way
@@ -144,14 +144,14 @@ behind a router or on a larger VPN is not found that way; start it with the addr
 | Area | Commands |
 |---|---|
 | Run | `exec` (PowerShell, pwsh, 32-bit PowerShell, cmd; `exec -f script.ps1 -Arg value` sends a script with its arguments), `start` / `jobs` / `logs` / `kill` background jobs (`start --exe app.exe` tracks a GUI app itself, `start --lnk` starts what a shortcut starts, `--env NAME=VALUE` sets its environment, `--replace MyApp.exe` first closes the running one; `exec --quiet-ok` prints only the last lines of a command that succeeded), `wait` for a process, window, port, file, log line, idle CPU or a control of a window, `expect` (the same conditions as a one-line assertion), `run` (a file of commands as one command: quiet when all went well, the failed step with evidence when not) |
-| Files | `push`, `pull` (files and folders), `ls`, `read` (tail, grep, line ranges, a time span of a log, only-new; repeated log lines folded), `stat` (version, x86/x64, .NET or native, SHA-256, blocked-download flag, what a shortcut starts), `locks` (who holds a file open) |
-| First look | `triage`: load, hung windows, recent crashes and errors, low disk, pending reboot, and what to try next; for an app that is not running, where it is installed and how to start it |
+| Files | `push`, `pull` (files and folders), `ls`, `read` (tail, grep, line ranges, a time span of a log, only-new; repeated log lines folded), `stat` (version, x86/x64, .NET or native, SHA-256, blocked-download flag, what a shortcut starts; `--strings` finds the text inside a binary, a .NET build's string literals included: can this build write that log line?), `locks` (who holds a file open) |
+| First look | `triage`: load, hung windows, recent crashes and errors, unexpected shutdowns, low disk, pending reboot, and what to try next; for an app that is not running, where it is installed and how to start it |
 | Processes | `ps`, `top`, `proc`, `threads` (CPU per thread, wait reason, name, creation time, start module; threads per name), `stacks` (call stacks of a live process, identical ones grouped), `modules` (loaded DLLs, versions, paths), `handles` (by type, and what grew), `vmmap` (which kind of memory grows: heaps, stacks, images, mapped files), `heap` (.NET objects by type, only the reachable ones on request, the window objects that are still alive and how many of them are shown, the chain of references that keeps one alive, and the values in an object's fields; read on the tested PC from a snapshot), `dump` (small or full memory dump, fetched to your PC or kept there) |
-| System | `sys` (OS build, hardware, locale, GPU drivers, displays, .NET / VC++ runtimes), `mem` (commit, pools, standby lists, biggest consumers), `net` (listeners, connections per process, reachability checks), `svc`, `reg`, `firewall` (allow a program you pushed to accept connections for the session, or close the Windows Firewall prompt, once or for the whole session; lists and removes the rules Windows keeps afterwards) |
+| System | `sys` (OS build, hardware, locale, GPU drivers, displays, .NET / VC++ runtimes, what started the PC), `mem` (commit, pools, standby lists, biggest consumers), `drivers` (kernel drivers that run, with version, company and date), `devices` (problem codes, driver, PCIe link speed and width, when a device came and went), `sensors` (disk temperatures, thermal zones, CPU throttling, power; and what cannot be read without a vendor driver), `net` (listeners, connections per process, reachability checks), `svc`, `reg`, `firewall` (allow a program you pushed to accept connections for the session, or close the Windows Firewall prompt, once or for the whole session; lists and removes the rules Windows keeps afterwards) |
 | Why only there? | `compare <pc> local` (differences in OS, drivers, runtimes, environment, PATH, installed programs, services, files), `envsnap --save/--diff` (what an installer or update changed), `deps` (missing DLLs, x86/x64 mismatch, missing exports, missing .NET runtime, and for a .NET app what its host needs: its DLL, `.deps.json` and the files that lists; `deps --run` starts it once with the host's tracing on and says why the host gave up) |
-| Logs | `events` (Windows event logs, filtered and de-duplicated), `crashes` (faulting module, exception code, dump files, blue screens), `dbg` (OutputDebugString capture, like DebugView) |
+| Logs | `events` (Windows event logs, filtered and de-duplicated, with the events' own fields on request; every log at once around given moments), `crashes` (faulting module, exception code, dump files; `--system` for blue screens and resets: what was recorded, whether a dump could have been written, and what that is consistent with), `boots` (every start of Windows and how it ended: shut down by whom, or unexpectedly, with the last-alive time), `dbg` (OutputDebugString capture, like DebugView) |
 | Monitor | `watch`: per-process private bytes, handles, GDI/USER objects, threads and CPU with growth rates and a leak verdict; start/exit of the watched processes and of what they start, with decoded exit codes; any crash; windows that stop responding. The noise of Windows starting its own helpers is counted, not listed |
-| Capture | `trace` (which file and registry accesses FAIL for a process, counted and grouped: Process Monitor's most useful view as a short table), `crashdumps on` (Windows saves a dump whenever the app crashes), `wpr start/stop` (Windows Performance Recorder traces: CPU, disk, file, registry, heap) |
+| Capture | `trace` (which file and registry accesses FAIL for a process, counted and grouped: Process Monitor's most useful view as a short table), `crashdumps on` (Windows saves a dump whenever the app crashes; `--no-autoreboot` keeps a blue screen on the screen), `wpr start/stop` (Windows Performance Recorder traces: CPU, disk, file, registry, heap) |
 | Desktop | `ui` (a window's controls as text with their state: selected, checked, expanded, scroll position, slider value; click, tap, read and fill them by name, and each action says what changed on the screen; `--diff` for what changed since the last look, `--pos` for coordinates; `ui --at @x,y` for what is at a point), `windows` (also flags a Windows prompt waiting for the person: firewall, UAC, credentials; and open menus), `screenshot` (screen, display, or one window drawn by itself so that nothing in front hides it, scaled; one control or a region; only what changed; or numbers instead of a picture), `click` (names the window that got the click, and refuses when another window is in front of the one you name), `touch` (tap, double tap, press and hold, drag as a finger does, also on a PC without a touch screen), `drag`, `scroll`, `type`, `key`, `focus` |
 | Session | `list` (what each PC is doing, since when it is connected, whether the person there has paused it), `dashboard`, `name`, `history` (with how much each command wrote), `result`, `reboot --wait`, `end` |
 
@@ -208,9 +208,8 @@ Double-clicking the exe asks which side this PC is: `1` shares it for testing, `
 the start screen. Enter takes what the PC was last time (a PC that has been a developer PC stays one; any other PC
 is shared). `agentprobe share` and `agentprobe home` go there without the question.
 
-The start screen is a short list of lines to click. Four of them copy what an agent needs: the one line for its
-instructions file, the `claude mcp add` / `codex mcp add` commands with this exe's path already filled in, and a
-prompt to paste into a chat. The others open the dashboard, list the connected PCs, share this PC, run the one-time
+The start screen is a short list of lines to click. Three of them copy what an agent needs: the prompt to paste
+into a chat, and the `claude mcp add` / `codex mcp add` commands, with this exe's path already filled in. The others open the dashboard, list the connected PCs, share this PC, run the one-time
 setup and, when there is one, install an update. Click a line or press its number (lines highlight under the mouse);
 the PCs that are connected are listed live. A command line stays at the bottom of the window: type `list`, `help` or `-t <name> triage` there instead
 of opening another terminal. It adapts to the window size and works in Windows Terminal and in the classic console,
@@ -276,9 +275,11 @@ agentprobe gives a remote machine command execution on a PC, so the design assum
   The prompt says whose rights are being handed over (and says so loudly when it is administrator rights).
 - **It is always visible.** While a developer PC is connected, a banner sits in the top-left corner of the screen:
   *Remote control active*. It cannot be switched off, locally or remotely. It is excluded from screen capture and
-  click-through, so it does not disturb the app under test. The console window lists each command as it runs.
-- **The person at the PC can say "not now".** Pressing the space bar in agentprobe's window there pauses remote commands until
-  Enter is pressed: every new command is refused and tells the agent why, the session stays. agentprobe's input
+  click-through, so it does not disturb the app under test. agentprobe's window there says at its top who controls the
+  PC and lists each command as it runs; a long one is one line ending in "…" until it is clicked, then it shows in full,
+  a script included.
+- **The person at the PC can say "not now".** Pressing the space bar in agentprobe's window there (or its *Pause* button)
+  pauses remote commands until Enter is pressed: every new command is refused and tells the agent why, the session stays. agentprobe's input
   tools do not act on that window, and typing that is under way stops when it comes to the front.
 - **There is a record.** Every command, file transfer, screenshot and input action is appended to
   `agentprobe-activity.log` next to the exe. There is no remote command to edit or delete that file; `end --remove-exe`
@@ -312,7 +313,7 @@ show what a 32-bit process sees, and `dump` notes the extra step WinDbg needs fo
 - Both PCs on the same network for automatic discovery; otherwise give the address. There is no relay server yet,
   so the tested PC must be able to reach the developer PC directly (LAN or VPN).
 - Commands run with the rights of the user who started agentprobe on the tested PC. A few tools need it started with
-  *Run as administrator*: `wpr`, `crashdumps on`, memory page lists, other users' processes.
+  *Run as administrator*: `wpr`, `crashdumps on` and `--no-autoreboot`, memory page lists, other users' processes, a few event logs.
 - The secure desktop (UAC prompts, the lock screen) cannot be captured or clicked.
 - Language: the dashboard and everything a person reads on the tested PC (approval prompt, banner) come in English
   and Korean and follow the Windows display language; switch in the dashboard, or start with `--lang en|ko`.

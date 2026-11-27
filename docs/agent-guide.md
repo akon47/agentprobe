@@ -53,8 +53,11 @@ This is the short guide. Topics to read when you need them are listed at the end
 | .NET app: how many objects of a type are alive, and what holds them? | `heap <name> --windows`, `heap <name> --live --type "A,B"`, `heap <name> --why <Type>`, `heap <name> --show <Type> --fields a,b` |
 | Which file or registry access fails? | `trace start <name>` ... reproduce ... `trace` (needs an elevated target) |
 | Did it crash? Why? | `crashes`, `events --level error`, `watch` (exit codes), `crashdumps on` before reproducing |
+| Did the PC itself crash, reset or lose power ("a blue screen sometimes")? | `crashes --system`, `boots`, `events --around unexpected --all-logs` (see `guide system`) |
+| Which driver, which device? Is the card there, at what PCIe link? Too hot? | `drivers`, `devices --grep <VEN_xxxx\|name> --long`, `sensors` |
 | What does the app log? | `read <file> --new` / `--grep` / `--between 12:02 12:05`, `dbg` (OutputDebugString), `logs <job>` |
 | Which DLL version did it load, from where? | `modules <pid> --grep <name>` |
+| Can this installed build write that log line? | `stat <exe or dll> --strings <regex>` |
 | Who holds this file open? | `locks <file>` |
 | Can it reach the server? Who listens on the port? | `net check host:port`, `net --listen`, `net --name <app>` |
 | What did the installer / update change? | `envsnap --save before` ... `envsnap --diff before` (`--dir`, `--reg`) |
@@ -244,7 +247,8 @@ agentprobe wait --idle MyApp --below 25                              # "finished
   *Run as administrator*.
 - Output: a line that comes several times in a row is printed once with its count; `read` (log lines), `logs` and
   `dbg` print lines that differ only in their numbers as the first one plus how many followed and the last one
-  (`--no-fold` prints them all).
+  (`--no-fold` prints them all). The same PowerShell error from the same place of a script (a loop in which one
+  step fails) is printed once with how many more came and the last one's message (`exec --no-fold` prints each).
 
 <!-- topic: firewall | Windows Firewall and other system prompts (UAC, credentials, SmartScreen) that block a test -->
 ## System prompts and the firewall
@@ -267,6 +271,44 @@ question another way it is not reported, so a silent stall after starting a serv
 Connections to 127.0.0.1 work without an answer; once answered, the rule stays for that path. While such a prompt
 is up, the program it is about may not react to mouse input or to requests to close its windows (seen with the
 firewall prompt; `ui click` still worked), so answer or dismiss it before concluding that the app is broken.
+
+<!-- topic: system | the PC as a whole: blue screens, resets and power loss, drivers and devices, temperatures -->
+## Blue screens, resets, drivers and devices
+
+"It shows a blue screen sometimes" is often not a bugcheck: a PC that resets or loses power several times in a row
+starts Windows' Automatic Repair, whose screen is blue too. Find out what the log says before guessing:
+
+```
+agentprobe crashes --system --since 60d     # unexpected ends, bugchecks, dumps, could a dump be written, WHEA, Startup Repair
+agentprobe boots --since 60d --logs 'C:\App\Logs'   # each start: how long it ran, how it ended; the app's last log line
+agentprobe events --around unexpected --since 60d --all-logs   # every log, just before each unexpected end
+agentprobe drivers                          # kernel drivers that are not from Microsoft: version, company, dates
+agentprobe devices --grep VEN_10EE --long   # that card: problem code, location, PCIe link, arrivals and removals, PnP events
+agentprobe sensors                          # disk temperatures, thermal zones, throttling, power
+agentprobe crashdumps --no-autoreboot       # (elevated target) a bugcheck stays on the screen instead of restarting
+```
+
+- An unexpected end has a last-alive time: the last time Windows stamped that it was running. The end came after
+  it and before the next start, which `boots` also gives. Kernel-Power 41 says whether a bugcheck code was recorded
+  and whether the power button was held; `events --id 41 --data` shows all its fields.
+- `crashes --system` ends with what the evidence is consistent with and what it cannot rule out. "No bugcheck, no
+  dump although dumps are set up and could be written" points to a hard reset or a power loss, not to proof of one.
+  `crashdumps --no-autoreboot` settles it: after it, a reset that leaves no blue screen on the display was not a
+  bugcheck. Windows may read that setting only when it starts; it is put back when the session ends, or, if the
+  PC resets first, when agentprobe next starts there.
+- `boots` knows only what the System log still holds (it says how far back that is). The SMBIOS wake-up type in
+  `sys` and `boots` ("power switch", "AC power restored") is the firmware's value for the current start only, and
+  some boards report the same value every time.
+- `events --around TIME[,TIME...]` takes the times `boots` prints (11-24 06:35:22) and answers which (log, provider,
+  id) came up in how many of the windows, the last events of each, and which windows had no event at all.
+  `--provider` accepts a classic source name (BugCheck) and says when a name is not registered on the PC.
+- `drivers` lists drivers that run as a service of their own; one loaded only as a dependency of another is not
+  listed. MODIFIED is the file's date, INF DATE the driver date Device Manager shows. `devices` without options
+  lists only devices with a problem; a device that is unplugged or switched off in the firmware is not present.
+- `sensors` reads what Windows can read without a vendor driver. An ACPI thermal zone is a firmware value and often
+  not the CPU's temperature; voltages and fan speeds are not readable, and the answer says so.
+- Event messages come in English where Windows has the English text (Event Viewer may show the PC's language);
+  the values inside them (a user's name, a reason) are as Windows recorded them.
 
 <!-- topic: sessions | typical sessions step by step: a leak hunt, a crash on start, a reboot in the middle -->
 ## Typical sessions
@@ -331,7 +373,7 @@ enums as numbers. `threads` shows a thread's name only when the app set one that
 native code); .NET Framework names stay empty. `read --between` goes by the time of day at the start of each line
 and knows nothing about dates. `stacks` names internal functions as module+offset unless a PDB is present, and
 cannot walk managed/JIT frames. `trace` says so if events were dropped. `kill --pid` ends that one process; add
-`--tree` to include what it started.
+`--tree` to include what it started. `boots` and `crashes --system` read the System log, which keeps a limited amount: they say how far back it reaches.
 
 <!-- topic: targets | several targets at once, which PC a command goes to, versions and updates -->
 ## Several targets, versions and updates

@@ -304,7 +304,7 @@ internal static class Cli
 
             if (wholeScript && a == "--") break; // the script's arguments start here
 
-            if (a == "--dismiss-firewall" && tool == "start")
+            if ((a == "--dismiss-firewall" && tool == "start") || (a == "--no-fold" && tool == "exec"))
             {
                 options.Add(a);
                 continue;

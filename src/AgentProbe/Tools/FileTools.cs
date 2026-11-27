@@ -50,9 +50,12 @@ internal static partial class FileTools
             """, ReadAsync) { Quiet = true },
         new("stat", "Files", "Facts about a file: version, x86/x64, .NET or native, SHA-256, blocked-from-internet flag",
             """
-            stat <file> [more files...]
+            stat <file> [more files...] [--strings REGEX [--min 5] [--max 40]]
               For a shortcut (.lnk) also what it starts: the target, its arguments and the "Start in" folder
               (`start --lnk <shortcut>` starts exactly that).
+              --strings  the text inside the file that matches: runs of ASCII/UTF-8 and of UTF-16 text, and for a
+                         .NET assembly the string literals of its code (#US, the messages it can log). "Can this
+                         deployed build write that log line?" Each text once, with its offset; the first 256 MB.
             """, StatAsync) { Quiet = true },
         new("locks", "Files", "Which processes keep a file open (why it cannot be deleted/replaced)",
             "locks <file> [more files...]", LocksAsync) { Quiet = true },
@@ -417,9 +420,23 @@ internal static partial class FileTools
 
     private static Task<int> StatAsync(ToolContext ctx, string[] args)
     {
-        if (args.Length == 0) return Task.FromResult(ctx.Fail("stat: which file?"));
+        var a = ArgParser.Parse(args);
+        if (a.Positionals.Count == 0) return Task.FromResult(ctx.Fail("stat: which file?"));
+        System.Text.RegularExpressions.Regex? strings = null;
+        if (a.Get("strings") is { } pattern)
+        {
+            try
+            {
+                strings = new System.Text.RegularExpressions.Regex(pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+            }
+            catch (ArgumentException ex)
+            {
+                return Task.FromResult(ctx.Fail("stat: bad --strings pattern: " + ex.Message));
+            }
+        }
+
         var rc = 0;
-        foreach (var arg in args)
+        foreach (var arg in a.Positionals)
         {
             var path = ctx.Runtime.ResolvePath(arg);
             if (Directory.Exists(path))
@@ -490,9 +507,32 @@ internal static partial class FileTools
             {
                 // no mark
             }
+
+            if (strings != null) WriteStrings(ctx, path, strings, Math.Max(2, a.GetInt("min", 5)), Math.Max(1, a.GetInt("max", 40)));
         }
 
         return Task.FromResult(rc);
+    }
+
+    private static void WriteStrings(ToolContext ctx, string path, System.Text.RegularExpressions.Regex re, int min, int max)
+    {
+        BinaryStrings.Result found;
+        try
+        {
+            found = BinaryStrings.Find(path, re, min);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            ctx.Out.WriteLine($"  strings   (cannot be read: {ex.Message})");
+            return;
+        }
+
+        var kinds = found.Matches.GroupBy(m => m.Kind).Select(g => $"{g.Count()} {(g.Key == "#US" ? ".NET string literals" : g.Key)}");
+        ctx.Out.WriteLine($"  strings   {found.Matches.Count} different texts match /{re}/" + (found.Matches.Count > 0 ? $" ({string.Join(", ", kinds)})" : "") +
+                          $", among {found.Total} strings of {min}+ characters" + (found.Literals > 0 ? $" ({found.Literals} string literals in its .NET code)" : "") +
+                          (found.SearchedBytes is { } cut ? $"; only the first {Format.Bytes(cut)} of the file were searched" : ""));
+        foreach (var m in found.Matches.Take(max)) ctx.Out.WriteLine($"    0x{m.Offset:X8}  {m.Kind,-5}  \"{Format.Clip(m.Text, 200)}\"");
+        if (found.Matches.Count > max) ctx.Out.WriteLine($"    … {found.Matches.Count - max} more (--max {found.Matches.Count}, or a narrower pattern)");
     }
 
     /// <summary>"x64 native GUI" / "x86 .NET (AnyCPU, 32-bit preferred)" etc., or null when the file is not a PE image.</summary>

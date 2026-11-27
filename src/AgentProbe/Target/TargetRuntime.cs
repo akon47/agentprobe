@@ -89,10 +89,11 @@ internal sealed class AuditLog
 
     public string? FilePath => _path.Value;
 
-    /// <summary>Raised for every line so the console can mirror it.</summary>
-    public event Action<string>? Line;
+    /// <summary>Raised for every line so the console can mirror it, with the whole text when the line shortened it.</summary>
+    public event Action<string, string?>? Line;
 
-    public void Write(string message)
+    /// <param name="detail">The whole of what <paramref name="message"/> shortens (a command's full text), for the screen.</param>
+    public void Write(string message, string? detail = null)
     {
         var line = $"{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)}  {message}";
         lock (_gate)
@@ -110,7 +111,7 @@ internal sealed class AuditLog
             }
         }
 
-        Line?.Invoke(line);
+        Line?.Invoke(line, detail);
     }
 }
 

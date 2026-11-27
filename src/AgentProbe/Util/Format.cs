@@ -35,6 +35,19 @@ internal static class Format
 
     public static string Time(DateTime t) => t.ToLocalTime().ToString("MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
 
+    /// <summary>A time shown next to <paramref name="reference"/>: only the time of day when both are on the same day.</summary>
+    public static string TimeAfter(DateTime t, DateTime reference)
+        => t.ToLocalTime().Date == reference.ToLocalTime().Date ? t.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture) : Time(t);
+
+    /// <summary>An uptime as h:mm:ss, with days in front when it is that long: 0:00:14, 8:14:39, 3d 04:05:06.</summary>
+    public static string Uptime(TimeSpan t)
+    {
+        if (t < TimeSpan.Zero) t = TimeSpan.Zero;
+        return t.TotalDays >= 1
+            ? $"{(int)t.TotalDays}d {t.Hours:00}:{t.Minutes:00}:{t.Seconds:00}"
+            : $"{(int)t.TotalHours}:{t.Minutes:00}:{t.Seconds:00}";
+    }
+
     public static string Clip(string? s, int max)
     {
         if (string.IsNullOrEmpty(s)) return "";

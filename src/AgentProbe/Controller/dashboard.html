@@ -287,15 +287,13 @@ a.btn{text-decoration:none}
   <header><h2 data-t="ag_title">Connect an AI agent</h2><button class="btn icon" id="agent-close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button></header>
   <div class="body">
     <p data-t="ag_lead"></p>
-    <div class="step"><b>1</b><div><div class="t" data-t="ag_1"></div><p data-t="ag_1d"></p>
-      <div class="copy"><code id="ag-line"></code><button class="btn" data-copy="ag-line" data-t="copy">Copy</button></div>
+    <div class="step"><b>1</b><div><div class="t" data-t="ag_2"></div><p data-t="ag_2d"></p>
+      <div class="copy"><code id="ag-prompt"></code><button class="btn" data-copy="ag-prompt" data-t="copy">Copy</button></div>
       <p id="ag-path" hidden></p></div></div>
-    <div class="step"><b>2</b><div><div class="t" data-t="ag_2"></div><p data-t="ag_2d"></p>
-      <div class="copy"><code id="ag-prompt"></code><button class="btn" data-copy="ag-prompt" data-t="copy">Copy</button></div></div></div>
-    <div class="step"><b>3</b><div><div class="t" data-t="ag_m"></div><p data-t="ag_md"></p>
+    <div class="step"><b>2</b><div><div class="t" data-t="ag_m"></div><p data-t="ag_md"></p>
       <div class="copy"><code id="ag-mcp1"></code><button class="btn" data-copy="ag-mcp1" data-t="copy">Copy</button></div>
       <div class="copy"><code id="ag-mcp2"></code><button class="btn" data-copy="ag-mcp2" data-t="copy">Copy</button></div></div></div>
-    <div class="step"><b>4</b><div><div class="t" data-t="ag_3"></div><p data-t="ag_3d"></p><div class="guide"><pre class="wrap" id="ag-guide"></pre></div></div></div>
+    <div class="step"><b>3</b><div><div class="t" data-t="ag_3"></div><p data-t="ag_3d"></p><div class="guide"><pre class="wrap" id="ag-guide"></pre></div></div></div>
   </div></div></div>
 <div class="modal" id="upd"><div class="sheet sm">
   <header><h2 id="upd-title"></h2><button class="btn icon" id="upd-close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button></header>
@@ -341,11 +339,9 @@ const I18N = {
     upd_t_btn: 'Update to {0}', upd_t_title: 'Update {0}',
     upd_t_lead: '{0} runs agentprobe {1}; this PC has {2}. This PC sends its exe there, and agentprobe restarts on that PC in a new window. The session, its approval and its workspace carry over.',
     ag_lead: 'agentprobe is a command-line tool, so any agent that can run shell commands on this PC can use it: Claude Code, Codex, Gemini CLI, Cursor and others. The steps are the same for all of them and there is nothing to install or register.',
-    ag_1: 'Tell the agent the tool exists', ag_1d: 'Add this line to the instructions file your agent reads in the project (CLAUDE.md, AGENTS.md, ...). The wording is the same for every agent.',
-    ag_2: 'Or just say it once in the chat', ag_2d: 'For a one-off session, paste this to the agent:',
-    ag_line: 'To debug or test on the remote Windows PC, use the agentprobe CLI: {0}. Run `{0} guide` first.',
+    ag_2: 'Tell the agent in the chat', ag_2d: 'Paste this at the start of a session and add what to look into. The wording is the same for every agent.',
     ag_prompt: 'A Windows PC is shared with this machine through agentprobe. Run `{0} guide` and `{0} list`, then use that CLI to investigate: ',
-    ag_nopath: '`agentprobe` is not on your PATH yet, so the lines above use the full path of the exe. Run this once to type just `agentprobe` (it also opens the firewall port):',
+    ag_nopath: '`agentprobe` is not on your PATH yet, so the text above uses the full path of the exe. Run this once to type just `agentprobe` (it also opens the firewall port):',
     ag_m: 'Or register it as an MCP server', ag_md: 'For agents you set up through MCP. The server is this same exe; it tells the agent how to use the command line and offers four tools (list, run any command, screenshot, guide). Restart the agent afterwards.',
     ag_3: 'What the agent reads', ag_3d: 'This is the output of `agentprobe guide`. It is built into the exe, so it always matches this version.',
   },
@@ -375,9 +371,7 @@ const I18N = {
     upd_t_btn: '{0}(으)로 업데이트', upd_t_title: '{0} 업데이트',
     upd_t_lead: '{0}은(는) agentprobe {1}이고 이 PC는 {2}입니다. 이 PC의 exe를 그 PC로 보내면 거기서 agentprobe가 새 창으로 다시 시작합니다. 세션, 승인, 작업 폴더는 그대로 이어집니다.',
     ag_lead: 'agentprobe는 명령줄 도구이므로, 이 PC에서 셸 명령을 실행할 수 있는 에이전트라면 무엇이든 쓸 수 있습니다. Claude Code, Codex, Gemini CLI, Cursor 모두 방법이 같고, 설치하거나 등록할 것은 없습니다.',
-    ag_1: '에이전트에게 도구가 있다고 알려 주기', ag_1d: '프로젝트에서 에이전트가 읽는 지침 파일(CLAUDE.md, AGENTS.md 등)에 이 한 줄을 넣으세요. 어떤 에이전트든 문구는 같습니다.',
-    ag_2: '또는 대화에서 한 번만 말하기', ag_2d: '한 번만 쓸 때는 에이전트에게 이렇게 붙여 넣으세요.',
-    ag_line: 'To debug or test on the remote Windows PC, use the agentprobe CLI: {0}. Run `{0} guide` first.',
+    ag_2: '대화에서 에이전트에게 알려 주기', ag_2d: '세션을 시작할 때 이 문구를 붙여 넣고 조사할 내용을 이어서 쓰세요. 어떤 에이전트든 문구는 같습니다.',
     ag_prompt: 'agentprobe로 이 PC에 Windows PC 한 대가 공유되어 있어. `{0} guide`와 `{0} list`를 실행한 다음, 그 명령으로 다음 문제를 조사해 줘: ',
     ag_nopath: '아직 `agentprobe`가 PATH에 없어서 위 문구에 exe의 전체 경로를 넣었습니다. 아래를 한 번 실행하면 `agentprobe`만 입력해도 됩니다 (방화벽 포트도 함께 엽니다):',
     ag_m: '또는 MCP 서버로 등록하기', ag_md: 'MCP로 설정하는 에이전트용입니다. 서버는 이 exe 그대로이며, 에이전트에게 명령줄 사용법을 알려 주고 도구 4개(목록, 명령 실행, 스크린샷, 안내서)를 제공합니다. 등록한 뒤 에이전트를 다시 시작하세요.',
@@ -405,7 +399,6 @@ function applyStatic() {
 let info = null;
 function agentText() {
   const cmd = !info || info.onPath === '1' ? 'agentprobe' : `"${info.exe}"`;
-  $('#ag-line').textContent = T('ag_line', cmd);
   $('#ag-prompt').textContent = T('ag_prompt', cmd);
   const exe = info ? info.exe : 'agentprobe.exe';
   $('#ag-mcp1').textContent = `claude mcp add agentprobe -- "${exe}" mcp`;

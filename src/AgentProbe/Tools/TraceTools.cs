@@ -30,6 +30,11 @@ internal static class TraceTools
             crashdumps                                           status + dumps collected so far
               Uses Windows Error Reporting "LocalDumps". Turn it on, reproduce the crash, then `pull` the .dmp.
               This is how to catch a crash that happens at startup or too fast for `dump`.
+            crashdumps --no-autoreboot
+              For the PC as a whole: after a blue screen the PC stays on it instead of restarting (CrashControl
+              AutoReboot=0), so the person there can read the stop code. A reset that then leaves no blue screen
+              behind was not a bugcheck. Windows may read this only when it starts. If the PC resets before the
+              session ends, agentprobe puts it back the next time it starts there.
               Needs agentprobe elevated on the target. Reverted automatically when the session ends.
             """, CrashDumpsAsync),
         new("wpr", "Capture", "Record a Windows Performance Recorder trace (CPU, disk, file, registry, heap...) and fetch the .etl",
@@ -63,12 +68,18 @@ internal static class TraceTools
 
     private static Task<int> CrashDumpsAsync(ToolContext ctx, string[] args)
     {
-        var a = ArgParser.Parse(args, "full");
-        var sub = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : "status";
+        var a = ArgParser.Parse(args, "full", "no-autoreboot");
+        var sub = a.Positionals.Count > 0 ? a.Positionals[0].ToLowerInvariant() : a.Flag("no-autoreboot") ? "no-autoreboot" : "status";
         using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
 
         if (sub == "status")
         {
+            using (var cc = hklm.OpenSubKey(CrashControlKey))
+            {
+                if (cc?.GetValue("AutoReboot") is 0)
+                    ctx.Out.WriteLine($"after a blue screen: the PC stays on it (AutoReboot=0{(File.Exists(AutoRebootNote) ? ", set by agentprobe" : "")})");
+            }
+
             using var key = hklm.OpenSubKey(LocalDumpsKey);
             if (key == null) ctx.Out.WriteLine("automatic crash dumps: off (Windows default)");
             else
@@ -106,7 +117,8 @@ internal static class TraceTools
             return Task.FromResult(0);
         }
 
-        if (sub != "on") return Task.FromResult(ctx.Fail("crashdumps: use on, off, or nothing for status."));
+        if (sub == "no-autoreboot") return Task.FromResult(NoAutoReboot(ctx, hklm));
+        if (sub != "on") return Task.FromResult(ctx.Fail("crashdumps: use on, off, --no-autoreboot, or nothing for status."));
 
         var app = a.Positionals.Count > 1 ? a.Positionals[1] : null;
         if (app != null && !app.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) app += ".exe";
@@ -174,6 +186,86 @@ internal static class TraceTools
         ctx.Out.WriteLine("reproduce the crash, then: agentprobe crashdumps   (lists them)   and   agentprobe pull <dump path>");
         if (app != null && !rootExisted) ctx.Out.WriteLine("note: while this is on, Windows also keeps default mini dumps for other apps that crash (the setting's own behaviour).");
         return Task.FromResult(0);
+    }
+
+    // ------------------------------------------------------------------ crashdumps --no-autoreboot
+
+    private const string CrashControlKey = @"SYSTEM\CurrentControlSet\Control\CrashControl";
+
+    /// <summary>
+    /// Written while AutoReboot=0 is this agentprobe's doing: the value to put back. A reset ends the session without
+    /// its undo, so the next agentprobe that starts on this PC puts the value back from here.
+    /// </summary>
+    private static string AutoRebootNote => Path.Combine(AppInfo.StateDir, "autoreboot-restore.txt");
+
+    private static int NoAutoReboot(ToolContext ctx, RegistryKey hklm)
+    {
+        using var cc = hklm.OpenSubKey(CrashControlKey, writable: true);
+        if (cc == null) return ctx.Fail($@"crashdumps: HKLM\{CrashControlKey} is missing on this PC.");
+        var before = cc.GetValue("AutoReboot");
+        if (before is 0)
+        {
+            ctx.Out.WriteLine("after a blue screen this PC already stays on it (AutoReboot=0): nothing changed");
+            return 0;
+        }
+
+        Directory.CreateDirectory(AppInfo.StateDir);
+        File.WriteAllText(AutoRebootNote, before is int v ? v.ToString(System.Globalization.CultureInfo.InvariantCulture) : "absent");
+        cc.SetValue("AutoReboot", 0, RegistryValueKind.DWord);
+        RegisterAutoRebootUndo(ctx.Runtime);
+        ctx.Runtime.Audit.Write("after a blue screen this PC now stays on it instead of restarting (AutoReboot=0) until the session ends");
+        ctx.Out.WriteLine($"after a blue screen this PC now stays on it instead of restarting (CrashControl AutoReboot=0, was {before ?? "not set (1)"}): the person there can read the stop code.");
+        ctx.Out.WriteLine("Windows may read this only when it starts, so it is certain from the next start on. A hard reset or a power loss restarts the PC all the same:");
+        ctx.Out.WriteLine("a reset that leaves no blue screen behind while this applies was not a bugcheck. Put back when the session ends, or, after a reset, when agentprobe next starts here.");
+        return 0;
+    }
+
+    private static void RegisterAutoRebootUndo(Target.TargetRuntime runtime)
+    {
+        lock (Reverts) Reverts.Add(() => RestoreAutoReboot());
+        runtime.AddUndo("staying on a blue screen (AutoReboot)", () => RevertAll());
+    }
+
+    /// <summary>Puts AutoReboot back as the note says. True when there was something to put back and it was done.</summary>
+    private static bool RestoreAutoReboot()
+    {
+        if (!File.Exists(AutoRebootNote)) return false;
+        var was = File.ReadAllText(AutoRebootNote).Trim();
+        using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+        using var cc = hklm.OpenSubKey(CrashControlKey, writable: true);
+        if (cc == null) return false;
+        if (cc.GetValue("AutoReboot") is 0) // someone else may have changed it since: then it is theirs
+        {
+            if (int.TryParse(was, out var v)) cc.SetValue("AutoReboot", v, RegistryValueKind.DWord);
+            else cc.DeleteValue("AutoReboot", false);
+        }
+
+        File.Delete(AutoRebootNote);
+        return true;
+    }
+
+    /// <summary>
+    /// At the start of sharing: AutoReboot=0 that an earlier session set and could not put back (the PC reset). Put
+    /// back now, or, when this start continues that session after a reboot it asked for, put back when it ends.
+    /// </summary>
+    public static void TakeOverLeftovers(Target.TargetRuntime runtime, bool resumed)
+    {
+        try
+        {
+            if (!File.Exists(AutoRebootNote)) return;
+            if (!Environment.IsPrivilegedProcess)
+            {
+                runtime.Audit.Write("an earlier session made this PC stay on a blue screen (AutoReboot=0): start agentprobe as administrator once to put it back");
+                return;
+            }
+
+            if (resumed) RegisterAutoRebootUndo(runtime);
+            else if (RestoreAutoReboot()) runtime.Audit.Write("reverted: staying on a blue screen (AutoReboot), set by an earlier session that ended with a reset");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            runtime.Audit.Write("could not put back AutoReboot that an earlier session set: " + ex.Message);
+        }
     }
 
     // ------------------------------------------------------------------ wpr

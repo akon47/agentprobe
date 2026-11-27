@@ -162,6 +162,7 @@ internal sealed partial class ShareHost
             RequestEnd = removeExe => _ = Task.Run(() => End(removeExe, askedToEnd: true)),
         };
         _instance = this;
+        Tools.TraceTools.TakeOverLeftovers(_runtime, IsResume);
         WatchLogoffAndShutdown();
         ConsoleLog.Start();
         if (resumedHistory != null) _runtime.SeedHistory(resumedHistory, _resumedAfterUpdate ? "update" : "reboot");
@@ -173,7 +174,12 @@ internal sealed partial class ShareHost
 
         WatchPauseKey();
         _runtime.ContinueRunsAfter(_continueRunsAfter); // a run number printed before an update never comes to mean another command
-        _runtime.Audit.Line += line => ConsoleLog.Write("  " + line[11..]); // time of day is enough on screen
+        _runtime.Audit.Line += (line, detail) =>
+        {
+            // The time of day is enough on screen. The screen keeps every line from the start, for when it is shown.
+            TargetScreen.Record(line[11..19], line[21..], detail);
+            if (!TargetScreen.Active) ConsoleLog.Write("  " + line[11..]);
+        };
 
         using var close = PosixSignalRegistration.Create(PosixSignal.SIGHUP, _ => End(false));
         using var ctrlC = PosixSignalRegistration.Create(PosixSignal.SIGINT, _ => End(false));
@@ -198,6 +204,25 @@ internal sealed partial class ShareHost
         await probing.ContinueWith(_ => { }, TaskScheduler.Default);
         return 0;
     }
+
+    /// <summary>
+    /// Once a developer PC is connected the window becomes a screen of its own: who controls this PC and how to
+    /// pause, at the top, and the activity log under it (see <see cref="TargetScreen"/>). Before that it is the
+    /// plain console, where the questions about which PC to allow are asked.
+    /// </summary>
+    private void StartScreen()
+    {
+        if (Interlocked.Exchange(ref _screenTried, 1) != 0) return;
+        var name = $"{Environment.MachineName}{(Label != null ? $" \"{Label}\"" : "")}";
+        var who = Environment.IsPrivilegedProcess ? Lang.T("administrator", "관리자 권한") : Lang.T("standard user rights", "일반 사용자 권한");
+        TargetScreen.Start(
+            () => Lang.T($"agentprobe {AppInfo.Version}  -  sharing this PC: {name}, user {Environment.UserName} ({who})", $"agentprobe {AppInfo.Version}  -  이 PC 공유 중: {name}, 사용자 {Environment.UserName} ({who})"),
+            _runtime.Audit.FilePath ?? Lang.T("(log file unavailable)", "(로그 파일을 만들 수 없음)"),
+            () => new TargetScreen.State(_connected, _runtime.Paused, _controllerName),
+            SetPaused);
+    }
+
+    private int _screenTried;
 
     private void PrintBanner()
     {
@@ -337,6 +362,7 @@ internal sealed partial class ShareHost
                         : Lang.T("agentprobe: this PC is being controlled remotely. Close its window to stop.", "agentprobe: 이 PC가 원격으로 제어되고 있습니다. 멈추려면 agentprobe 창을 닫으세요."));
                 var session = new TargetSession(channel, _runtime, _controllerName, a => Badge.SetDetail(DateTime.Now.ToString("HH:mm:ss") + "  " + a));
                 _connected = true;
+                StartScreen();
                 MinimizeOnce();
                 try
                 {
@@ -560,7 +586,8 @@ internal sealed partial class ShareHost
                 try
                 {
                     // Only while a developer PC is connected: before that, this window's keys answer its own questions.
-                    if (_connected && Console.KeyAvailable)
+                    // The screen reads its keys itself.
+                    if (_connected && !TargetScreen.Active && Console.KeyAvailable)
                     {
                         var key = Console.ReadKey(true);
                         if (key.Key == ConsoleKey.Spacebar || key.KeyChar == ' ') SetPaused(true);
@@ -585,9 +612,13 @@ internal sealed partial class ShareHost
         _runtime.Audit.Write(paused
             ? "PAUSED by the person at this PC: remote commands are refused until Enter is pressed here"
             : "resumed by the person at this PC: remote commands are accepted again");
-        ConsoleLog.Write(paused
-            ? Lang.T("  == PAUSED: remote commands are refused. Press Enter to resume. ==", "  == 일시 멈춤: 원격 명령을 받지 않습니다. 계속하려면 Enter를 누르세요. ==")
-            : Lang.T("  == Resumed. ==", "  == 다시 받습니다. =="));
+        if (!TargetScreen.Active) // the screen says so at its top
+        {
+            ConsoleLog.Write(paused
+                ? Lang.T("  == PAUSED: remote commands are refused. Press Enter to resume. ==", "  == 일시 멈춤: 원격 명령을 받지 않습니다. 계속하려면 Enter를 누르세요. ==")
+                : Lang.T("  == Resumed. ==", "  == 다시 받습니다. =="));
+        }
+
         if (_connected)
         {
             Badge.Show(
@@ -782,6 +813,7 @@ internal sealed partial class ShareHost
     private void End(bool removeExe, bool askedToEnd = false)
     {
         if (Interlocked.Exchange(ref _ended, 1) != 0) return;
+        TargetScreen.Stop();
         Badge.Hide();
         KeepAwake(false);
 

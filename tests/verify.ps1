@@ -166,6 +166,128 @@ Start-Sleep 600
     Check 'wait --port succeeds' ($r.Code -eq 0) $r.Out
     $listener.Stop()
 
+    # ------------------------------------------------------------------ the PC as a whole
+    Write-Host "`nthe PC as a whole (event logs, starts and ends, drivers, devices, sensors)"
+    $since30 = (Get-Date).AddDays(-30)
+    # Not StartTime in the hashtable: Windows PowerShell 5.1 fails to read it back on some cultures and then drops it.
+    $sysEvents = { param($provider, $id) @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = $provider; Id = $id } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -ge $since30 }) }
+    $kg12 = & $sysEvents 'Microsoft-Windows-Kernel-General' 12
+    if ($kg12.Count -gt 0) {
+        # Its message has the start time with direction marks (U+200E) around the digits: wevtutil turned them into '?'.
+        $r = AP -t local events --provider Microsoft-Windows-Kernel-General --id 12 --level info --since '30d' --max 1
+        Check 'events: direction marks in a message come out as nothing, not as ?' ($r.Code -eq 0 -and $r.Out -match 'Kernel-General#12: .*\d{4}-\d\d-\d\dT\d\d:\d\d' -and $r.Out -notmatch "[\u200E\u200F?]\d") $r.Out
+        $startTime = (([xml]$kg12[0].ToXml()).Event.EventData.Data | Where-Object Name -eq 'StartTime').'#text'
+        $r = AP -t local events --provider Microsoft-Windows-Kernel-General --id 12 --level info --since '30d' --max 1 --data
+        Check 'events --data: the event''s own fields, as Windows recorded them' ($r.Out -match "(?m)^  data: .*StartTime=$([regex]::Escape($startTime))") "$startTime / $($r.Out)"
+        $r = AP -t local events --provider 'NoSuchProviderForVerifyZz,Microsoft-Windows-Kernel-General' --id 12 --level info --since '30d' --max 1
+        Check 'events --provider takes several names' ($r.Out -match 'Kernel-General#12') $r.Out
+    }
+    # A provider can be named by its classic source name (BugCheck, DCOM): one that differs from its name, if the log has one.
+    $classic = Get-WinEvent -LogName System -MaxEvents 3000 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -ge $since30 } | ForEach-Object {
+        $p = ([xml]$_.ToXml()).Event.System.Provider
+        if ($p.EventSourceName -and $p.EventSourceName -ne $p.Name) { [pscustomobject]@{ Source = $p.EventSourceName; Name = $p.Name; Id = $_.Id } }
+    } | Select-Object -First 1
+    if ($classic) {
+        $r = AP -t local events --provider $classic.Source --id $classic.Id --level info --since '30d' --max 1
+        Check 'events --provider: a classic source name finds the events of its provider' ($r.Out -match "$([regex]::Escape($classic.Name))#$($classic.Id)") "$($classic.Source) -> $($classic.Name): $($r.Out)"
+    }
+    $r = AP -t local events --provider NoSuchProviderForVerifyZz --level info --since '1d'
+    Check 'events: a provider that does not exist is named as such, not only "no events"' ($r.Out -match 'provider NoSuchProviderForVerifyZz: NOT registered on this PC') $r.Out
+    $r = AP -t local events --provider Microsoft-Windows-Kernel-General --id 59999 --level info --since '1d'
+    Check 'events: a provider that exists but logged nothing is said to exist' ($r.Out -match 'provider Microsoft-Windows-Kernel-General: registered on this PC') $r.Out
+    $newest = Get-WinEvent -LogName System -MaxEvents 1
+    $at = $newest.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    $r = AP -t local events --around "$at,2000-01-01 03:00" --log System
+    Check 'events --around: the window around an event counts it, a window without one says so' ($r.Code -eq 0 -and $r.Out -match "(?m)^\s+\d+\s+Sys $([regex]::Escape($newest.ProviderName))#$($newest.Id) \(" -and $r.Out -match '(?m)^1 of 2 windows had no event at all: 01-01 03:00:00') $r.Out
+    $r = AP -t local events --around $at --all-logs --provider $newest.ProviderName --id $newest.Id
+    Check 'events --around --all-logs: searches every log that holds events' ($r.Code -eq 0 -and $r.Out -match 'searched \d+ logs that hold events' -and $r.Out -match "(?m)^\s+1\s+Sys $([regex]::Escape($newest.ProviderName))#$($newest.Id) \(") $r.Out
+
+    # boots against the events Windows logged: one start per Kernel-General 12 (plus a fast startup or a resume
+    # from hibernation, a Kernel-Boot 27 without one), one unexpected end per Kernel-Power 41 or EventLog 6008.
+    $kb27 = & $sysEvents 'Microsoft-Windows-Kernel-Boot' 27
+    $kp41 = & $sysEvents 'Microsoft-Windows-Kernel-Power' 41
+    $el6008 = & $sysEvents 'EventLog' 6008
+    $unexpected = $null
+    $r = AP -t local boots --since '30d' --max 500
+    if ($r.Out -match '(?m)^(\d+) starts in the last 30d00h; ends: (\d+) UNEXPECTED') {
+        $starts = [int]$Matches[1]; $unexpected = [int]$Matches[2]
+        $others = @($kb27 | Where-Object { $t27 = $_.TimeCreated; -not ($kg12 | Where-Object { [Math]::Abs(($_.TimeCreated - $t27).TotalMinutes) -le 5 }) }).Count
+        Check 'boots: as many starts as Windows logged' ($starts -eq $kg12.Count + $others) "boots $starts, Windows $($kg12.Count) + $others"
+        Check 'boots: as many unexpected ends as Kernel-Power 41 / EventLog 6008 say' ($unexpected -ge [Math]::Max($kp41.Count, $el6008.Count) -and $unexpected -le $kp41.Count + $el6008.Count) "boots $unexpected, Windows 41 x$($kp41.Count), 6008 x$($el6008.Count)"
+        $latest = $kg12 | Sort-Object TimeCreated | Select-Object -Last 1
+        if ($latest -and -not ($kb27 | Where-Object { $_.TimeCreated -gt $latest.TimeCreated.AddMinutes(5) })) {
+            $began = ([datetime](([xml]$latest.ToXml()).Event.EventData.Data | Where-Object Name -eq 'StartTime').'#text').ToString('MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+            Check 'boots: the start that runs now began when the kernel says' ($r.Out -match "(?m)^$began\s+up \S+\s+running now") "$began / $(($r.Out -split "`n") -match 'running now')"
+        }
+    } else { Check 'boots summary line' $false $r.Out }
+    # --logs: the file of a folder last written during the current start, its lines and its last line. UTF-16 with
+    # U+AC0A, whose low byte is the byte of a line break: three lines, not four.
+    $logDir = Join-Path $work 'applogs'; New-Item -ItemType Directory -Path $logDir | Out-Null
+    $odd = [char]0xAC0A
+    [IO.File]::WriteAllText((Join-Path $logDir 'app-1.log'), "start $odd`r`nworking $odd`r`nlast line $odd", [Text.Encoding]::Unicode)
+    $r = AP -t local boots --since '365d' --max 1 --logs $logDir
+    Check 'boots --logs: the log file last written during this start, its line count and its last line' ($r.Out -match "(?m)^\s+log: app-1\.log last written \d\d:\d\d:\d\d, 3 lines, last line `"last line $odd`" \(1 file created during it\)") $r.Out
+
+    $r = AP -t local crashes --system --since '30d'
+    $cc = Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl
+    $kind = switch ($cc.CrashDumpEnabled) { 0 { 'NONE' } 1 { if ($cc.FilterPages -eq 1) { 'active memory dump' } else { 'complete memory dump' } } 2 { 'kernel memory dump' } 3 { 'small memory dumps' } 7 { 'automatic memory dump' } default { "CrashDumpEnabled=$($cc.CrashDumpEnabled)" } }
+    Check 'crashes --system: the dump setup is what CrashControl says' ($r.Code -eq 0 -and $r.Out -match "(?m)^dump setup: $([regex]::Escape($kind))" -and $r.Out -match $(if ($cc.AutoReboot -eq 0) { 'stays on the blue screen' } else { 'restarts by itself after a blue screen' })) $r.Out
+    $pageOnBoot = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management').ExistingPageFiles) -match "^\\\?\?\\$($env:SystemDrive)"
+    Check 'crashes --system: says whether the boot volume has a page file, as Windows does' (($r.Out -match "page file $([regex]::Escape($env:SystemDrive))\\") -eq [bool]$pageOnBoot) "$pageOnBoot / $(($r.Out -split "`n") -match '^dump setup')"
+    if ($null -ne $unexpected) {
+        Check 'crashes --system: as many unexpected shutdowns as boots, and a verdict' ($r.Out -match '(?m)^unexpected shutdowns: (none|(\d+))' -and [int]("0" + $Matches[2]) -eq $unexpected -and $r.Out -match '(?m)^-> ') $r.Out
+        $tr = (AP -t local triage).Out
+        Check 'triage: a line about unexpected shutdowns exactly when there were some in 30 days' (($unexpected -gt 0) -eq ($tr -match '(?m)^resets\s+\d+ unexpected shutdown')) $tr
+        if ($tr -match 'pending reboot can explain') { Check 'triage: the pending reboot is the last lead' ((@($tr -split "`n" | Where-Object { $_ -match '^\s+- ' }) | Select-Object -Last 1) -match 'pending reboot') $tr }
+    }
+
+    $wakeNames = @{ 1 = 'other'; 2 = 'unknown'; 3 = 'APM timer'; 4 = 'modem ring'; 5 = 'LAN remote'; 6 = 'power switch'; 7 = 'PCI PME#'; 8 = 'AC power restored' }
+    $wake = [int](Get-CimInstance Win32_ComputerSystem).WakeUpType
+    if ($wakeNames.ContainsKey($wake)) {
+        $r = AP -t local sys
+        Check 'sys: what started the PC is the SMBIOS wake-up type Windows reports' ($r.Out -match "(?m)^boot\s.*started by: $([regex]::Escape($wakeNames[$wake]))") "Windows: $wake / $(($r.Out -split "`n") -match '^boot')"
+    }
+
+    $r = AP -t local drivers --all
+    $runningDrivers = @(Get-CimInstance Win32_SystemDriver -Filter "State='Running'").Count
+    if ($r.Out -match '^(\d+) kernel drivers running as services') { Check 'drivers: as many running drivers as Windows lists' (Near ([double]$Matches[1]) $runningDrivers 0 3) "got $($Matches[1]), Windows $runningDrivers" } else { Check 'drivers summary line' $false $r.Out }
+    $tcpip = Get-Item "$env:WINDIR\System32\drivers\tcpip.sys"
+    $tv = $tcpip.VersionInfo
+    $r = AP -t local drivers --grep '^tcpip$'
+    Check 'drivers: a driver''s version, date and path are its file''s' ($r.Out -match "(?m)^tcpip\s+$($tv.FileMajorPart)\.$($tv.FileMinorPart)\.$($tv.FileBuildPart)\.$($tv.FilePrivatePart)\s+$($tcpip.LastWriteTime.ToString('yyyy-MM-dd'))\s.*Microsoft.*$([regex]::Escape($tcpip.FullName))") $r.Out
+    $r = AP -t local drivers
+    Check 'drivers: without --all, the non-Microsoft ones and how many were left out' ($r.Out -match '^(\d+) kernel drivers running as services; (\d+) not from Microsoft .*?, (\d+) from Microsoft left out' -and [int]$Matches[2] + [int]$Matches[3] -eq [int]$Matches[1]) ($r.Out -split "`n" | Select-Object -First 1)
+
+    $pnp = @(Get-PnpDevice -PresentOnly)
+    $r = AP -t local devices
+    if ($r.Out -match '^(\d+) devices present, (\d+) with a problem') {
+        Check 'devices: as many present devices as Get-PnpDevice' (Near ([double]$Matches[1]) $pnp.Count 0 2) "got $($Matches[1]), Windows $($pnp.Count)"
+        $problems = @($pnp | Where-Object { $_.ConfigManagerErrorCode -ne 0 }).Count
+        Check 'devices: as many with a problem as Windows' ([int]$Matches[2] -eq $problems) "got $($Matches[2]), Windows $problems"
+    } else { Check 'devices summary line' $false $r.Out }
+    $link = $pnp | Where-Object InstanceId -like 'PCI\*' | ForEach-Object {
+        $p = @(Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_PciDevice_CurrentLinkSpeed, DEVPKEY_PciDevice_CurrentLinkWidth -ErrorAction SilentlyContinue)
+        if ($p.Count -eq 2 -and $p[0].Data -and $p[1].Data) { [pscustomobject]@{ Id = $_.InstanceId; Speed = $p[0].Data; Width = $p[1].Data } }
+    } | Select-Object -First 1
+    if ($link) {
+        $r = AP -t local devices --grep "^$([regex]::Escape($link.Id))$" --long
+        Check 'devices --long: the PCIe link is the one Windows reports' ($r.Out -match "(?m)^\s+link\s+PCIe Gen$($link.Speed) x$($link.Width),") "$($link.Id) Gen$($link.Speed) x$($link.Width): $($r.Out)"
+    }
+
+    $r = AP -t local sensors
+    Check 'sensors: answers, and says what it cannot read' ($r.Code -eq 0 -and $r.Out -match '(?m)^not readable here: voltages') $r.Out
+    foreach ($z in @(Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation -ErrorAction SilentlyContinue) | Select-Object -First 2) {
+        $celsius = $z.Temperature - 273.15
+        if ($r.Out -match "(?m)^thermal\s+ACPI $([regex]::Escape($z.Name)): (-?[\d.]+)") { Check "sensors: thermal zone $($z.Name) as its counter says" (Near ([double]$Matches[1]) $celsius 0 3) "got $($Matches[1]), counter $celsius" }
+        else { Check "sensors: thermal zone $($z.Name)" $false $r.Out }
+    }
+    if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        foreach ($d in @(Get-PhysicalDisk)) {
+            $t = ($d | Get-StorageReliabilityCounter).Temperature
+            if ($t -gt 0 -and $r.Out -match "(?m)^disk\s+PhysicalDrive$($d.DeviceId) .*?: (\d+)") { Check "sensors: disk $($d.DeviceId) temperature as Windows reports it" (Near ([double]$Matches[1]) $t 0 3) "got $($Matches[1]), Windows $t" }
+        }
+    }
+
     # ------------------------------------------------------------------ files
     Write-Host "`nfiles"
     $file = Join-Path $work 'lines.txt'
@@ -232,6 +354,22 @@ Start-Sleep 600
     Check 'stat sha256' ($r.Out -match $hash) ''
     Check 'stat image kind' ($r.Out -match 'x64 native console EXE') $r.Out
     Check 'stat size' ($r.Out -match "size\s+$((Get-Item $Exe).Length) ") ''
+
+    # stat --strings: a .NET string literal (with Korean) at the offset given, and UTF-8 / UTF-16 text in a binary.
+    $lit = Join-Path $work 'ApVerifyLiterals.dll'
+    Add-Type -TypeDefinition 'public static class ApVerifyLiterals { public static string Text() { return "ApVerify literal \uD55C\uAE00 text"; } }' -OutputAssembly $lit -OutputType Library
+    $hangul = "$([char]0xD55C)$([char]0xAE00)"
+    $r = AP -t local stat $lit --strings 'ApVerify literal'
+    if ($r.Out -match '(?m)^\s+0x([0-9A-F]{8})\s+#US\s+"ApVerify literal (.+) text"') {
+        $shownText = $Matches[2]
+        $atOffset = [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($lit), [Convert]::ToInt32($Matches[1], 16), 48)
+        Check 'stat --strings: a .NET string literal, its Korean intact, at the offset given' ($shownText -eq $hangul -and $atOffset -eq "ApVerify literal $hangul text") "$atOffset / $($r.Out)"
+    } else { Check 'stat --strings finds a .NET string literal' $false $r.Out }
+    $blob = Join-Path $work 'blob.bin'
+    $utf8 = [Text.Encoding]::UTF8.GetBytes("ApVerify utf8 $hangul line")
+    [IO.File]::WriteAllBytes($blob, [byte[]](@(0, 1, 2, 3) + $utf8 + @(0, 0, 0) + [Text.Encoding]::Unicode.GetBytes('ApVerify wide line') + @(0, 0, 9)))
+    $r = AP -t local stat $blob --strings 'ApVerify'
+    Check 'stat --strings: UTF-8 and UTF-16 text in a binary, each at its offset' ($r.Out -match '2 different texts match' -and $r.Out -match "(?m)^\s+0x00000004\s+utf8\s+`"ApVerify utf8 $hangul line`"" -and $r.Out -match "(?m)^\s+0x$('{0:X8}' -f (4 + $utf8.Length + 3))\s+utf16\s+`"ApVerify wide line`"") $r.Out
 
     $locked = Join-Path $work 'locked.bin'; $fs = [IO.File]::Open($locked, 'Create', 'ReadWrite', 'None')
     $r = AP -t local locks $locked
@@ -924,6 +1062,7 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
                 # The start screen as text (piped): the link, the MCP command with this exe's path, the connected PC.
                 $homeText = (AP home).Out
                 Check 'home: prints the dashboard link, the MCP command for this exe and the connected PC' ($homeText -match 'http://127\.0\.0\.1:\d+/\?k=[0-9A-F]{16,}' -and $homeText.Contains("claude mcp add agentprobe -- `"$Exe`" mcp") -and $homeText -match '(?m):\s.*\bverify\b.*$') $homeText
+                Check 'home: the first thing to give an agent is the prompt for the chat; no line for an instructions file' ($homeText -match '(?m)^\s+1\. .*\n\s+.*guide.*list' -and $homeText -notmatch 'CLAUDE\.md|AGENTS\.md') $homeText
                 $bare = AP
                 Check 'no arguments, piped: prints the command list instead of opening a screen' ($bare.Code -eq 0 -and $bare.Out -match 'ON THE PC TO TEST') (($bare.Out -split "`n" | Select-Object -First 2) -join ' / ')
 
@@ -956,6 +1095,21 @@ Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing 'namespace A
                 Check 'exec --shell cmd exit code' ($r.Out -match 'cmd-ok' -and $r.Code -eq 3) "$($r.Code) $($r.Out)"
                 $r = AP -t verify exec 'Get-Item C:\no-such-path-for-verify'
                 Check 'exec: PowerShell error is plain text, not CLIXML' ($r.Out -notmatch 'CLIXML|<Objs' -and $r.Out -match 'no-such-path-for-verify' -and $r.Code -ne 0) $r.Out
+                $r = AP -t verify exec '1..20 | ForEach-Object { Get-Item "C:\no-such-path-for-verify-$_" }; Write-Output done'
+                Check 'exec: the same error from the same place is printed once, with how many more came and the last one' ($r.Out -match '(?m)^done$' -and ([regex]::Matches($r.Out, 'FullyQualifiedErrorId')).Count -eq 1 -and $r.Out -match 'came 19 more times \(x20 in all\); the last one: .*no-such-path-for-verify-20') $r.Out
+                $r = AP -t verify exec --no-fold '1..20 | ForEach-Object { Get-Item "C:\no-such-path-for-verify-$_" }'
+                Check 'exec --no-fold prints each error' (([regex]::Matches($r.Out, 'FullyQualifiedErrorId')).Count -eq 20) $r.Out
+                $before = (Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl).AutoReboot
+                $r = AP -t verify crashdumps --no-autoreboot
+                if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+                    $set = (Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl).AutoReboot
+                    $status = (AP -t verify crashdumps).Out
+                    [void](AP -t verify crashdumps off)
+                    $after = (Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl).AutoReboot
+                    Check 'crashdumps --no-autoreboot: AutoReboot=0 while it is on, as it was after off' ($r.Code -eq 0 -and ($before -eq 0 -or ($set -eq 0 -and $status -match 'stays on it \(AutoReboot=0, set by agentprobe\)')) -and $after -eq $before) "before $before, set $set, after ${after}: $($r.Out) / $status"
+                } else {
+                    Check 'crashdumps --no-autoreboot: refused without administrator rights, and nothing changed' ($r.Code -eq 2 -and $r.Out -match 'needs agentprobe elevated' -and (Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl).AutoReboot -eq $before) $r.Out
+                }
                 $r = AP -t verify exec --timeout 2s 'Start-Sleep 30'
                 Check 'exec --timeout returns 124' ($r.Code -eq 124) "$($r.Code) $($r.Out)"
                 $r = AP -t verify exec '1..1000 | ForEach-Object { "row $_" }'
